@@ -236,18 +236,25 @@ def summary_prompt(why: str, title: str, author: str) -> Dict[str, Any]:
 # =======================
 # LLM CALLS
 # =======================
-def stream_assistant_reply(client: OpenAI, history: List[Dict[str, str]]) -> str:
-    """Streams the assistant reply based on full history (orchestrator system included)."""
-    stream = client.responses.stream(model=CHAT_MODEL, input=history)
-    chunks = []
+def stream_assistant_reply(client: OpenAI, history: list[dict[str, str]]) -> str:
+    """
+    Streamt die Assistenten-Antwort korrekt:
+    - Context-Manager benutzen
+    - über .events() iterieren
+    """
+    chunks: list[str] = []
     with st.chat_message("assistant"):
         ph = st.empty()
-        for event in stream:
-            if event.type == "response.output_text.delta":
-                chunks.append(event.delta)
-                ph.markdown("".join(chunks))
-    stream.close()
+        # WICHTIG: als Context-Manager + .events()
+        with client.responses.stream(model=CHAT_MODEL, input=history) as stream:
+            for event in stream.events():
+                if event.type == "response.output_text.delta":
+                    chunks.append(event.delta)
+                    ph.markdown("".join(chunks))
+            # optional: Finale Response abrufen (falls du sie brauchst)
+            _final = stream.get_final_response()
     return "".join(chunks).strip()
+
 
 def controller_decide(client: OpenAI, history: List[Dict[str, str]], current_profile: Dict[str, Any]) -> Dict[str, Any]:
     payload = controller_prompt(history, current_profile)
