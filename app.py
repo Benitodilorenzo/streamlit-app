@@ -1,6 +1,5 @@
 import os
 import json
-import time
 import io
 from typing import List, Dict, Any
 
@@ -38,19 +37,17 @@ def get_client() -> OpenAI:
     return OpenAI(api_key=OPENAI_API_KEY)
 
 def ensure_session():
+    # conversation history including a system message
     if "messages" not in st.session_state:
-        # conversation history including a system message
         st.session_state.messages: List[Dict[str, str]] = [
             {"role": "system", "content": system_orchestrator_prompt()},
             {"role": "assistant",
-             "content": "Hi! I'll help you craft a tiny expert card. "
-                        "First: which book has helped you professionally? "
-                        "Please give the title (author optional)."},
+             "content": ("Hi! I'll help you craft a tiny expert card.\n"
+                         "First: which book has helped you professionally? "
+                         "Please give the title (author optional).")}
         ]
     if "profile" not in st.session_state:
-        st.session_state.profile = {
-            "book": {"title": "", "why": "", "author_guess": ""}
-        }
+        st.session_state.profile = {"book": {"title": "", "why": "", "author_guess": ""}}
     if "controller" not in st.session_state:
         st.session_state.controller = {"ready_to_research": False, "next_question": ""}
 
@@ -62,7 +59,7 @@ def svg_card(person_name: str, headline: str, verified: dict, summary: dict) -> 
     # headline
     dwg.add(dwg.text(headline.upper(), insert=(90, 210), fill=TEXT_PRIMARY,
                      font_size="60px", font_weight="700", font_family="Montserrat, Arial"))
-    # avatar placeholder circle (we keep it simple for now)
+    # avatar placeholder circle
     dwg.add(dwg.circle(center=(680, 320), r=160, fill="#eeeeee"))
     # name
     dwg.add(dwg.text(person_name, insert=(60, 580), fill=TEXT_PRIMARY,
@@ -75,7 +72,8 @@ def svg_card(person_name: str, headline: str, verified: dict, summary: dict) -> 
     dwg.add(dwg.text(title, insert=(720, 160), fill=TEXT_PRIMARY, font_size="24px"))
     if author:
         dwg.add(dwg.text(author, insert=(720, 190), fill=TEXT_PRIMARY, font_size="22px"))
-    # summary text (wrap naive)
+
+    # summary text (naive wrap)
     text_y = 230
     para = (summary.get("book_100w", "") or "").strip()
     line, lines = "", []
@@ -89,6 +87,7 @@ def svg_card(person_name: str, headline: str, verified: dict, summary: dict) -> 
     for ln in lines[:8]:
         dwg.add(dwg.text(ln, insert=(720, text_y), fill=TEXT_SECONDARY, font_size="20px"))
         text_y += 28
+
     # dots
     for i in range(12):
         x = 560 + (i * 45)
@@ -111,7 +110,13 @@ def png_from_svg(svg_text: str) -> bytes:
 # =======================
 def system_orchestrator_prompt() -> str:
     """
-    This is the single system prompt for the conversation. It sets policy & tone.
+    Single system prompt that sets policy & tone.
+
+    Defaults to English; if user writes clearly in another language, mirror it.
+    Ask at most TWO concise questions, one at a time, to collect:
+      1) book.title (required)
+      2) book.why   (required, 1–2 sentences)
+    If the user already provided both, avoid extra questions and suggest proceeding.
     """
     return (
         "You are an interviewing assistant for a tiny 'Expert Card'.\n"
@@ -127,58 +132,52 @@ def system_orchestrator_prompt() -> str:
         "- You only focus on natural conversation. Keep messages short and clear.\n"
     )
 
-def controller_prompt(history: List[Dict[str, str]], current_profile: Dict[str, Any]) -> Dict[str, Any]:
+def controller_payload(history: List[Dict[str, str]]) -> Dict[str, Any]:
     """
-    Builds the controller input for the JSON-schema extractor/decider.
+    JSON-schema extractor/decider for two required fields.
     """
+    schema = {
+        "type": "object",
+        "properties": {
+            "profile_partial": {
+                "type": "object",
+                "properties": {
+                    "book": {
+                        "type": "object",
+                        "properties": {
+                            "title": {"type": "string"},
+                            "why": {"type": "string"},
+                            "author_guess": {"type": "string"}
+                        }
+                    }
+                }
+            },
+            "ready_to_research": {"type": "boolean"},
+            "next_question": {"type": "string"}
+        },
+        "required": ["profile_partial", "ready_to_research", "next_question"]
+    }
     return {
         "model": CHAT_MODEL,
         "response_format": {
             "type": "json_schema",
-            "json_schema": {
-                "name": "interview_control",
-                "schema": {
-                    "type": "object",
-                    "properties": {
-                        "profile_partial": {
-                            "type": "object",
-                            "properties": {
-                                "book": {
-                                    "type": "object",
-                                    "properties": {
-                                        "title": {"type": "string"},
-                                        "why": {"type": "string"},
-                                        "author_guess": {"type": "string"}
-                                    }
-                                }
-                            }
-                        },
-                        "ready_to_research": {"type": "boolean"},
-                        "next_question": {"type": "string", "description": "Short, natural next question in the user's language; empty if none."}
-                    },
-                    "required": ["profile_partial", "ready_to_research", "next_question"]
-                },
-                "strict": True
-            }
+            "json_schema": {"name": "interview_control", "schema": schema, "strict": True}
         },
         "input": [
-            {
-                "role": "system",
-                "content": (
-                    "From the conversation so far, extract the fields and decide if we have enough to start research.\n"
-                    "We need exactly two required fields: book.title and book.why (1–2 sentences). "
-                    "If both are reasonably present, set ready_to_research=true. "
-                    "If not ready, propose next_question (very short). "
-                    "Default language English; mirror user's language if obvious."
-                )
-            },
+            {"role": "system",
+             "content": (
+                 "Extract fields from the conversation. We need two required fields: "
+                 "book.title and book.why (1–2 sentences). "
+                 "If both are present, set ready_to_research=true. "
+                 "If not, propose a short next_question (same language as the user)."
+             )},
             *history[-12:]
         ]
     }
 
-def research_prompt(title: str, author_guess: str) -> Dict[str, Any]:
+def research_payload(title: str, author_guess: str) -> Dict[str, Any]:
     """
-    Responses call that uses web_search tool to fetch candidates for the book.
+    Responses call that uses the hosted web_search tool to fetch candidates.
     """
     return {
         "model": SEARCH_MODEL,
@@ -187,14 +186,14 @@ def research_prompt(title: str, author_guess: str) -> Dict[str, Any]:
         "input": [
             {"role": "system", "content":
                 "Use the web_search tool to find book data. "
-                "Return JSON with 'candidates' (up to 5), each having: "
+                "Return JSON with 'candidates' (up to 5), each: "
                 "title (str), authors (array), cover_url (str), info_url (str), source (str). "
-                "Prefer publisher sites, Google Books, Open Library. If uncertain, include your best plausible options."},
-            {"role": "user", "content": json.dumps({"book_title": title, "author_guess": author_guess})}
+                "Prefer publisher sites, Google Books, Open Library."},
+            {"role": "user", "content": json.dumps({"book_title": title, "author_guess": author_guess}, separators=(",", ":"))}
         ]
     }
 
-def verifier_prompt(user_claim: Dict[str, Any], candidates: List[Dict[str, Any]]) -> Dict[str, Any]:
+def verifier_payload(user_claim: Dict[str, Any], candidates: List[Dict[str, Any]]) -> Dict[str, Any]:
     schema = {
         "type": "object",
         "properties": {
@@ -219,10 +218,15 @@ def verifier_prompt(user_claim: Dict[str, Any], candidates: List[Dict[str, Any]]
         ]
     }
 
-def summary_prompt(why: str, title: str, author: str) -> Dict[str, Any]:
-    schema = {"type": "object",
-              "properties": {"book_100w": {"type": "string"}, "one_liner": {"type": "string"}},
-              "required": ["book_100w", "one_liner"]}
+def summary_payload(why: str, title: str, author: str) -> Dict[str, Any]:
+    schema = {
+        "type": "object",
+        "properties": {
+            "book_100w": {"type": "string"},
+            "one_liner": {"type": "string"}
+        },
+        "required": ["book_100w", "one_liner"]
+    }
     return {
         "model": CHAT_MODEL,
         "response_format": {"type": "json_schema",
@@ -236,29 +240,26 @@ def summary_prompt(why: str, title: str, author: str) -> Dict[str, Any]:
 # =======================
 # LLM CALLS
 # =======================
-def stream_assistant_reply(client: OpenAI, history: list[dict[str, str]]) -> str:
+def stream_assistant_reply(client: OpenAI, history: List[Dict[str, str]]) -> str:
     """
-    Stream assistant reply using Responses API.
-    Use the context manager and iterate *directly* over the stream.
+    Stream assistant reply using Responses API (context manager + direct iteration).
     """
-    chunks: list[str] = []
+    chunks: List[str] = []
     with st.chat_message("assistant"):
         ph = st.empty()
-        # Context manager returns a ResponseStream
         with client.responses.stream(model=CHAT_MODEL, input=history) as stream:
-            for event in stream:  # <-- iterate the stream directly
+            for event in stream:
                 if event.type == "response.output_text.delta":
                     chunks.append(event.delta)
                     ph.markdown("".join(chunks))
-            # optional: retrieve the final response object
+            # fetch final response (optional)
             _final = stream.get_final_response()
     return "".join(chunks).strip()
 
-
-
 def controller_decide(client: OpenAI, history: List[Dict[str, str]], current_profile: Dict[str, Any]) -> Dict[str, Any]:
-    payload = controller_prompt(history, current_profile)
+    payload = controller_payload(history)
     r = client.responses.create(**payload)
+    # Structured output → prefer output_text when present
     text = getattr(r, "output_text", "")
     if not text and getattr(r, "output", None):
         blk = r.output[0]
@@ -268,41 +269,52 @@ def controller_decide(client: OpenAI, history: List[Dict[str, str]], current_pro
         data = json.loads(text)
     except Exception:
         data = {"profile_partial": {}, "ready_to_research": False, "next_question": ""}
+
     # merge partial into profile
     prof = current_profile.copy()
     partial = data.get("profile_partial") or {}
-    for k, v in partial.get("book", {}).items():
+    for k, v in (partial.get("book") or {}).items():
         if isinstance(v, str) and not v.strip():
             continue
         prof["book"][k] = v
-    return {"profile": prof,
-            "ready_to_research": bool(data.get("ready_to_research", False)),
-            "next_question": data.get("next_question", "")[:240]}
+
+    return {
+        "profile": prof,
+        "ready_to_research": bool(data.get("ready_to_research", False)),
+        "next_question": (data.get("next_question") or "")[:240]
+    }
 
 def run_research_pipeline(client: OpenAI, profile: Dict[str, Any]) -> Dict[str, Any]:
-    title = profile["book"].get("title", "")
-    author_guess = profile["book"].get("author_guess", "")
-    # 1) search
-    r1 = client.responses.create(**research_prompt(title, author_guess))
-    content = getattr(r1, "output_text", "") or (r1.output[0]["content"][0]["text"] if getattr(r1, "output", None) else "")
+    title = profile["book"].get("title", "") or ""
+    author_guess = profile["book"].get("author_guess", "") or ""
+
+    # 1) Search (hosted tool)
+    r1 = client.responses.create(**research_payload(title, author_guess))
+    ctext = getattr(r1, "output_text", "") or (r1.output[0]["content"][0]["text"] if getattr(r1, "output", None) else "")
     try:
-        candidates = json.loads(content).get("candidates", [])
+        candidates = json.loads(ctext).get("candidates", [])
     except Exception:
         candidates = []
-    # 2) verify
-    r2 = client.responses.create(**verifier_prompt(profile["book"], candidates))
-    v_text = getattr(r2, "output_text", "") or (r2.output[0]["content"][0]["text"] if getattr(r2, "output", None) else "")
+
+    # 2) Verify (strict JSON schema)
+    r2 = client.responses.create(**verifier_payload(profile["book"], candidates))
+    vtext = getattr(r2, "output_text", "") or (r2.output[0]["content"][0]["text"] if getattr(r2, "output", None) else "")
     try:
-        verified = json.loads(v_text)
+        verified = json.loads(vtext)
     except Exception:
-        verified = {"status": "not_found", "title": title, "author": author_guess, "cover_url": "", "info_url": "", "citations": [], "verification": "Parse failed"}
-    # 3) summary
-    r3 = client.responses.create(**summary_prompt(profile["book"].get("why", ""), verified.get("title", ""), verified.get("author", "")))
-    s_text = getattr(r3, "output_text", "") or (r3.output[0]["content"][0]["text"] if getattr(r3, "output", None) else "")
+        verified = {
+            "status": "not_found", "title": title, "author": author_guess,
+            "cover_url": "", "info_url": "", "citations": [], "verification": "Parse failed"
+        }
+
+    # 3) Summary
+    r3 = client.responses.create(**summary_payload(profile["book"].get("why", ""), verified.get("title", ""), verified.get("author", "")))
+    stext = getattr(r3, "output_text", "") or (r3.output[0]["content"][0]["text"] if getattr(r3, "output", None) else "")
     try:
-        summary = json.loads(s_text)
+        summary = json.loads(stext)
     except Exception:
         summary = {"book_100w": profile["book"].get("why", ""), "one_liner": ""}
+
     return {"verified": verified, "summary": summary}
 
 # =======================
@@ -335,22 +347,30 @@ user_text = st.chat_input("Type your answer…")
 if user_text:
     # append user msg
     st.session_state.messages.append({"role": "user", "content": user_text})
-    # ask LLM to reply
+
+    # ask LLM to reply (stream)
     if agent_ready:
         reply = stream_assistant_reply(client, st.session_state.messages)
         st.session_state.messages.append({"role": "assistant", "content": reply})
+
         # controller: extract/decide/next question
         ctrl = controller_decide(client, st.session_state.messages, st.session_state.profile)
         st.session_state.profile = ctrl["profile"]
-        st.session_state.controller = {"ready_to_research": ctrl["ready_to_research"], "next_question": ctrl["next_question"]}
+        st.session_state.controller = {
+            "ready_to_research": ctrl["ready_to_research"],
+            "next_question": ctrl["next_question"]
+        }
+
         # if not ready and we have a concrete next question, show it immediately
         if not ctrl["ready_to_research"] and ctrl["next_question"]:
             st.session_state.messages.append({"role": "assistant", "content": ctrl["next_question"]})
     else:
-        st.session_state.messages.append({"role": "assistant", "content": "(Demo mode — set OPENAI_API_KEY in Streamlit Secrets.)"})
+        st.session_state.messages.append(
+            {"role": "assistant", "content": "(Demo mode — set OPENAI_API_KEY in Streamlit Secrets.)"}
+        )
     st.rerun()
 
-# If controller says we're ready, auto-signal next step
+# If controller says we're ready, auto-run research
 if st.session_state.controller.get("ready_to_research"):
     st.info("✅ I have enough info. Starting research & validation…")
     if agent_ready:
