@@ -309,48 +309,72 @@ def finish_pipeline():
     png = rasterize_svg(svg_text)
     st.download_button("PNG herunterladen", data=png, file_name="steckbrief.png", mime="image/png")
 
-# Eingabe
-if prompt := st.chat_input("Antworte dem Bot …"):
-    st.session_state.messages.append({"role":"user","content":prompt})
+# ===== Chat: Eingabe zuerst verarbeiten, dann rendern =====
 
-    # Einfache State-Machine im Frontend, Agent für Formulierung
+# 1) Erster Start: Begrüßungsfrage einstellen
+if not st.session_state.messages:
+    st.session_state.messages = [{"role": "assistant",
+                                  "content": "Hi! Lass uns einen Kurz-Steckbrief erstellen. "
+                                             "Erste Frage: Welches Buch hat dich beruflich besonders weitergebracht? "
+                                             "Bitte den Titel (Autor:in optional)."}]
+
+# 2) Eingabe (zuerst verarbeiten)
+user_text = st.chat_input("Antworte dem Bot …")
+if user_text:
+    # Nutzer-Nachricht anzeigen
+    st.session_state.messages.append({"role": "user", "content": user_text})
+
+    # Mini-Interview-State-Machine
     p = st.session_state.profile
-    text = prompt.strip()
+    t = user_text.strip()
 
+    bot_msg = None
     if not p["book"]["title"]:
-        p["book"]["title"] = text
-        st.session_state.messages.append({"role":"assistant","content":"Warum genau hat dich dieses Buch weitergebracht? 1–2 Sätze."})
+        p["book"]["title"] = t
+        bot_msg = "Danke! Warum genau hat dich dieses Buch weitergebracht? 1–2 Sätze."
     elif not p["book"]["why"]:
-        p["book"]["why"] = text
-        st.session_state.messages.append({"role":"assistant","content":"Kennst du die/den Autor:in? (optional) – sonst schreibe 'weiter'."})
+        p["book"]["why"] = t
+        bot_msg = "Super. Kennst du die/den Autor:in? (optional) – oder schreibe „weiter“."
     elif not p["book"]["author_guess"]:
-        p["book"]["author_guess"] = text
-        st.session_state.messages.append({"role":"assistant","content":"Magst du noch ein hilfreiches Tool nennen (optional)? Name reicht."})
+        p["book"]["author_guess"] = t
+        bot_msg = "Magst du noch ein hilfreiches Tool nennen (optional)? Name reicht."
     elif not p["tool"]["name"]:
-        p["tool"]["name"] = text
-        st.session_state.messages.append({"role":"assistant","content":"Kurz: Warum genau dieses Tool? Ein Satz."})
+        p["tool"]["name"] = t
+        bot_msg = "Kurz: Warum genau dieses Tool? Ein Satz."
     elif not p["tool"]["why"]:
-        p["tool"]["why"] = text
-        st.session_state.messages.append({"role":"assistant","content":"Optional: Ein Role Model? (Name) – oder schreibe 'fertig'."})
-    elif not p["role_model"]["name"] and text.lower() != "fertig":
-        p["role_model"]["name"] = text
-        st.session_state.messages.append({"role":"assistant","content":"Warum dieses Role Model? Ein Satz – oder schreibe 'fertig'."})
-    elif not p["role_model"]["why"] and text.lower() != "fertig":
-        p["role_model"]["why"] = text
-        st.session_state.messages.append({"role":"assistant","content":"Wenn du bereit bist, schreibe 'fertig'."})
+        p["tool"]["why"] = t
+        bot_msg = "Optional: Gibt es ein Role Model? (Name) – oder schreibe „fertig“."
+    elif not p["role_model"]["name"] and t.lower() != "fertig":
+        p["role_model"]["name"] = t
+        bot_msg = "Warum dieses Role Model? Ein Satz – oder schreibe „fertig“."
+    elif not p["role_model"]["why"] and t.lower() != "fertig":
+        p["role_model"]["why"] = t
+        bot_msg = "Wenn du bereit bist, schreibe „fertig“ oder klicke den Button „Recherche & Validierung starten“."
     else:
-        # Freitext → Agent antwortet
-        if st.session_state.agent_ready:
-            ask_agent(text)
+        # Freitext → optional Agent-Antwort (nur wenn API vorhanden)
+        if st.session_state.get("agent_ready"):
+            ask_agent(t)  # streamt live ins UI
+            bot_msg = None  # ask_agent hat schon gerendert
         else:
-            st.session_state.messages.append({"role":"assistant","content":"(Kein API-Key gesetzt; Demo-Modus)"})
+            bot_msg = "(Demo-Modus ohne OpenAI-Key)"
 
-# Finish-Button (oder Keyword)
+    if bot_msg:
+        st.session_state.messages.append({"role": "assistant", "content": bot_msg})
+
+    # Sofort neu rendern, damit die Antwort sichtbar ist
+    st.rerun()
+
+# 3) Jetzt den aktuellen Verlauf rendern
+for m in st.session_state.messages:
+    with st.chat_message(m["role"]):
+        st.markdown(m["content"])
+
+# 4) Finish/Reset Buttons (wie gehabt)
 col1, col2 = st.columns(2)
 with col1:
     if st.button("🔎 Recherche & Validierung starten"):
         if not OPENAI_API_KEY:
-            st.error("OPENAI_API_KEY fehlt.")
+            st.error("OPENAI_API_KEY fehlt. Lege ihn in den Streamlit-Secrets an.")
         else:
             with st.status("Suche Buchkandidaten, prüfe Quellen, erstelle Zusammenfassung …", expanded=True) as status:
                 finish_pipeline()
@@ -361,3 +385,4 @@ with col2:
             if k in st.session_state: del st.session_state[k]
         init_session()
         st.rerun()
+
