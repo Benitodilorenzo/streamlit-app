@@ -1,11 +1,10 @@
-# app.py — Expert Card Multi-Agent (Streamlit + OpenAI Responses + Vision)
-# Director-Chat führt natürliches Gespräch (ohne redundante Bestätigungen),
-# triggert eigenständig Actions (z. B. search_cover).
-# Hintergrund-Pipeline: Websuche -> Vision-Validierung -> Finalizer.
-# Ausgabe: Zweispalten-Layout (Bild links, Text rechts).
+# app.py — Expert Card Multi-Agents (Director + Web Search + Vision + Finalizer)
+# - Natürliches Gespräch (Director, GPT-5), ohne redundante Bestätigungen
+# - Aktionen (search_cover) werden autonom ausgelöst
+# - Hintergrund-Pipeline: Websuche → Vision-Validierung → Finalizer
+# - UI: Bild links, finaler Absatz rechts (pro Topic)
 
 import os
-import io
 import json
 import uuid
 import threading
@@ -14,7 +13,6 @@ from typing import List, Dict, Any, Optional
 
 import streamlit as st
 from openai import OpenAI
-from PIL import Image
 import requests
 
 # =======================
@@ -23,41 +21,38 @@ import requests
 APP_TITLE = "Expert Card – Mini Agents (Vision)"
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "")
 
-# Basis-Modelle
-CHAT_MODEL_PRIMARY = os.getenv("DTBR_CHAT_MODEL", "gpt-5")            # Gespräch, Controller, Finalizer, Vision-Validator
+# Modelle (Primär + Fallbacks)
+CHAT_MODEL_PRIMARY = os.getenv("DTBR_CHAT_MODEL", "gpt-5")
 CHAT_MODEL_FALLBACKS = ["gpt-4o", "gpt-4o-mini"]
 
-SEARCH_MODEL_PRIMARY = os.getenv("DTBR_SEARCH_MODEL", "gpt-5")        # mit web_search Tool
+SEARCH_MODEL_PRIMARY = os.getenv("DTBR_SEARCH_MODEL", "gpt-5")  # Responses + web_search
 SEARCH_MODEL_FALLBACKS = ["gpt-4.1", "gpt-4o"]
 
 # Downloads
 ALLOWED_IMAGE_MIME = {"image/jpeg", "image/png", "image/webp"}
 HTTP_TIMEOUT = 20
 
-SHOW_DEBUG = False  # True -> Debugblöcke
+# Debug UI (optional)
+SHOW_DEBUG = False
 
 # =======================
-# SESSION
+# SESSION STATE
 # =======================
 def ensure_session():
     if "messages" not in st.session_state:
         st.session_state.messages: List[Dict[str, Any]] = [
             {"role": "system", "content": system_director_prompt()},
-            {"role": "assistant", "content": (
+            {"role": "assistant", "content":
                 "Hi! I'll help you craft a tiny expert card. "
                 "First, which book has helped you professionally? "
-                "Please give the title (author optional)."
-            )},
+                "Please give the title (author optional)."}
         ]
-    if "facts" not in st.session_state:
-        # Platz für mehr als nur Buch: Podcasts, Role Model etc. (optional)
-        st.session_state.facts = {
-            "book": {"title": "", "author_guess": "", "why": ""}
-        }
+    if "profile" not in st.session_state:
+        st.session_state.profile = {"topics": []}  # siehe Topic-Objekte unten
     if "tasks" not in st.session_state:
-        st.session_state.tasks: Dict[str, Dict[str, Any]] = {}  # task_id -> dict(status, result, error, kind)
+        st.session_state.tasks: Dict[str, Dict[str, Any]] = {}  # id -> {status, kind, ...}
     if "results" not in st.session_state:
-        st.session_state.results: List[Dict[str, Any]] = []     # fertige Ergebnisse (Bild + Finalizer-Text)
+        st.session_state.results: List[Dict[str, Any]] = []      # fertige Kacheln (Bild + Text)
     if "last_director_json" not in st.session_state:
         st.session_state.last_director_json = None
 
@@ -70,35 +65,37 @@ def get_client() -> OpenAI:
 # PROMPTS
 # =======================
 def system_director_prompt() -> str:
-    """
-    Chat-Agent (Director):
-    - führt natürliches, freundliches Gespräch (Default Englisch; spiegle Nutzersprache, wenn eindeutig nicht Englisch),
-    - sammelt mind. Buch.Titel; optional Autor; und eine kurze Begründung (1–2 Sätze),
-    - KEINE redundanten Bestätigungen („Is that correct?“ etc.),
-    - wenn ausreichend eindeutig: ohne Nachfrage Action `search_cover` starten,
-    - bei Mehrdeutigkeit: genau EINE knappe Disambiguation-Frage,
-    - gerne weitere, leichte Folgefragen (Podcasts, Tipps etc.) – aber nie den Nutzer „zuwortfragen“,
-    - UI erwähnt keine Hintergrundarbeit.
-    Ausgabe IMMER als JSON gemäß Schema.
-    """
     return (
         "You are the Interview Director for a tiny 'Expert Card'.\n"
         "LANGUAGE:\n"
         "- Default to English; mirror the user's language if clearly not English.\n"
         "GOALS:\n"
-        "- Collect book.title (required), optionally book.author_guess, and a short book.why (1–2 sentences).\n"
-        "- Keep conversation natural and warm; brief follow-ups are welcome (e.g., podcasts, role models, tips).\n"
+        "- Collect for topics like book/podcast/role_model/tool:\n"
+        "  • book: title (required), optional author_guess; why (1–2 sentences)\n"
+        "  • podcast: title; why (1–2 sentences)\n"
+        "  • role_model: name; why (1–2 sentences)\n"
+        "  • tool: title; why (1–2 sentences)\n"
         "BEHAVIOR:\n"
-        "- NEVER ask redundant confirmations if info is already clear.\n"
-        "- If title is present and either author is present OR the title is sufficiently unambiguous, you MAY trigger a cover search.\n"
-        "- If multiple likely authors exist, ask ONE targeted disambiguation question.\n"
-        "- Keep messages short, friendly, and specific. Avoid over-politeness.\n"
-        "OUTPUT (STRICT JSON):\n"
-        "- Return an object with:\n"
-        "  assistant_visible: string (next message to user, in user's language),\n"
-        "  facts_partial: { book: { title?, author_guess?, why? }, extras?: any },\n"
-        "  actions: [ { type: 'search_cover', title: string, author?: string } ] or [],\n"
-        "  notes: string (optional internal rationale; ignored by UI).\n"
+        "- Keep conversation warm and natural. Ask targeted follow-ups that reveal the user's thinking.\n"
+        "- NEVER ask redundant confirmations if information is already clear.\n"
+        "- If the title/name is sufficiently unambiguous (or author provided), you MAY trigger a cover/portrait search immediately.\n"
+        "- If multiple likely authors exist, ask ONE brief disambiguation question.\n"
+        "- After 1–2 meaningful follow-ups per topic, move on to another topic (e.g., podcast → role model → tool).\n"
+        "CONTROL OUTPUT (STRICT JSON):\n"
+        "{\n"
+        "  assistant_visible: string (short next message in user's language),\n"
+        "  facts_partial: {\n"
+        "    book?: {title?, author_guess?, why?},\n"
+        "    podcast?: {title?, why?},\n"
+        "    role_model?: {name?, why?},\n"
+        "    tool?: {title?, why?},\n"
+        "    extras?: object\n"
+        "  },\n"
+        "  actions: [\n"
+        "    { type:'search_cover', kind:'book|podcast|person|tool', title?:string, author?:string, name?:string }\n"
+        "  ]\n"
+        "}\n"
+        "Do not include pleasantries asking for confirmation. Keep it short and focused."
     )
 
 def director_schema() -> Dict[str, Any]:
@@ -117,6 +114,27 @@ def director_schema() -> Dict[str, Any]:
                             "why": {"type": "string"}
                         }
                     },
+                    "podcast": {
+                        "type": "object",
+                        "properties": {
+                            "title": {"type": "string"},
+                            "why": {"type": "string"}
+                        }
+                    },
+                    "role_model": {
+                        "type": "object",
+                        "properties": {
+                            "name": {"type": "string"},
+                            "why": {"type": "string"}
+                        }
+                    },
+                    "tool": {
+                        "type": "object",
+                        "properties": {
+                            "title": {"type": "string"},
+                            "why": {"type": "string"}
+                        }
+                    },
                     "extras": {"type": "object"}
                 }
             },
@@ -126,10 +144,12 @@ def director_schema() -> Dict[str, Any]:
                     "type": "object",
                     "properties": {
                         "type": {"type": "string", "enum": ["search_cover"]},
+                        "kind": {"type": "string", "enum": ["book", "podcast", "person", "tool"]},
                         "title": {"type": "string"},
-                        "author": {"type": "string"}
+                        "author": {"type": "string"},
+                        "name": {"type": "string"}
                     },
-                    "required": ["type", "title"]
+                    "required": ["type", "kind"]
                 }
             },
             "notes": {"type": "string"}
@@ -137,45 +157,114 @@ def director_schema() -> Dict[str, Any]:
         "required": ["assistant_visible", "facts_partial", "actions"]
     }
 
-def websearch_system_prompt() -> str:
-    return (
+def websearch_system_prompt(kind: str) -> str:
+    base = (
         "You are a web image search assistant.\n"
-        "Find up to three HIGH-QUALITY BOOK COVER candidates.\n"
+        "Find up to three HIGH-QUALITY image candidates for the requested item.\n"
         "Return ONLY JSON with: candidates: [ {image_url, page_url, source, title, authors[]} ].\n"
-        "Prefer trusted sources: publisher, Amazon, Goodreads, Open Library, Wikipedia/Commons.\n"
-        "Whenever possible, provide DIRECT image URLs (not thumbnails that require JS)."
+        "Prefer trusted sources: publisher, Amazon, Goodreads, Open Library, Wikipedia/Commons, or the official site/channel."
     )
+    if kind == "book":
+        return base + "\nEnsure the images are book covers (portrait aspect, visible title/author typical of covers)."
+    if kind == "podcast":
+        return base + "\nLook for podcast/youtube channel artwork (logo/title)."
+    if kind == "person":
+        return base + "\nLook for portraits (press photos, Wikipedia portrait)."
+    if kind == "tool":
+        return base + "\nLook for product/app logos or official product shots."
+    return base
 
-def validator_system_prompt() -> str:
+def validator_system_prompt(kind: str) -> str:
     return (
         "You are a VISION validator.\n"
         "Inputs:\n"
-        "- expected title/author (strings),\n"
+        "- expected (title/author/name) strings,\n"
         "- up to 3 candidate images (as image inputs) with metadata (page_url, source, scraped title/authors if available).\n"
         "Task:\n"
-        "- Inspect each image VISUALLY to judge whether it is a plausible book cover.\n"
-        "- Verify if title/author appear consistent with the expected strings (tolerate small punctuation/case variations).\n"
-        "- Prefer trustworthy sources (publisher, Amazon, Goodreads, Open Library) if images look similar.\n"
-        "Output STRICT JSON: {best_index: 0|1|2|-1, reason: string}."
+        f"- Inspect each image VISUALLY to judge whether it is a plausible {kind} image.\n"
+        "- Verify if visible title/author/name align with expected strings (tolerate minor punctuation/case differences).\n"
+        "- Prefer trustworthy sources (publisher, Amazon, Goodreads, Open Library, official site) if images look similar.\n"
+        "Output STRICT JSON: {best_index: 0|1|2|-1, reason: string, confidence: number}."
     )
 
 def finalizer_system_prompt() -> str:
     return (
-        "You are a finalizing writer. Create a professional, warm, uplifting 3–5 sentence paragraph that presents the user positively without flattery.\n"
-        "Use the interview facts and the verified book (title/author) and why it helped. Be specific, concise, and human."
+        "You are a finalizing writer. Create a professional, warm, uplifting 3–5 sentence paragraph that presents the user positively without flattery. "
+        "Use the interview facts (why the item matters to them) and the verified media (title/author/name). Be specific, concise, and human."
     )
 
 # =======================
-# OPENAI WRAPPERS
+# OPENAI WRAPPERS (robust gegen SDK Abweichungen)
 # =======================
 def responses_create(client: OpenAI, **kwargs):
     try:
         return client.responses.create(**kwargs)
     except TypeError:
+        # Fallback: ggf. Preview-Argumente entfernen
         cleaned = dict(kwargs)
         cleaned.pop("response_format", None)
         cleaned.pop("tools", None)
         return client.responses.create(**cleaned)
+
+# =======================
+# PROFILE / TOPICS
+# =======================
+def ensure_topic(profile: Dict[str, Any], kind: str, key_value: str) -> int:
+    """
+    Sucht (kind, key_value) in profile.topics; wenn nicht vorhanden, legt neuen Topic an.
+    key_value:
+      - book/tool/podcast -> title
+      - person -> name
+    """
+    topics = profile["topics"]
+    key_field = "name" if kind == "person" else "title"
+    for i, t in enumerate(topics):
+        if t.get("kind") == kind and (t.get("facts", {}).get(key_field, "") or "").lower() == (key_value or "").lower():
+            return i
+    topic = {
+        "kind": kind,
+        "facts": {key_field: key_value},
+        "status": "collecting",
+        "media": {}
+    }
+    topics.append(topic)
+    return len(topics) - 1
+
+def merge_facts(profile: Dict[str, Any], partial: Dict[str, Any]):
+    # akzeptiert book/podcast/role_model/tool
+    if not partial:
+        return
+    # BOOK
+    if "book" in partial and isinstance(partial["book"], dict):
+        idx = ensure_topic(profile, "book", partial["book"].get("title", "") or profile_key(profile, "book"))
+        st.session_state.profile["topics"][idx]["facts"].update(
+            {k: v for k, v in partial["book"].items() if isinstance(v, str) and v.strip()})
+    # PODCAST
+    if "podcast" in partial and isinstance(partial["podcast"], dict):
+        title = partial["podcast"].get("title", "") or profile_key(profile, "podcast")
+        idx = ensure_topic(profile, "podcast", title)
+        st.session_state.profile["topics"][idx]["facts"].update(
+            {k: v for k, v in partial["podcast"].items() if isinstance(v, str) and v.strip()})
+    # ROLE MODEL
+    if "role_model" in partial and isinstance(partial["role_model"], dict):
+        name = partial["role_model"].get("name", "") or profile_key(profile, "person")
+        idx = ensure_topic(profile, "person", name)
+        st.session_state.profile["topics"][idx]["facts"].update(
+            {k: v for k, v in partial["role_model"].items() if isinstance(v, str) and v.strip()})
+    # TOOL
+    if "tool" in partial and isinstance(partial["tool"], dict):
+        title = partial["tool"].get("title", "") or profile_key(profile, "tool")
+        idx = ensure_topic(profile, "tool", title)
+        st.session_state.profile["topics"][idx]["facts"].update(
+            {k: v for k, v in partial["tool"].items() if isinstance(v, str) and v.strip()})
+
+def profile_key(profile: Dict[str, Any], kind: str) -> str:
+    # notfalls leeres lookup
+    for t in profile["topics"]:
+        if t["kind"] == kind:
+            key_field = "name" if kind == "person" else "title"
+            return t.get("facts", {}).get(key_field, "")
+    return ""
 
 # =======================
 # AGENT CALLS
@@ -188,10 +277,10 @@ def call_director(client: OpenAI, history: List[Dict[str, Any]]) -> Dict[str, An
                             "json_schema": {"name": "director_control", "schema": schema, "strict": True}},
         "input": [
             {"role": "system", "content": system_director_prompt()},
-            *history[2:]  # skip initial system+assistant boot messages already in history
+            *history[2:]  # initial system + first assistant already in history
         ]
     }
-    last = None
+    last_err = None
     for m in [CHAT_MODEL_PRIMARY, *CHAT_MODEL_FALLBACKS]:
         payload["model"] = m
         try:
@@ -203,56 +292,62 @@ def call_director(client: OpenAI, history: List[Dict[str, Any]]) -> Dict[str, An
                     text = blk["content"][0]["text"]
             return json.loads(text)
         except Exception as e:
-            last = e
+            last_err = e
             continue
-    raise last
+    raise last_err
 
-def call_websearch(client: OpenAI, title: str, author: str) -> Dict[str, Any]:
+def call_websearch(client: OpenAI, kind: str, title_or_name: str, author: str = "") -> Dict[str, Any]:
     payload = {
         "model": SEARCH_MODEL_PRIMARY,
-        "tools": [{"type": "web_search"}],  # Responses + Web Search Tool
+        "tools": [{"type": "web_search"}],
         "response_format": {"type": "json_object"},
         "input": [
-            {"role": "system", "content": websearch_system_prompt()},
-            {"role": "user", "content": json.dumps({"book_title": title, "author": author}, separators=(",", ":"))}
+            {"role": "system", "content": websearch_system_prompt(kind)},
+            {"role": "user", "content": json.dumps({
+                "kind": kind,
+                "title_or_name": title_or_name,
+                "author": author
+            }, separators=(",", ":"))}
         ]
     }
-    last = None
+    last_err = None
     for m in [SEARCH_MODEL_PRIMARY, *SEARCH_MODEL_FALLBACKS]:
         payload["model"] = m
         try:
             r = responses_create(client, **payload)
             text = getattr(r, "output_text", "") or (r.output[0]["content"][0]["text"] if getattr(r, "output", None) else "")
             data = json.loads(text) if text else {}
-            return {"candidates": (data.get("candidates") or [])[:3]}
+            cands = data.get("candidates") or []
+            return {"candidates": cands[:3]}
         except Exception as e:
-            last = e
+            last_err = e
             continue
-    raise last
+    raise last_err
 
-def call_vision_validator(client: OpenAI, expected_title: str, expected_author: str,
+def call_vision_validator(client: OpenAI, kind: str,
+                          expected_title: str, expected_author_or_name: str,
                           candidates: List[Dict[str, Any]]) -> Dict[str, Any]:
-    """
-    Vision-Validierung: wir geben die Bilder direkt als Bild-Inputs in die Responses API.
-    """
-    # Baue einen Input-Block mit Text + bis zu 3 "input_image" Content-Parts
+    # baue Content Parts: zuerst Text, dann bis zu 3 Bilder
     content_parts: List[Dict[str, Any]] = [
         {"type": "input_text",
          "text": json.dumps({
+             "kind": kind,
              "expected_title": expected_title,
-             "expected_author": expected_author,
+             "expected_author_or_name": expected_author_or_name,
              "candidates_meta": [
-                 {"page_url": c.get("page_url", ""), "source": c.get("source", ""),
-                  "title": c.get("title", ""), "authors": c.get("authors", [])}
-                 for c in candidates[:3]
+                 {
+                     "page_url": c.get("page_url", ""),
+                     "source": c.get("source", ""),
+                     "title": c.get("title", ""),
+                     "authors": c.get("authors", []),
+                     "image_url": c.get("image_url", "")
+                 } for c in candidates[:3]
              ]
          }, separators=(",", ":"))}
     ]
-
     for c in candidates[:3]:
-        img_url = c.get("image_url")
-        if img_url:
-            content_parts.append({"type": "input_image", "image_url": img_url})
+        if c.get("image_url"):
+            content_parts.append({"type": "input_image", "image_url": c["image_url"]})
 
     payload = {
         "model": CHAT_MODEL_PRIMARY,  # Vision-fähig
@@ -262,37 +357,41 @@ def call_vision_validator(client: OpenAI, expected_title: str, expected_author: 
                                                 "type": "object",
                                                 "properties": {
                                                     "best_index": {"type": "integer"},
-                                                    "reason": {"type": "string"}
+                                                    "reason": {"type": "string"},
+                                                    "confidence": {"type": "number"}
                                                 },
-                                                "required": ["best_index", "reason"]
+                                                "required": ["best_index", "reason", "confidence"]
                                             },
                                             "strict": True}},
         "input": [
-            {"role": "system", "content": validator_system_prompt()},
+            {"role": "system", "content": validator_system_prompt(kind)},
             {"role": "user", "content": content_parts}
         ]
     }
-    last = None
+    last_err = None
     for m in [CHAT_MODEL_PRIMARY, *CHAT_MODEL_FALLBACKS]:
         payload["model"] = m
         try:
             r = responses_create(client, **payload)
             text = getattr(r, "output_text", "") or (r.output[0]["content"][0]["text"] if getattr(r, "output", None) else "")
-            return json.loads(text) if text else {"best_index": -1, "reason": "No output"}
+            return json.loads(text) if text else {"best_index": -1, "reason": "No output", "confidence": 0.0}
         except Exception as e:
-            last = e
+            last_err = e
             continue
-    raise last
+    raise last_err
 
-def call_finalizer(client: OpenAI, facts: Dict[str, Any], chosen: Dict[str, Any]) -> str:
+def call_finalizer(client: OpenAI, facts: Dict[str, Any], chosen_meta: Dict[str, Any]) -> str:
     payload = {
         "model": CHAT_MODEL_PRIMARY,
         "input": [
             {"role": "system", "content": finalizer_system_prompt()},
-            {"role": "user", "content": json.dumps({"facts": facts, "verified_book": chosen}, separators=(",", ":"))}
+            {"role": "user", "content": json.dumps({
+                "facts": facts,
+                "verified_media": chosen_meta
+            }, separators=(",", ":"))}
         ]
     }
-    last = None
+    last_err = None
     for m in [CHAT_MODEL_PRIMARY, *CHAT_MODEL_FALLBACKS]:
         payload["model"] = m
         try:
@@ -300,12 +399,12 @@ def call_finalizer(client: OpenAI, facts: Dict[str, Any], chosen: Dict[str, Any]
             txt = getattr(r, "output_text", "") or (r.output[0]["content"][0]["text"] if getattr(r, "output", None) else "")
             return (txt or "").strip()
         except Exception as e:
-            last = e
+            last_err = e
             continue
-    raise last
+    raise last_err
 
 # =======================
-# IMAGE DOWNLOAD (für Anzeige)
+# DOWNLOADER (nur für Anzeige)
 # =======================
 def safe_download_image(url: str) -> Optional[str]:
     try:
@@ -314,9 +413,9 @@ def safe_download_image(url: str) -> Optional[str]:
             ctype = r.headers.get("Content-Type", "").split(";")[0].strip().lower()
             if ctype not in ALLOWED_IMAGE_MIME:
                 return None
-            fd, path = tempfile.mkstemp(prefix="cover_", suffix={
-                "image/jpeg": ".jpg", "image/png": ".png", "image/webp": ".webp"
-            }.get(ctype, ".img"))
+            # einfache Dateiendung anhand MIME
+            suf = { "image/jpeg": ".jpg", "image/png": ".png", "image/webp": ".webp" }.get(ctype, ".img")
+            fd, path = tempfile.mkstemp(prefix="cover_", suffix=suf)
             with os.fdopen(fd, "wb") as f:
                 for chunk in r.iter_content(8192):
                     f.write(chunk)
@@ -325,44 +424,62 @@ def safe_download_image(url: str) -> Optional[str]:
         return None
 
 # =======================
-# BACKGROUND TASK: COVER SEARCH → VALIDATE (VISION) → FINALIZE
+# BACKGROUND TASKS
 # =======================
-def start_cover_task(client: OpenAI, title: str, author: str, facts_snapshot: Dict[str, Any]):
+def start_cover_task(client: OpenAI, kind: str, title_or_name: str, author: str, topic_index: int, facts_snapshot: Dict[str, Any]):
+    """
+    Startet: Websuche -> Vision-Validierung -> Finalizer.
+    Speichert Ergebnis in st.session_state.results.
+    """
     task_id = str(uuid.uuid4())
-    st.session_state.tasks[task_id] = {"status": "running", "error": "", "result": None, "kind": "cover"}
+    st.session_state.tasks[task_id] = {"status": "running", "kind": "cover", "topic_index": topic_index, "error": "", "result": None}
 
     def worker():
         try:
-            # 1) Websuche (bis zu 3 Kandidaten)
-            found = call_websearch(client, title, author)
+            # Status auf searching
+            st.session_state.profile["topics"][topic_index]["status"] = "searching"
+
+            # 1) Websuche
+            found = call_websearch(client, kind, title_or_name, author)
             candidates = (found.get("candidates") or [])[:3]
+            st.session_state.profile["topics"][topic_index].setdefault("media", {})["candidates"] = candidates
 
             # 2) Vision-Validierung
-            val = call_vision_validator(client, title, author, candidates)
+            st.session_state.profile["topics"][topic_index]["status"] = "validating"
+            expected_title = title_or_name if kind != "person" else ""
+            expected_author_or_name = author if kind == "book" else (title_or_name if kind == "person" else "")
+            val = call_vision_validator(client, kind, expected_title, expected_author_or_name, candidates)
             best_i = val.get("best_index", -1)
             reason = val.get("reason", "")
+            conf = float(val.get("confidence", 0.0))
 
             chosen = candidates[best_i] if 0 <= best_i < len(candidates) else {}
-            img_path = None
-            if chosen.get("image_url"):
-                img_path = safe_download_image(chosen["image_url"])
+            st.session_state.profile["topics"][topic_index]["media"]["validator"] = val
+            st.session_state.profile["topics"][topic_index]["media"]["chosen"] = chosen
 
             # 3) Finalizer-Text
             final_txt = call_finalizer(client, facts_snapshot, chosen)
 
+            # Ergebnis-Kachel
             res = {
-                "title": title,
-                "author": author,
-                "chosen_meta": chosen,
-                "validator_reason": reason,
-                "final_text": final_txt,
-                "local_image": img_path,
-                "all_candidates": candidates
+                "topic_index": topic_index,
+                "kind": kind,
+                "image": {
+                    "image_url": chosen.get("image_url"),
+                    "page_url": chosen.get("page_url"),
+                    "source": chosen.get("source")
+                },
+                "text": {"final_paragraph": final_txt},
+                "meta": {"validator_reason": reason, "confidence": conf}
             }
-            st.session_state.tasks[task_id] = {"status": "done", "error": "", "result": res, "kind": "cover"}
             st.session_state.results.append(res)
+
+            # Status fertig
+            st.session_state.profile["topics"][topic_index]["status"] = "ready"
+            st.session_state.tasks[task_id] = {"status": "done", "kind": "cover", "topic_index": topic_index, "error": "", "result": res}
         except Exception as e:
-            st.session_state.tasks[task_id] = {"status": "error", "error": str(e), "result": None, "kind": "cover"}
+            st.session_state.profile["topics"][topic_index]["status"] = "failed"
+            st.session_state.tasks[task_id] = {"status": "error", "kind": "cover", "topic_index": topic_index, "error": str(e), "result": None}
 
     threading.Thread(target=worker, daemon=True).start()
 
@@ -371,11 +488,11 @@ def start_cover_task(client: OpenAI, title: str, author: str, facts_snapshot: Di
 # =======================
 st.set_page_config(page_title=APP_TITLE, page_icon="🟡", layout="centered")
 st.title("Dein Kurz-Steckbrief")
-st.caption("Director decides; background cover search with Vision; final shows as two columns")
+st.caption("Director decides • parallel web search + vision validate • final shows as two columns")
 
 ensure_session()
 
-# Verlauf anzeigen (ohne initiales system)
+# Verlauf (ohne initiales system)
 for m in st.session_state.messages:
     if m["role"] == "system":
         continue
@@ -391,75 +508,102 @@ except Exception as e:
     agent_ready = False
     st.error(f"OpenAI key missing: {e}")
 
-# Chat input
+# Chat Input
 user_text = st.chat_input("Type your answer…")
 if user_text:
     st.session_state.messages.append({"role": "user", "content": user_text})
+
     if agent_ready:
-        # Director (ein Call, strukturiert)
-        dj = call_director(client, st.session_state.messages)
-        st.session_state.last_director_json = dj
+        # Director entscheidet (liefert sichtbaren Satz + actions + facts_partial)
+        director_json = call_director(client, st.session_state.messages)
+        st.session_state.last_director_json = director_json
 
-        # Fakten mergen
-        facts_partial = dj.get("facts_partial") or {}
-        bp = (facts_partial.get("book") or {})
-        for k, v in bp.items():
-            if isinstance(v, str) and not v.strip():
-                continue
-            st.session_state.facts["book"][k] = v
+        # Merge Facts
+        merge_facts(st.session_state.profile, director_json.get("facts_partial") or {})
 
-        # Sichtbarer Bot-Text
-        vis = (dj.get("assistant_visible") or "").strip()
+        # Sichtbare Antwort
+        vis = (director_json.get("assistant_visible") or "").strip()
         if vis:
             st.session_state.messages.append({"role": "assistant", "content": vis})
 
-        # Aktionen
-        for act in (dj.get("actions") or []):
+        # Aktionen ausführen (parallel)
+        for act in (director_json.get("actions") or []):
             if act.get("type") == "search_cover":
-                title = (act.get("title") or st.session_state.facts["book"].get("title", "")).strip()
-                author = (act.get("author") or st.session_state.facts["book"].get("author_guess", "")).strip()
-                if title:
-                    snapshot = json.loads(json.dumps(st.session_state.facts))
-                    start_cover_task(client, title, author, snapshot)
+                kind = (act.get("kind") or "").strip()
+                if not kind:
+                    continue
+                if kind == "person":
+                    name = (act.get("name") or "").strip()
+                    if not name:
+                        # ggf. aus Facts holen
+                        name = profile_key(st.session_state.profile, "person")
+                    if not name:
+                        continue
+                    idx = ensure_topic(st.session_state.profile, "person", name)
+                    # Deduplizieren: nicht mehrfach starten
+                    if st.session_state.profile["topics"][idx]["status"] in ("queued", "searching", "validating"):
+                        continue
+                    st.session_state.profile["topics"][idx]["status"] = "queued"
+                    snapshot = json.loads(json.dumps(st.session_state.profile["topics"][idx]["facts"]))
+                    start_cover_task(client, "person", name, "", idx, {"topic": snapshot})
+                else:
+                    title = (act.get("title") or "").strip()
+                    author = (act.get("author") or "").strip()
+                    if not title:
+                        title = profile_key(st.session_state.profile, kind)
+                    if not title:
+                        continue
+                    idx = ensure_topic(st.session_state.profile, kind, title)
+                    if st.session_state.profile["topics"][idx]["status"] in ("queued", "searching", "validating"):
+                        continue
+                    st.session_state.profile["topics"][idx]["status"] = "queued"
+                    snapshot = json.loads(json.dumps(st.session_state.profile["topics"][idx]["facts"]))
+                    start_cover_task(client, kind, title, author, idx, {"topic": snapshot})
 
     else:
         st.session_state.messages.append({"role": "assistant",
                                           "content": "(Demo mode — set OPENAI_API_KEY in Streamlit Secrets.)"})
+
     st.rerun()
 
-# Status laufender Tasks
+# Laufende Tasks
 running = [t for t in st.session_state.tasks.values() if t["status"] == "running"]
 if running:
-    st.info("🔎 Background research running… feel free to continue the chat.")
+    st.info("🔎 Background research running… you can keep chatting.")
 
-# Ergebnisse anzeigen
+# Ergebnisse
 if st.session_state.results:
     st.subheader("Results")
     for res in st.session_state.results[::-1]:
         c1, c2 = st.columns([1, 1.25])
         with c1:
-            if res.get("local_image") and os.path.exists(res["local_image"]):
-                st.image(res["local_image"], caption=res.get("chosen_meta", {}).get("source", ""), use_container_width=True)
-            elif res.get("chosen_meta", {}).get("image_url"):
-                # Fallback: zeige Remote-URL (Streamlit kann das direkt)
-                st.image(res["chosen_meta"]["image_url"], caption=res.get("chosen_meta", {}).get("source", ""), use_container_width=True)
+            img_url = res.get("image", {}).get("image_url")
+            if img_url:
+                st.image(img_url, caption=res.get("image", {}).get("source", ""), use_container_width=True)
             else:
                 st.write("No image available.")
         with c2:
-            st.markdown(f"**Book:** {res.get('title','')} — {res.get('author','')}")
-            st.write(res.get("final_text", ""))
-            cm = res.get("chosen_meta") or {}
-            if cm.get("page_url"):
-                st.markdown(f"[Source]({cm['page_url']})")
+            kind = res.get("kind", "")
+            title_line = ""
+            if kind == "person":
+                title_line = f"**Person:** {res.get('image', {}).get('title','') or ''}"
+            else:
+                # für book/podcast/tool zeigen wir title/author falls vorhanden (aus meta ggf. nicht immer gesetzt)
+                title_line = f"**{kind.capitalize()}:**"
+            st.markdown(title_line)
+            st.write(res.get("text", {}).get("final_paragraph", ""))
+            page_url = res.get("image", {}).get("page_url")
+            if page_url:
+                st.markdown(f"[Source]({page_url})")
             if SHOW_DEBUG:
-                with st.expander("Debug (metadata)"):
+                with st.expander("Debug"):
                     st.code(json.dumps(res, indent=2))
 
 # Controls
 c1, c2, c3 = st.columns(3)
 with c1:
     if st.button("🔄 Restart interview"):
-        for k in ["messages", "facts", "tasks", "results", "last_director_json"]:
+        for k in ["messages", "profile", "tasks", "results", "last_director_json"]:
             if k in st.session_state:
                 del st.session_state[k]
         ensure_session()
