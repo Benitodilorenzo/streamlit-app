@@ -1,15 +1,17 @@
 # app.py — Expert Card Multi-Agents (Director + Web Search + Vision + Finalizer)
+# Robust gegen nicht-wohlgeformtes JSON: sichere Parser + Fallbacks.
 # - Natürliches Gespräch (Director, GPT-5), ohne redundante Bestätigungen
 # - Aktionen (search_cover) werden autonom ausgelöst
 # - Hintergrund-Pipeline: Websuche → Vision-Validierung → Finalizer
 # - UI: Bild links, finaler Absatz rechts (pro Topic)
 
 import os
+import re
 import json
 import uuid
 import threading
 import tempfile
-from typing import List, Dict, Any, Optional
+from typing import List, Dict, Any, Optional, Tuple
 
 import streamlit as st
 from openai import OpenAI
@@ -32,8 +34,9 @@ SEARCH_MODEL_FALLBACKS = ["gpt-4.1", "gpt-4o"]
 ALLOWED_IMAGE_MIME = {"image/jpeg", "image/png", "image/webp"}
 HTTP_TIMEOUT = 20
 
-# Debug UI (optional)
-SHOW_DEBUG = False
+# UI Debug Toggle (per Checkbox ein-/ausschaltbar)
+if "SHOW_DEBUG" not in st.session_state:
+    st.session_state.SHOW_DEBUG = False
 
 # =======================
 # SESSION STATE
@@ -55,6 +58,8 @@ def ensure_session():
         st.session_state.results: List[Dict[str, Any]] = []      # fertige Kacheln (Bild + Text)
     if "last_director_json" not in st.session_state:
         st.session_state.last_director_json = None
+    if "last_raw_director_text" not in st.session_state:
+        st.session_state.last_raw_director_text = ""
 
 def get_client() -> OpenAI:
     if not OPENAI_API_KEY:
@@ -95,7 +100,7 @@ def system_director_prompt() -> str:
         "    { type:'search_cover', kind:'book|podcast|person|tool', title?:string, author?:string, name?:string }\n"
         "  ]\n"
         "}\n"
-        "Do not include pleasantries asking for confirmation. Keep it short and focused."
+        "Output ONLY the JSON object. No prose, no backticks."
     )
 
 def director_schema() -> Dict[str, Any]:
@@ -162,7 +167,8 @@ def websearch_system_prompt(kind: str) -> str:
         "You are a web image search assistant.\n"
         "Find up to three HIGH-QUALITY image candidates for the requested item.\n"
         "Return ONLY JSON with: candidates: [ {image_url, page_url, source, title, authors[]} ].\n"
-        "Prefer trusted sources: publisher, Amazon, Goodreads, Open Library, Wikipedia/Commons, or the official site/channel."
+        "Prefer trusted sources: publisher, Amazon, Goodreads, Open Library, Wikipedia/Commons, or the official site/channel.\n"
+        "No extra text; JSON only."
     )
     if kind == "book":
         return base + "\nEnsure the images are book covers (portrait aspect, visible title/author typical of covers)."
@@ -184,7 +190,7 @@ def validator_system_prompt(kind: str) -> str:
         f"- Inspect each image VISUALLY to judge whether it is a plausible {kind} image.\n"
         "- Verify if visible title/author/name align with expected strings (tolerate minor punctuation/case differences).\n"
         "- Prefer trustworthy sources (publisher, Amazon, Goodreads, Open Library, official site) if images look similar.\n"
-        "Output STRICT JSON: {best_index: 0|1|2|-1, reason: string, confidence: number}."
+        "Output STRICT JSON: {best_index: 0|1|2|-1, reason: string, confidence: number}. No prose."
     )
 
 def finalizer_system_prompt() -> str:
@@ -194,13 +200,75 @@ def finalizer_system_prompt() -> str:
     )
 
 # =======================
-# OPENAI WRAPPERS (robust gegen SDK Abweichungen)
+# JSON PARSER (robust)
+# =======================
+CODE_FENCE_RE = re.compile(r"^```(?:json)?\s*|\s*```$", re.IGNORECASE | re.MULTILINE)
+
+def strip_code_fences(s: str) -> str:
+    return CODE_FENCE_RE.sub("", s).strip()
+
+def extract_balanced_json(s: str) -> Optional[str]:
+    """
+    Find the first balanced {...} block and return it. Handles nested braces, quotes, and escapes.
+    """
+    start = s.find("{")
+    if start < 0:
+        return None
+    depth = 0
+    in_str = False
+    esc = False
+    for i in range(start, len(s)):
+        ch = s[i]
+        if in_str:
+            if esc:
+                esc = False
+            elif ch == "\\":
+                esc = True
+            elif ch == '"':
+                in_str = False
+        else:
+            if ch == '"':
+                in_str = True
+            elif ch == "{":
+                depth += 1
+            elif ch == "}":
+                depth -= 1
+                if depth == 0:
+                    return s[start:i+1]
+    return None
+
+def parse_json_strict_or_best_effort(text: str) -> Tuple[Optional[dict], Optional[str]]:
+    """
+    Try to parse JSON. If it fails, try to strip code fences and extract a balanced JSON block.
+    Returns (data, raw_used_text) — data is dict or None; raw_used_text shows what we attempted.
+    """
+    raw = text or ""
+    try:
+        return json.loads(raw), raw
+    except Exception:
+        pass
+    cleaned = strip_code_fences(raw)
+    try:
+        return json.loads(cleaned), cleaned
+    except Exception:
+        pass
+    maybe = extract_balanced_json(cleaned)
+    if maybe:
+        try:
+            return json.loads(maybe), maybe
+        except Exception:
+            return None, maybe
+    return None, cleaned
+
+# =======================
+# OPENAI WRAPPER
 # =======================
 def responses_create(client: OpenAI, **kwargs):
+    # leichte „Deterministik“
+    kwargs.setdefault("temperature", 0.2)
     try:
         return client.responses.create(**kwargs)
     except TypeError:
-        # Fallback: ggf. Preview-Argumente entfernen
         cleaned = dict(kwargs)
         cleaned.pop("response_format", None)
         cleaned.pop("tools", None)
@@ -210,12 +278,6 @@ def responses_create(client: OpenAI, **kwargs):
 # PROFILE / TOPICS
 # =======================
 def ensure_topic(profile: Dict[str, Any], kind: str, key_value: str) -> int:
-    """
-    Sucht (kind, key_value) in profile.topics; wenn nicht vorhanden, legt neuen Topic an.
-    key_value:
-      - book/tool/podcast -> title
-      - person -> name
-    """
     topics = profile["topics"]
     key_field = "name" if kind == "person" else "title"
     for i, t in enumerate(topics):
@@ -231,35 +293,30 @@ def ensure_topic(profile: Dict[str, Any], kind: str, key_value: str) -> int:
     return len(topics) - 1
 
 def merge_facts(profile: Dict[str, Any], partial: Dict[str, Any]):
-    # akzeptiert book/podcast/role_model/tool
     if not partial:
         return
     # BOOK
     if "book" in partial and isinstance(partial["book"], dict):
-        idx = ensure_topic(profile, "book", partial["book"].get("title", "") or profile_key(profile, "book"))
-        st.session_state.profile["topics"][idx]["facts"].update(
-            {k: v for k, v in partial["book"].items() if isinstance(v, str) and v.strip()})
+        title = partial["book"].get("title", "") or profile_key(profile, "book")
+        idx = ensure_topic(profile, "book", title)
+        profile["topics"][idx]["facts"].update({k: v for k, v in partial["book"].items() if isinstance(v, str) and v.strip()})
     # PODCAST
     if "podcast" in partial and isinstance(partial["podcast"], dict):
         title = partial["podcast"].get("title", "") or profile_key(profile, "podcast")
         idx = ensure_topic(profile, "podcast", title)
-        st.session_state.profile["topics"][idx]["facts"].update(
-            {k: v for k, v in partial["podcast"].items() if isinstance(v, str) and v.strip()})
+        profile["topics"][idx]["facts"].update({k: v for k, v in partial["podcast"].items() if isinstance(v, str) and v.strip()})
     # ROLE MODEL
     if "role_model" in partial and isinstance(partial["role_model"], dict):
         name = partial["role_model"].get("name", "") or profile_key(profile, "person")
         idx = ensure_topic(profile, "person", name)
-        st.session_state.profile["topics"][idx]["facts"].update(
-            {k: v for k, v in partial["role_model"].items() if isinstance(v, str) and v.strip()})
+        profile["topics"][idx]["facts"].update({k: v for k, v in partial["role_model"].items() if isinstance(v, str) and v.strip()})
     # TOOL
     if "tool" in partial and isinstance(partial["tool"], dict):
         title = partial["tool"].get("title", "") or profile_key(profile, "tool")
         idx = ensure_topic(profile, "tool", title)
-        st.session_state.profile["topics"][idx]["facts"].update(
-            {k: v for k, v in partial["tool"].items() if isinstance(v, str) and v.strip()})
+        profile["topics"][idx]["facts"].update({k: v for k, v in partial["tool"].items() if isinstance(v, str) and v.strip()})
 
 def profile_key(profile: Dict[str, Any], kind: str) -> str:
-    # notfalls leeres lookup
     for t in profile["topics"]:
         if t["kind"] == kind:
             key_field = "name" if kind == "person" else "title"
@@ -285,16 +342,33 @@ def call_director(client: OpenAI, history: List[Dict[str, Any]]) -> Dict[str, An
         payload["model"] = m
         try:
             r = responses_create(client, **payload)
+            # Raw-Text extrahieren
             text = getattr(r, "output_text", "")
             if not text and getattr(r, "output", None):
                 blk = r.output[0]
                 if blk and blk.get("content") and blk["content"][0].get("text"):
                     text = blk["content"][0]["text"]
-            return json.loads(text)
+            st.session_state.last_raw_director_text = text or ""
+            data, used = parse_json_strict_or_best_effort(text or "")
+            if data is not None:
+                return data
+            # Fallback: sichere Minimalstruktur
+            return {
+                "assistant_visible": "Got it! What makes it stand out for you? A sentence or two is enough.",
+                "facts_partial": {},
+                "actions": []
+            }
         except Exception as e:
             last_err = e
             continue
-    raise last_err
+    # Wenn gar nichts klappt, immer noch eine sichere Antwort zurückgeben
+    if last_err:
+        st.session_state.last_raw_director_text = f"(error: {last_err})"
+    return {
+        "assistant_visible": "Thanks! Tell me briefly why this matters to you.",
+        "facts_partial": {},
+        "actions": []
+    }
 
 def call_websearch(client: OpenAI, kind: str, title_or_name: str, author: str = "") -> Dict[str, Any]:
     payload = {
@@ -316,18 +390,19 @@ def call_websearch(client: OpenAI, kind: str, title_or_name: str, author: str = 
         try:
             r = responses_create(client, **payload)
             text = getattr(r, "output_text", "") or (r.output[0]["content"][0]["text"] if getattr(r, "output", None) else "")
-            data = json.loads(text) if text else {}
-            cands = data.get("candidates") or []
+            data, _ = parse_json_strict_or_best_effort(text or "")
+            cands = (data or {}).get("candidates") or []
             return {"candidates": cands[:3]}
         except Exception as e:
             last_err = e
             continue
-    raise last_err
+    # Fallback
+    return {"candidates": []}
 
 def call_vision_validator(client: OpenAI, kind: str,
                           expected_title: str, expected_author_or_name: str,
                           candidates: List[Dict[str, Any]]) -> Dict[str, Any]:
-    # baue Content Parts: zuerst Text, dann bis zu 3 Bilder
+    # Text + bis zu 3 Bilder
     content_parts: List[Dict[str, Any]] = [
         {"type": "input_text",
          "text": json.dumps({
@@ -374,15 +449,19 @@ def call_vision_validator(client: OpenAI, kind: str,
         try:
             r = responses_create(client, **payload)
             text = getattr(r, "output_text", "") or (r.output[0]["content"][0]["text"] if getattr(r, "output", None) else "")
-            return json.loads(text) if text else {"best_index": -1, "reason": "No output", "confidence": 0.0}
+            data, _ = parse_json_strict_or_best_effort(text or "")
+            if data is None:
+                return {"best_index": -1, "reason": "Parse failed", "confidence": 0.0}
+            return data
         except Exception as e:
             last_err = e
             continue
-    raise last_err
+    return {"best_index": -1, "reason": "Validator failed", "confidence": 0.0}
 
 def call_finalizer(client: OpenAI, facts: Dict[str, Any], chosen_meta: Dict[str, Any]) -> str:
     payload = {
         "model": CHAT_MODEL_PRIMARY,
+        "temperature": 0.6,  # finaler Text darf etwas wärmer sein
         "input": [
             {"role": "system", "content": finalizer_system_prompt()},
             {"role": "user", "content": json.dumps({
@@ -401,7 +480,7 @@ def call_finalizer(client: OpenAI, facts: Dict[str, Any], chosen_meta: Dict[str,
         except Exception as e:
             last_err = e
             continue
-    raise last_err
+    return "A concise, positive summary will appear here once the network recovers."
 
 # =======================
 # DOWNLOADER (nur für Anzeige)
@@ -413,8 +492,7 @@ def safe_download_image(url: str) -> Optional[str]:
             ctype = r.headers.get("Content-Type", "").split(";")[0].strip().lower()
             if ctype not in ALLOWED_IMAGE_MIME:
                 return None
-            # einfache Dateiendung anhand MIME
-            suf = { "image/jpeg": ".jpg", "image/png": ".png", "image/webp": ".webp" }.get(ctype, ".img")
+            suf = {"image/jpeg": ".jpg", "image/png": ".png", "image/webp": ".webp"}.get(ctype, ".img")
             fd, path = tempfile.mkstemp(prefix="cover_", suffix=suf)
             with os.fdopen(fd, "wb") as f:
                 for chunk in r.iter_content(8192):
@@ -427,16 +505,11 @@ def safe_download_image(url: str) -> Optional[str]:
 # BACKGROUND TASKS
 # =======================
 def start_cover_task(client: OpenAI, kind: str, title_or_name: str, author: str, topic_index: int, facts_snapshot: Dict[str, Any]):
-    """
-    Startet: Websuche -> Vision-Validierung -> Finalizer.
-    Speichert Ergebnis in st.session_state.results.
-    """
     task_id = str(uuid.uuid4())
     st.session_state.tasks[task_id] = {"status": "running", "kind": "cover", "topic_index": topic_index, "error": "", "result": None}
 
     def worker():
         try:
-            # Status auf searching
             st.session_state.profile["topics"][topic_index]["status"] = "searching"
 
             # 1) Websuche
@@ -460,7 +533,6 @@ def start_cover_task(client: OpenAI, kind: str, title_or_name: str, author: str,
             # 3) Finalizer-Text
             final_txt = call_finalizer(client, facts_snapshot, chosen)
 
-            # Ergebnis-Kachel
             res = {
                 "topic_index": topic_index,
                 "kind": kind,
@@ -474,7 +546,6 @@ def start_cover_task(client: OpenAI, kind: str, title_or_name: str, author: str,
             }
             st.session_state.results.append(res)
 
-            # Status fertig
             st.session_state.profile["topics"][topic_index]["status"] = "ready"
             st.session_state.tasks[task_id] = {"status": "done", "kind": "cover", "topic_index": topic_index, "error": "", "result": res}
         except Exception as e:
@@ -487,8 +558,12 @@ def start_cover_task(client: OpenAI, kind: str, title_or_name: str, author: str,
 # STREAMLIT UI
 # =======================
 st.set_page_config(page_title=APP_TITLE, page_icon="🟡", layout="centered")
-st.title("Dein Kurz-Steckbrief")
-st.caption("Director decides • parallel web search + vision validate • final shows as two columns")
+colA, colB = st.columns([1, 1])
+with colA:
+    st.title("Dein Kurz-Steckbrief")
+    st.caption("Director decides • parallel web search + vision validate • final shows as two columns")
+with colB:
+    st.toggle("Debug", key="SHOW_DEBUG", help="Show raw JSON/text outputs for troubleshooting")
 
 ensure_session()
 
@@ -533,24 +608,18 @@ if user_text:
                 if not kind:
                     continue
                 if kind == "person":
-                    name = (act.get("name") or "").strip()
-                    if not name:
-                        # ggf. aus Facts holen
-                        name = profile_key(st.session_state.profile, "person")
+                    name = (act.get("name") or profile_key(st.session_state.profile, "person")).strip()
                     if not name:
                         continue
                     idx = ensure_topic(st.session_state.profile, "person", name)
-                    # Deduplizieren: nicht mehrfach starten
                     if st.session_state.profile["topics"][idx]["status"] in ("queued", "searching", "validating"):
                         continue
                     st.session_state.profile["topics"][idx]["status"] = "queued"
                     snapshot = json.loads(json.dumps(st.session_state.profile["topics"][idx]["facts"]))
                     start_cover_task(client, "person", name, "", idx, {"topic": snapshot})
                 else:
-                    title = (act.get("title") or "").strip()
+                    title = (act.get("title") or profile_key(st.session_state.profile, kind)).strip()
                     author = (act.get("author") or "").strip()
-                    if not title:
-                        title = profile_key(st.session_state.profile, kind)
                     if not title:
                         continue
                     idx = ensure_topic(st.session_state.profile, kind, title)
@@ -584,35 +653,31 @@ if st.session_state.results:
                 st.write("No image available.")
         with c2:
             kind = res.get("kind", "")
-            title_line = ""
-            if kind == "person":
-                title_line = f"**Person:** {res.get('image', {}).get('title','') or ''}"
-            else:
-                # für book/podcast/tool zeigen wir title/author falls vorhanden (aus meta ggf. nicht immer gesetzt)
-                title_line = f"**{kind.capitalize()}:**"
-            st.markdown(title_line)
+            # einfache Überschrift
+            header = kind.capitalize() if kind else "Item"
+            st.markdown(f"**{header}**")
             st.write(res.get("text", {}).get("final_paragraph", ""))
             page_url = res.get("image", {}).get("page_url")
             if page_url:
                 st.markdown(f"[Source]({page_url})")
-            if SHOW_DEBUG:
-                with st.expander("Debug"):
+            if st.session_state.SHOW_DEBUG:
+                with st.expander("Debug (result json)"):
                     st.code(json.dumps(res, indent=2))
 
 # Controls
 c1, c2, c3 = st.columns(3)
 with c1:
     if st.button("🔄 Restart interview"):
-        for k in ["messages", "profile", "tasks", "results", "last_director_json"]:
+        for k in ["messages", "profile", "tasks", "results", "last_director_json", "last_raw_director_text"]:
             if k in st.session_state:
                 del st.session_state[k]
         ensure_session()
         st.rerun()
 with c2:
-    if SHOW_DEBUG and st.session_state.get("last_director_json"):
-        with st.expander("Last director JSON"):
+    if st.session_state.SHOW_DEBUG and st.session_state.get("last_director_json") is not None:
+        with st.expander("Last director JSON (parsed)"):
             st.code(json.dumps(st.session_state.last_director_json, indent=2))
 with c3:
-    if st.button("Clear results"):
-        st.session_state.results.clear()
-        st.rerun()
+    if st.session_state.SHOW_DEBUG and st.session_state.get("last_raw_director_text"):
+        with st.expander("Last director RAW text"):
+            st.code(st.session_state.last_raw_director_text)
