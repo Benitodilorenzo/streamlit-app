@@ -1,12 +1,11 @@
-# app.py — Expert Card Creator (Natural-Language Multi-Agents, invisible ACTIONS, guarded)
-# Director decides; hidden [[ACTIONS]] block; parallel research; guarded triggers; finalizer after ready.
+# app.py — Expert Card Creator (Director mit festen Leitplanken, invisible ACTIONS, Guards, Parallel-Research, sauberer Stopp)
+# Modelle: gpt-5 (per ENV übersteuerbar). Setze OPENAI_API_KEY in Streamlit Secrets.
 
 import os
 import re
-import time
 import queue
 import threading
-from typing import List, Dict, Any, Optional
+from typing import List, Dict, Any
 
 import streamlit as st
 from openai import OpenAI
@@ -24,19 +23,20 @@ if not OPENAI_API_KEY:
 
 client = OpenAI(api_key=OPENAI_API_KEY)
 
-CHAT_MODEL = os.getenv("DTBR_CHAT_MODEL", "gpt-5")      # director / validator / finalizer
-SEARCH_MODEL = os.getenv("DTBR_SEARCH_MODEL", CHAT_MODEL)  # websearch (hier via LLM ohne Tools)
+CHAT_MODEL = os.getenv("DTBR_CHAT_MODEL", "gpt-5")          # Director / Validator / Finalizer
+SEARCH_MODEL = os.getenv("DTBR_SEARCH_MODEL", CHAT_MODEL)   # Websearch-Simulation (LLM)
 
-TOPICS_ORDER = ["Book", "Podcast", "Person", "Tool"]
-FOLLOWUP_BUDGET = {"Book": 2, "Podcast": 2, "Person": 1, "Tool": 0}
+# Gesprächs-Plan (Themen, Followups, Minimalfelder, erlaubte Actions)
+TOPICS_PLAN = [
+    {"name": "Book",    "followups": 2, "min_fields": ["title"], "actions": ["SEARCH_COVER"]},
+    {"name": "Podcast", "followups": 2, "min_fields": ["title"], "actions": ["SEARCH_PODCAST", "SEARCH_LOGO"]},
+    {"name": "Person",  "followups": 1, "min_fields": ["name"],  "actions": ["SEARCH_PORTRAIT"]},
+    {"name": "Tool",    "followups": 0, "min_fields": ["title"], "actions": ["SEARCH_LOGO"]},
+]
 
-# Für jedes Topic: welche Action-Typen sind überhaupt sinnvoll/erlaubt?
-ALLOWED_ACTIONS_BY_TOPIC = {
-    "Book": {"SEARCH_COVER"},
-    "Podcast": {"SEARCH_PODCAST", "SEARCH_LOGO"},
-    "Person": {"SEARCH_PORTRAIT"},
-    "Tool": {"SEARCH_LOGO"},
-}
+# Harte Grenzen fürs ganze Gespräch
+MAX_TOTAL_QUESTIONS = 10         # maximale Anzahl aller Bot-Fragen
+MAX_TOPICS = len(TOPICS_PLAN)
 
 # Background queues/state (thread-safe)
 RESULTS_QUEUE: "queue.Queue[Dict[str, Any]]" = queue.Queue()
@@ -66,21 +66,22 @@ def ensure_session():
     if "profile" not in st.session_state:
         st.session_state.profile = {
             "topics": [
-                {"name": name, "status": "queued", "followups": FOLLOWUP_BUDGET[name],
+                {"name": t["name"], "status": "queued", "followups": t["followups"],
                  "answers": [], "media": {}, "research_started": False}
-                for name in TOPICS_ORDER
+                for t in TOPICS_PLAN
             ],
             "current_topic_index": 0,
-            "finalizing": False  # wird vom Director via ACTION signalisiert
+            "finalizing": False,
+            "bot_questions": 0,  # Zähler aller gestellten Bot-Fragen
         }
     if "inflight_keys" not in st.session_state:
-        st.session_state.inflight_keys = set()         # aktive Jobs (Dedup)
+        st.session_state.inflight_keys = set()       # dedup laufender Jobs
     if "results" not in st.session_state:
-        st.session_state.results: List[Dict[str, Any]] = []   # gesammelte Resultate
+        st.session_state.results: List[Dict[str, Any]] = []
     if "final_output" not in st.session_state:
         st.session_state.final_output = None
     if "progress_total" not in st.session_state:
-        st.session_state.progress_total = len(TOPICS_ORDER) * 2  # Interview + Research je Topic
+        st.session_state.progress_total = len(TOPICS_PLAN) * 2  # Interview + Research je Topic
     if "progress_done" not in st.session_state:
         st.session_state.progress_done = 0
 
@@ -102,39 +103,61 @@ def advance_topic_if_needed():
     if topic["status"] == "done" and idx + 1 < len(st.session_state.profile["topics"]):
         st.session_state.profile["current_topic_index"] += 1
 
+def all_topics_completed() -> bool:
+    return all(t["status"] == "done" for t in st.session_state.profile["topics"])
+
+def reached_global_limits() -> bool:
+    return (
+        st.session_state.profile["bot_questions"] >= MAX_TOTAL_QUESTIONS
+        or all_topics_completed()
+    )
+
+def finalize_if_possible():
+    if not st.session_state.profile["finalizing"]:
+        if all_topics_completed():
+            st.session_state.profile["finalizing"] = True
+
 # ─────────────────────────────────────────────
 # Director Prompt / ACTIONS Parsing
 # ─────────────────────────────────────────────
 DIRECTOR_INSTRUCTIONS = """
-You are the Director Agent for an expert card interview.
+You are the Director Agent for a short expert-card interview.
 
-RULES
-- Default to English; mirror the user's language if it is clearly not English.
-- Ask ONE concise, fresh question that progresses the current topic only.
-- Avoid repeating questions with the same meaning.
-- Keep a gentle, professional tone. Do not ask for confirmations like “Is that correct?” unless truly ambiguous.
-- Roughly 1–2 follow-ups per topic; then transition naturally to the next topic.
-- Only propose background actions for items the user actually mentioned (no guessing).
-- Allowed action types per topic:
-  Book → SEARCH_COVER
-  Podcast → SEARCH_PODCAST or SEARCH_LOGO
-  Person → SEARCH_PORTRAIT
-  Tool → SEARCH_LOGO
-- Trigger actions only when minimal info is present:
-  • SEARCH_COVER: at least a title; author optional but helpful.
-  • SEARCH_PODCAST / SEARCH_LOGO: podcast/channel/tool name present.
-  • SEARCH_PORTRAIT: person name present.
-- If you believe the entire interview has enough material to finalize, also emit: FINALIZE_READY.
+SCOPE & ORDER
+- You must follow this exact topic order and stop after the last one:
+  1) Book → ask up to 2 follow-ups
+  2) Podcast → up to 2
+  3) Person → up to 1
+  4) Tool → 0 follow-ups (just collect a name if available)
+- Never introduce new topics outside this list.
+- Per topic, ask only within that topic’s scope.
+
+STYLE & BEHAVIOR
+- One concise, fresh question per turn.
+- Avoid repeating the same meaning.
+- No “Is that correct?” confirmations unless truly ambiguous.
+- Mirror the user's language if it's clearly not English; otherwise use English.
+- After a topic reaches its follow-up limit or has enough substance, move on.
+
+TRIGGERS (optional, hidden):
+- If minimal info for the current topic is present, emit a hidden [[ACTIONS]] block with one action per line:
+  [[ACTIONS]]
+  ACTION: SEARCH_COVER title="..." author="..."
+  [[/ACTIONS]]
+- Allowed actions by topic:
+  Book: SEARCH_COVER
+  Podcast: SEARCH_PODCAST or SEARCH_LOGO
+  Person: SEARCH_PORTRAIT
+  Tool: SEARCH_LOGO
+- Emit FINALIZE_READY only when all topics in scope have sufficient material.
 
 OUTPUT FORMAT
-1) First lines: the VISIBLE chat question (one or two short sentences).
-2) Then, if any, a hidden block:
+1) First lines: the VISIBLE question (one or two short sentences).
+2) Then, if any, a hidden block exactly like:
 [[ACTIONS]]
 ACTION: <TYPE> [title="..."] [author="..."] [name="..."]
-(one action per line)
 [[/ACTIONS]]
-
-No markdown fences beyond the [[ACTIONS]] block. No JSON. The VISIBLE text must not include actions.
+Never mix actions into the visible question.
 """
 
 ACTIONS_BLOCK_RE = re.compile(r"\[\[ACTIONS\]\](.*?)\[\[/ACTIONS\]\]", re.DOTALL | re.IGNORECASE)
@@ -148,7 +171,7 @@ ACTION_LINE_RE = re.compile(
 
 def split_visible_and_actions(text: str) -> (str, List[Dict[str, str]]):
     """Extrahiert [[ACTIONS]]-Block, strippt ihn aus dem sichtbaren Text, parst Action-Zeilen.
-       Fällt zurück auf Einzelzeilen mit 'ACTION:' falls kein Block benutzt wurde.
+       Fallback: ACTION:-Zeilen auch ohne Block entfernen.
     """
     actions: List[Dict[str, str]] = []
 
@@ -167,11 +190,11 @@ def split_visible_and_actions(text: str) -> (str, List[Dict[str, str]]):
             if gd.get("author"): act["author"] = gd["author"].strip()
             if gd.get("name"):   act["name"]   = gd["name"].strip()
             actions.append(act)
-        # zusätzlich: evtl. versehentlich im sichtbaren Teil verbliebene ACTION-Zeilen entfernen
+        # Sicherheit: im sichtbaren Teil evtl. hineingeratene ACTION-Zeilen entfernen
         visible = "\n".join([ln for ln in visible.splitlines() if not ln.strip().upper().startswith("ACTION:")]).strip()
         return visible, actions
 
-    # 2) kein Block → entferne Zeilen, die mit ACTION: beginnen
+    # 2) kein Block → entferne ACTION:-Zeilen aus sichtbarem Text
     visible_lines = []
     for ln in (text or "").splitlines():
         if ACTION_LINE_RE.match(ln):
@@ -188,11 +211,14 @@ def split_visible_and_actions(text: str) -> (str, List[Dict[str, str]]):
 def director_ask_next() -> (str, List[Dict[str, str]]):
     """Frage vom Director generieren; sichtbarer Text + geparste Actions zurückgeben."""
     topic = current_topic()
+    bot_q = st.session_state.profile.get("bot_questions", 0)
+
     sys = (
         f"{DIRECTOR_INSTRUCTIONS}\n\n"
         f"CURRENT TOPIC: {topic['name']}\n"
         f"REMAINING FOLLOW-UPS: {topic['followups']}\n"
         f"ALREADY SAID FOR THIS TOPIC: {topic['answers']}\n"
+        f"TOTAL BOT QUESTIONS SO FAR: {bot_q} (hard limit {MAX_TOTAL_QUESTIONS})\n"
         "Remember: visible question first; optional [[ACTIONS]] block after."
     )
     try:
@@ -204,65 +230,60 @@ def director_ask_next() -> (str, List[Dict[str, str]]):
         raw = (resp.choices[0].message.content or "").strip()
     except Exception as e:
         raw = f"(Director error: {e})"
+
     visible, acts = split_visible_and_actions(raw)
-    # Fallback, falls Modell nichts Sinnvolles liefert
     if not visible:
         visible = f"One more on {topic['name'].lower()}: what makes it stand out for you?"
     return visible, acts
 
 # ─────────────────────────────────────────────
-# Guards: Nur sinnvolle Actions zulassen
+# Guards: nur sinnvolle Actions zulassen
 # ─────────────────────────────────────────────
 def allow_action(action: Dict[str, str], last_user_text: str) -> bool:
-    """Harter Programm-Guard: nur passende, ausreichend informierte Actions akzeptieren."""
+    """Nur passende, ausreichend informierte Actions akzeptieren – strikt pro Topic."""
     kind = action.get("kind", "").upper()
     topic = current_topic()
     name = topic["name"]
 
-    # 1) Nur Actions erlauben, die zum aktuellen Topic passen
-    if kind not in ALLOWED_ACTIONS_BY_TOPIC.get(name, set()):
+    # Finalize kann immer – aber nur, wenn noch nicht im Finalisieren
+    if kind == "FINALIZE_READY":
+        return not st.session_state.profile["finalizing"]
+
+    # Zulässige Actions laut Plan
+    allowed = next((t["actions"] for t in TOPICS_PLAN if t["name"] == name), [])
+    if kind not in set(allowed):
         return False
 
-    # 2) Minimalinformationen prüfen je nach Action-Typ
-    if kind == "SEARCH_COVER":
-        # Braucht mind. einen Titel
+    # Minimalfelder je Topic/Action
+    if name == "Book" and kind == "SEARCH_COVER":
         title = (action.get("title") or "").strip()
         if not title:
             return False
-        # Wenn das Topic bereits recherchiert wurde, nicht doppelt
-        if topic.get("media", {}).get("done"):
-            return False
-        return True
-
-    if kind in ("SEARCH_PODCAST", "SEARCH_LOGO"):
+    elif name == "Podcast" and kind in ("SEARCH_PODCAST", "SEARCH_LOGO"):
         title = (action.get("title") or "").strip()
-        # Für Podcast/Logo braucht es zumindest einen Namen/Hinweis
         if not title and not last_user_text.strip():
             return False
-        if topic.get("media", {}).get("done"):
-            return False
-        return True
-
-    if kind == "SEARCH_PORTRAIT":
+    elif name == "Person" and kind == "SEARCH_PORTRAIT":
         person = (action.get("name") or "").strip()
         if not person:
             return False
-        if topic.get("media", {}).get("done"):
+    elif name == "Tool" and kind == "SEARCH_LOGO":
+        title = (action.get("title") or "").strip()
+        if not title and not last_user_text.strip():
             return False
-        return True
 
-    if kind == "FINALIZE_READY":
-        # Director bestimmt das, kein weiterer Guard nötig
-        return True
+    # Nicht doppelt, falls bereits Media vorhanden
+    if topic.get("media", {}).get("done"):
+        return False
 
-    return False
+    return True
 
 # ─────────────────────────────────────────────
-# Background agents (websearch + validation) — natural language outputs
+# Background agents (Websearch + Validation) – Natural Language
 # ─────────────────────────────────────────────
 def websearch_agent(kind: str, title_or_name: str, author: str = "") -> List[Dict[str, str]]:
     """
-    LLM simulierte Bildsuche. Format:
+    LLM-simulierte Bildsuche. Format:
     CANDIDATE: image_url|page_url|source
     """
     sys = (
@@ -299,7 +320,7 @@ def websearch_agent(kind: str, title_or_name: str, author: str = "") -> List[Dic
 def vision_validator_agent(kind: str, expected_title: str, expected_author_or_name: str,
                            candidates: List[Dict[str, str]]) -> Dict[str, Any]:
     """
-    Vision/Plausibilitätswahl. Format:
+    Plausibilitätswahl. Antwort in einer Zeile:
     BEST: <0..2 or -1> | CONF: <0.0..1.0> | REASON: ...
     """
     header = (
@@ -351,13 +372,14 @@ def start_background_action(action: Dict[str, str]):
         if kind == "SEARCH_COVER":
             topic_kind = "Book"; srch_kind = "book"
         elif kind == "SEARCH_LOGO":
-            # kann für Tool/Podcast genutzt werden; hier behandeln wir es generisch als 'brand'
-            topic_kind = current_topic()["name"]  # bleibt beim aktuellen Topic
+            topic_kind = current_topic()["name"]  # Logo kann bei Podcast/Tool gebraucht werden
             srch_kind = "brand"
         else:  # SEARCH_PODCAST
             topic_kind = "Podcast"; srch_kind = "podcast"
 
-        key = f"{kind}:{title.lower() or author.lower()}"
+        key = f"{kind}:{(title or author).lower()}"
+        if not (title or author):
+            return
         if key in st.session_state.inflight_keys:
             return
         st.session_state.inflight_keys.add(key)
@@ -431,15 +453,34 @@ if user_text:
     # ggf. Topic abschließen & weiter
     advance_topic_if_needed()
 
-    # 3) Ask Director (visible + actions)
-    visible, acts = director_ask_next()
-    # Sichtbare Frage in den Chat, ohne ACTIONS
-    st.session_state.history.append({"role": "assistant", "content": visible})
+    # 3) Ask Director (visible + actions) – nur wenn nicht bereits finalisieren und Limits nicht erreicht
+    if not st.session_state.profile["finalizing"] and not reached_global_limits():
+        visible, acts = director_ask_next()
 
-    # 4) Actions nur starten, wenn Guards OK
-    for act in acts:
-        if allow_action(act, user_text):
-            start_background_action(act)
+        # Sichtbare Frage in den Chat
+        st.session_state.history.append({"role": "assistant", "content": visible})
+        # Bot-Frage zählen
+        st.session_state.profile["bot_questions"] += 1
+
+        # 4) Actions nur starten, wenn Guards OK
+        for act in acts:
+            if allow_action(act, user_text):
+                start_background_action(act)
+
+        # Falls jetzt globale Grenzen erreicht → finalisieren
+        if reached_global_limits():
+            finalize_if_possible()
+            st.session_state.history.append({
+                "role": "assistant",
+                "content": "Thanks, I’ve got a solid picture now. I’ll assemble your expert card in the background."
+            })
+    else:
+        # Bereits im Finalisieren → keine neue Frage mehr; ggf. einmalig Hinweis
+        if not any(m["content"].endswith("in the background.") for m in st.session_state.history if m["role"] == "assistant"):
+            st.session_state.history.append({
+                "role": "assistant",
+                "content": "Thanks, I’ve got a solid picture now. I’ll assemble your expert card in the background."
+            })
 
     st.rerun()
 
@@ -482,7 +523,7 @@ for res in harvested:
 # Progress bar (Interview + Research)
 # ─────────────────────────────────────────────
 interview_done = sum(1 for t in st.session_state.profile["topics"] if t["status"] == "done")
-research_done = sum(1 for t in st.session_state.profile["topics"] if t.get("media", {}).get("done"))
+research_done  = sum(1 for t in st.session_state.profile["topics"] if t.get("media", {}).get("done"))
 progress = min(interview_done + research_done, st.session_state.progress_total)
 st.progress(progress / st.session_state.progress_total, text=f"Progress: {progress}/{st.session_state.progress_total}")
 
@@ -539,12 +580,14 @@ def finalizer_agent(profile: Dict[str, Any]) -> str:
     except Exception as e:
         return f"(Finalizer error: {e})"
 
-# Finalisieren nur, wenn Director „bereit“ signalisiert hat und alle Recherchen fertig sind
-if st.session_state.profile["finalizing"] and not st.session_state.inflight_keys and all_research_done_for_answered_topics():
+# Finalisieren nur, wenn Director „bereit“ signalisiert hat ODER Limits erreicht, und alle Recherchen fertig sind
+if (st.session_state.profile["finalizing"] or reached_global_limits()) \
+        and not st.session_state.inflight_keys \
+        and all_research_done_for_answered_topics():
     if not st.session_state.final_output:
         st.session_state.final_output = finalizer_agent(st.session_state.profile)
 
-# Ergebnisse (Bilder + Kurzinfos) zeigen
+# Ergebnisse (Bilder + Kurzinfos)
 if st.session_state.results:
     st.subheader("Results")
     for res in st.session_state.results[::-1]:
@@ -578,8 +621,10 @@ with c1:
                 del st.session_state[k]
         # Queue leeren
         while not RESULTS_QUEUE.empty():
-            try: RESULTS_QUEUE.get_nowait()
-            except queue.Empty: break
+            try:
+                RESULTS_QUEUE.get_nowait()
+            except queue.Empty:
+                break
         ensure_session()
         st.rerun()
 with c2:
