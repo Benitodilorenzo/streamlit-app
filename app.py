@@ -78,7 +78,7 @@ def ensure_session():
             "current_topic_index": 0,
             "finalizing": False,
             "bot_questions": 0,
-        ]
+        }
     if "inflight_keys" not in st.session_state:
         st.session_state.inflight_keys = set()
     if "results" not in st.session_state:
