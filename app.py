@@ -23,7 +23,7 @@ GLOBAL_QUESTION_CAP = 12  # safety: stop after N bot questions to avoid endless 
 
 # Models (override via Streamlit Secrets or env as needed)
 OPENAI_API_KEY  = os.getenv("OPENAI_API_KEY", "")
-CHAT_MODEL      = os.getenv("OPENAI_CHAT_MODEL", "gpt-5")  # Director / Extractor / Vision
+CHAT_MODEL      = os.getenv("OPENAI_CHAT_MODEL", "gpt-5")   # Director / Extractor / Vision
 RESPONSES_MODEL = os.getenv("OPENAI_RESPONSES_MODEL", "gpt-5")  # for web_search tool (Responses API)
 
 # UI flags
@@ -113,7 +113,7 @@ def init_state():
                 "status": "queued",     # queued | active | done
                 "budget": budget,       # remaining followups (post first answer)
                 "answers": [],          # user answers (strings)
-                "research": None,       # {"candidates":[...], "best": url} when ready
+                "research": {},         # << never None; holds {"candidates":[...], "best": url}
                 "field": None           # extracted atomic value (title/name/idea)
             })
         topics[0]["status"] = "active"
@@ -147,7 +147,7 @@ def advance_topic(profile: Dict[str, Any]):
             topics[j]["status"] = "active"
             profile["current_topic_index"] = j
             return
-    profile["current_topic_index"] = ix  # no more, stays at last
+    profile["current_topic_index"] = ix  # no more topics
 
 def all_topics_done(profile: Dict[str, Any]) -> bool:
     return all(t["status"] == "done" for t in profile["topics"])
@@ -156,7 +156,7 @@ def all_topics_done(profile: Dict[str, Any]) -> bool:
 # OPENAI CALL HELPERS
 # =======================
 def chat_stream(client: OpenAI, messages: List[Dict[str, Any]]) -> str:
-    """Director streaming reply (Chat Completions). No temperature/top_p."""
+    """Director streaming reply (Chat Completions)."""
     out = []
     with st.chat_message("assistant"):
         ph = st.empty()
@@ -188,15 +188,14 @@ def chat_once(client: OpenAI, system_prompt: str, user_text: str) -> str:
 def responses_web_search(client: OpenAI, query_text: str) -> str:
     """
     Responses API + built-in web_search tool.
-    We ask it to output one line per candidate:
-    IMAGE: <direct_image_url> | SOURCE: <page_url>
+    Output: plain text, lines like:
+      IMAGE: <direct_image_url> | SOURCE: <page_url>
     """
     r = client.responses.create(
         model=RESPONSES_MODEL,
         tools=[{"type": "web_search"}],
         input=[{"role": "user", "content": [{"type": "input_text", "text": query_text}]}],
     )
-    # Prefer unified .output_text if present
     txt = getattr(r, "output_text", None)
     if txt is None and getattr(r, "output", None):
         try:
@@ -206,9 +205,7 @@ def responses_web_search(client: OpenAI, query_text: str) -> str:
     return txt or ""
 
 def vision_pick_best(client: OpenAI, item_desc: str, lines: List[str]) -> Optional[str]:
-    """
-    Vision validator: provide up to 3 images and get 'BEST: <url>' back.
-    """
+    """Vision validator: provide up to 3 images and get 'BEST: <url>' back."""
     content: List[Dict[str, Any]] = [{"type": "text", "text": f"{VALIDATOR_SYSTEM_PROMPT}\nTarget: {item_desc}"}]
     added = 0
     for ln in lines:
@@ -233,9 +230,7 @@ def vision_pick_best(client: OpenAI, item_desc: str, lines: List[str]) -> Option
 # EXTRACTOR
 # =======================
 def extractor_pull_fields(client: OpenAI, topic_name: str, user_text: str, recent_context: str = "") -> Optional[Dict[str, str]]:
-    """
-    LLM-based field extractor; returns dict with a single atomic field per topic.
-    """
+    """LLM-based field extractor; returns dict with a single atomic field per topic."""
     prompt = f"CURRENT TOPIC: {topic_name}\nContext: {recent_context}\nUser said: {user_text}\nExtract:"
     line = chat_once(client, EXTRACTOR_SYSTEM_PROMPT, prompt).strip()
     if not line or line == "—":
@@ -264,10 +259,11 @@ def bg_worker(client: OpenAI, in_q: "queue.Queue[Dict[str, Any]]", out_q: "queue
             break
         try:
             kind = job["kind"]  # "book"|"podcast"|"person"|"tool"|"idea"
-            title = job.get("title")    # book/podcast/tool/idea
+            title = job.get("title")
             author = job.get("author", "")
-            name  = job.get("name")     # person
-            # Build query text
+            name  = job.get("name")
+
+            # Build query text for Responses + web_search
             if kind == "book":
                 query = f"{SEARCHER_SYSTEM_PROMPT}\nQuery: Book cover: \"{title}\" {author}".strip()
                 item_desc = f'Book: "{title}" {author}'.strip()
@@ -333,11 +329,9 @@ def drain_bg_results():
 # SEARCH TRIGGER
 # =======================
 def enqueue_search_if_ready(client: OpenAI, topic: Dict[str, Any], user_text: str):
-    """
-    Let the extractor decide if we have the atomic field; if yes, enqueue search job once.
-    """
+    """Extractor decides if we have the atomic field; if yes, enqueue search job once."""
     # Skip if already have field or research
-    if topic.get("field") or topic.get("research"):
+    if topic.get("field") or (topic.get("research") or {}).get("best") or (topic.get("research") or {}).get("candidates"):
         return
     # Use recent context (last 6 messages excluding system)
     recent = []
@@ -376,11 +370,9 @@ def build_final_text(client: OpenAI, profile: Dict[str, Any]) -> str:
     bullets = []
     for t in profile["topics"]:
         name = t["name"]
-        # prefer the last answer for the one-liner seed
         why = t["answers"][-1] if t["answers"] else ""
         field = t.get("field") or {}
         atom = field.get("title") or field.get("name") or ""
-        img = (t.get("research") or {}).get("best") or ""
         bullets.append(f"- {name}: {atom} — {why}".strip())
 
     facts = "Interview facts:\n" + "\n".join(bullets)
@@ -396,8 +388,9 @@ def render_timeline(profile: Dict[str, Any]):
             cur = " (current)" if i == profile["current_topic_index"] and t["status"] == "active" else ""
             st.markdown(f"**{t['name']}**{cur}")
             st.caption(f"status: {t['status']} • followups left: {t['budget']}")
-            if t.get("research", {}).get("best"):
-                st.image(t["research"]["best"], caption="Selected", use_column_width=True)
+            best_url = (t.get("research") or {}).get("best")
+            if best_url:
+                st.image(best_url, caption="Selected", use_column_width=True)
 
 def can_ask_more(profile: Dict[str, Any]) -> bool:
     return profile["bot_questions"] < GLOBAL_QUESTION_CAP
@@ -434,7 +427,7 @@ except Exception as e:
     agent_ready = False
     st.warning(f"OpenAI not configured: {e}")
 
-# Drain any finished background results
+# Drain any finished background results (if anything changed, re-render)
 if drain_bg_results():
     st.rerun()
 
@@ -455,7 +448,6 @@ if user_text:
     if topic["budget"] > 0:
         topic["budget"] -= 1
     else:
-        # move to next topic
         topic["status"] = "done"
         advance_topic(st.session_state.profile)
 
@@ -471,22 +463,22 @@ if user_text:
     # End when cap reached or all topics done
     if all_topics_done(st.session_state.profile) or not can_ask_more(st.session_state.profile):
         if not st.session_state.finalized:
-            st.session_state.history.append({"role": "assistant",
-                                             "content": "Thanks, I’ve got a solid picture now. I’ll assemble your expert card in the background."})
+            st.session_state.history.append({
+                "role": "assistant",
+                "content": "Thanks, I’ve got a solid picture now. I’ll assemble your expert card in the background."
+            })
             st.session_state.finalized = True
     st.rerun()
 
 # Final assembly (once)
 if st.session_state.finalized and agent_ready and not st.session_state.final_text:
-    # give background worker time to complete any remaining searches
+    # Give the background worker a short moment to complete remaining searches
     time.sleep(0.2)
-    final_text = build_final_text(client, st.session_state.profile)
-    st.session_state.final_text = final_text
+    st.session_state.final_text = build_final_text(client, st.session_state.profile)
 
 # Output table + download
 if st.session_state.finalized:
     st.subheader("Expert Card (compact)")
-    # Rows
     rows = []
     for t in st.session_state.profile["topics"]:
         name = t["name"]
