@@ -132,9 +132,33 @@ def system_orchestrator_prompt() -> str:
         "- You only focus on natural conversation. Keep messages short and clear.\n"
     )
 
+# =======================
+# OPENAI HELPERS (robust wrapper)
+# =======================
+def responses_create(client: OpenAI, **kwargs):
+    """
+    Robust wrapper: tries the modern signature first.
+    If the SDK is old (TypeError: unexpected kwargs), strip unknown keys (like response_format) and retry.
+    """
+    try:
+        return client.responses.create(**kwargs)
+    except TypeError as e:
+        # remove known "new" keys and retry once
+        cleaned = dict(kwargs)
+        cleaned.pop("response_format", None)
+        try:
+            return client.responses.create(**cleaned)
+        except TypeError:
+            # re-raise original for clarity
+            raise e
+
+# =======================
+# PAYLOAD BUILDERS
+# =======================
 def controller_payload(history: List[Dict[str, str]]) -> Dict[str, Any]:
     """
     JSON-schema extractor/decider for two required fields.
+    If the SDK is too old to accept response_format, the wrapper will drop it.
     """
     schema = {
         "type": "object",
@@ -159,7 +183,7 @@ def controller_payload(history: List[Dict[str, str]]) -> Dict[str, Any]:
     }
     return {
         "model": CHAT_MODEL,
-        "response_format": {
+        "response_format": {  # <- will be dropped by wrapper if unsupported
             "type": "json_schema",
             "json_schema": {"name": "interview_control", "schema": schema, "strict": True}
         },
@@ -169,7 +193,8 @@ def controller_payload(history: List[Dict[str, str]]) -> Dict[str, Any]:
                  "Extract fields from the conversation. We need two required fields: "
                  "book.title and book.why (1–2 sentences). "
                  "If both are present, set ready_to_research=true. "
-                 "If not, propose a short next_question (same language as the user)."
+                 "If not, propose a short next_question (same language as the user). "
+                 "Return ONLY a single JSON object."
              )},
             *history[-12:]
         ]
@@ -182,13 +207,14 @@ def research_payload(title: str, author_guess: str) -> Dict[str, Any]:
     return {
         "model": SEARCH_MODEL,
         "tools": [{"type": "web_search"}],
-        "response_format": {"type": "json_object"},
+        "response_format": {"type": "json_object"},  # wrapper will drop if unsupported
         "input": [
             {"role": "system", "content":
                 "Use the web_search tool to find book data. "
                 "Return JSON with 'candidates' (up to 5), each: "
                 "title (str), authors (array), cover_url (str), info_url (str), source (str). "
-                "Prefer publisher sites, Google Books, Open Library."},
+                "Prefer publisher sites, Google Books, Open Library. "
+                "Respond with ONLY JSON."},
             {"role": "user", "content": json.dumps({"book_title": title, "author_guess": author_guess}, separators=(",", ":"))}
         ]
     }
@@ -209,11 +235,13 @@ def verifier_payload(user_claim: Dict[str, Any], candidates: List[Dict[str, Any]
     }
     return {
         "model": CHAT_MODEL,
-        "response_format": {"type": "json_schema",
-                            "json_schema": {"name": "book_verification", "schema": schema, "strict": True}},
+        "response_format": {  # wrapper will drop if unsupported
+            "type": "json_schema",
+            "json_schema": {"name": "book_verification", "schema": schema, "strict": True}
+        },
         "input": [
             {"role": "system",
-             "content": "Pick the best candidate matching the user's claim. If unsure, set status=not_found. Output strict JSON only."},
+             "content": "Pick the best candidate matching the user's claim. If unsure, set status=not_found. Output STRICT JSON only."},
             {"role": "user", "content": json.dumps({"user_claim": user_claim, "candidates": candidates}, separators=(",", ":"))}
         ]
     }
@@ -229,10 +257,12 @@ def summary_payload(why: str, title: str, author: str) -> Dict[str, Any]:
     }
     return {
         "model": CHAT_MODEL,
-        "response_format": {"type": "json_schema",
-                            "json_schema": {"name": "summaries", "schema": schema, "strict": True}},
+        "response_format": {  # wrapper will drop if unsupported
+            "type": "json_schema",
+            "json_schema": {"name": "summaries", "schema": schema, "strict": True}
+        },
         "input": [
-            {"role": "system", "content": "Summarize the user's reason in ~100 words and a one-liner (<=18 words). No inventions."},
+            {"role": "system", "content": "Summarize the user's reason in ~100 words and a one-liner (<=18 words). No inventions. Output ONLY JSON."},
             {"role": "user", "content": json.dumps({"user_book_why": why, "book_title": title, "book_author": author}, separators=(",", ":"))}
         ]
     }
@@ -247,24 +277,26 @@ def stream_assistant_reply(client: OpenAI, history: List[Dict[str, str]]) -> str
     chunks: List[str] = []
     with st.chat_message("assistant"):
         ph = st.empty()
+        # modern stream pattern
         with client.responses.stream(model=CHAT_MODEL, input=history) as stream:
             for event in stream:
                 if event.type == "response.output_text.delta":
                     chunks.append(event.delta)
                     ph.markdown("".join(chunks))
             # fetch final response (optional)
-            _final = stream.get_final_response()
+            _ = stream.get_final_response()
     return "".join(chunks).strip()
 
 def controller_decide(client: OpenAI, history: List[Dict[str, str]], current_profile: Dict[str, Any]) -> Dict[str, Any]:
     payload = controller_payload(history)
-    r = client.responses.create(**payload)
-    # Structured output → prefer output_text when present
+    r = responses_create(client, **payload)
+    # prefer output_text
     text = getattr(r, "output_text", "")
     if not text and getattr(r, "output", None):
         blk = r.output[0]
         if blk and blk.get("content") and blk["content"][0].get("text"):
             text = blk["content"][0]["text"]
+    # if the SDK dropped response_format, we still asked for ONLY JSON in the prompt
     try:
         data = json.loads(text)
     except Exception:
@@ -288,16 +320,16 @@ def run_research_pipeline(client: OpenAI, profile: Dict[str, Any]) -> Dict[str, 
     title = profile["book"].get("title", "") or ""
     author_guess = profile["book"].get("author_guess", "") or ""
 
-    # 1) Search (hosted tool)
-    r1 = client.responses.create(**research_payload(title, author_guess))
+    # 1) Search
+    r1 = responses_create(client, **research_payload(title, author_guess))
     ctext = getattr(r1, "output_text", "") or (r1.output[0]["content"][0]["text"] if getattr(r1, "output", None) else "")
     try:
         candidates = json.loads(ctext).get("candidates", [])
     except Exception:
         candidates = []
 
-    # 2) Verify (strict JSON schema)
-    r2 = client.responses.create(**verifier_payload(profile["book"], candidates))
+    # 2) Verify
+    r2 = responses_create(client, **verifier_payload(profile["book"], candidates))
     vtext = getattr(r2, "output_text", "") or (r2.output[0]["content"][0]["text"] if getattr(r2, "output", None) else "")
     try:
         verified = json.loads(vtext)
@@ -308,7 +340,7 @@ def run_research_pipeline(client: OpenAI, profile: Dict[str, Any]) -> Dict[str, 
         }
 
     # 3) Summary
-    r3 = client.responses.create(**summary_payload(profile["book"].get("why", ""), verified.get("title", ""), verified.get("author", "")))
+    r3 = responses_create(client, **summary_payload(profile["book"].get("why", ""), verified.get("title", ""), verified.get("author", "")))
     stext = getattr(r3, "output_text", "") or (r3.output[0]["content"][0]["text"] if getattr(r3, "output", None) else "")
     try:
         summary = json.loads(stext)
