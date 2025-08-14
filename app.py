@@ -1,9 +1,11 @@
 # app.py — Expert Card Multi-Agents (Director + Web Search + Vision + Finalizer)
-# Robust gegen nicht-wohlgeformtes JSON: sichere Parser + Fallbacks.
-# - Natürliches Gespräch (Director, GPT-5), ohne redundante Bestätigungen
-# - Aktionen (search_cover) werden autonom ausgelöst
-# - Hintergrund-Pipeline: Websuche → Vision-Validierung → Finalizer
-# - UI: Bild links, finaler Absatz rechts (pro Topic)
+# Features:
+# - Director (GPT-5) führt natürliches Interview, triggert autonom Actions (search_cover / search_portrait / search_logo)
+# - Topic-Manager (book -> podcast -> role_model -> tool), max 2 Vertiefungen/Topic, dann Wechsel
+# - Parallel: Websuche -> Vision-Validierung -> Finalizer (Thread)
+# - Ergebnisse als Kacheln (Bild links, Text rechts)
+# - Fortschritts-Badges je Topic
+# - Robustes JSON-Parsing & Fallbacks
 
 import os
 import re
@@ -23,23 +25,24 @@ import requests
 APP_TITLE = "Expert Card – Mini Agents (Vision)"
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "")
 
-# Modelle (Primär + Fallbacks)
+# Modelle
 CHAT_MODEL_PRIMARY = os.getenv("DTBR_CHAT_MODEL", "gpt-5")
 CHAT_MODEL_FALLBACKS = ["gpt-4o", "gpt-4o-mini"]
-
 SEARCH_MODEL_PRIMARY = os.getenv("DTBR_SEARCH_MODEL", "gpt-5")  # Responses + web_search
 SEARCH_MODEL_FALLBACKS = ["gpt-4.1", "gpt-4o"]
 
-# Downloads
 ALLOWED_IMAGE_MIME = {"image/jpeg", "image/png", "image/webp"}
 HTTP_TIMEOUT = 20
 
-# UI Debug Toggle (per Checkbox ein-/ausschaltbar)
+TOPIC_ORDER = ["book", "podcast", "person", "tool"]  # Reihenfolge
+MAX_FOLLOWUPS_PER_TOPIC = 2
+
+# UI Debug Toggle
 if "SHOW_DEBUG" not in st.session_state:
     st.session_state.SHOW_DEBUG = False
 
 # =======================
-# SESSION STATE
+# SESSION / STATE
 # =======================
 def ensure_session():
     if "messages" not in st.session_state:
@@ -51,11 +54,17 @@ def ensure_session():
                 "Please give the title (author optional)."}
         ]
     if "profile" not in st.session_state:
-        st.session_state.profile = {"topics": []}  # siehe Topic-Objekte unten
+        st.session_state.profile = {"topics": []}  # siehe Topic-Objekte
+    if "topic_state" not in st.session_state:
+        # Manager: aktuelles Topic, Followup-Zähler je Topic
+        st.session_state.topic_state = {
+            "current": "book",
+            "followups": {k: 0 for k in TOPIC_ORDER}
+        }
     if "tasks" not in st.session_state:
-        st.session_state.tasks: Dict[str, Dict[str, Any]] = {}  # id -> {status, kind, ...}
+        st.session_state.tasks: Dict[str, Dict[str, Any]] = {}
     if "results" not in st.session_state:
-        st.session_state.results: List[Dict[str, Any]] = []      # fertige Kacheln (Bild + Text)
+        st.session_state.results: List[Dict[str, Any]] = []
     if "last_director_json" not in st.session_state:
         st.session_state.last_director_json = None
     if "last_raw_director_text" not in st.session_state:
@@ -74,21 +83,19 @@ def system_director_prompt() -> str:
         "You are the Interview Director for a tiny 'Expert Card'.\n"
         "LANGUAGE:\n"
         "- Default to English; mirror the user's language if clearly not English.\n"
-        "GOALS:\n"
-        "- Collect for topics like book/podcast/role_model/tool:\n"
-        "  • book: title (required), optional author_guess; why (1–2 sentences)\n"
-        "  • podcast: title; why (1–2 sentences)\n"
-        "  • role_model: name; why (1–2 sentences)\n"
-        "  • tool: title; why (1–2 sentences)\n"
+        "GOALS by topic:\n"
+        "- book: title (required), optional author_guess; why (1–2 sentences)\n"
+        "- podcast: title; why (1–2 sentences)\n"
+        "- role_model (person): name; why (1–2 sentences)\n"
+        "- tool: title; why (1–2 sentences)\n"
         "BEHAVIOR:\n"
-        "- Keep conversation warm and natural. Ask targeted follow-ups that reveal the user's thinking.\n"
-        "- NEVER ask redundant confirmations if information is already clear.\n"
-        "- If the title/name is sufficiently unambiguous (or author provided), you MAY trigger a cover/portrait search immediately.\n"
+        "- Keep conversation warm, natural; ask targeted follow-ups that reveal the user's thinking (no redundant confirmations).\n"
+        "- If title/name is sufficiently unambiguous (or author provided), you MAY trigger an image action immediately.\n"
         "- If multiple likely authors exist, ask ONE brief disambiguation question.\n"
-        "- After 1–2 meaningful follow-ups per topic, move on to another topic (e.g., podcast → role model → tool).\n"
-        "CONTROL OUTPUT (STRICT JSON):\n"
+        "- After ~1–2 meaningful follow-ups per topic, move to the next topic (book → podcast → role_model → tool).\n"
+        "CONTROL OUTPUT (STRICT JSON). Output ONLY the JSON object:\n"
         "{\n"
-        "  assistant_visible: string (short next message in user's language),\n"
+        "  assistant_visible: string,\n"
         "  facts_partial: {\n"
         "    book?: {title?, author_guess?, why?},\n"
         "    podcast?: {title?, why?},\n"
@@ -97,10 +104,12 @@ def system_director_prompt() -> str:
         "    extras?: object\n"
         "  },\n"
         "  actions: [\n"
-        "    { type:'search_cover', kind:'book|podcast|person|tool', title?:string, author?:string, name?:string }\n"
-        "  ]\n"
+        "    { type:'search_cover',  kind:'book|podcast', title?:string, author?:string },\n"
+        "    { type:'search_portrait', kind:'person',     name?:string },\n"
+        "    { type:'search_logo',     kind:'tool',       title?:string }\n"
+        "  ],\n"
+        "  next_topic_hint?: 'book'|'podcast'|'person'|'tool'  // optional hint for switching\n"
         "}\n"
-        "Output ONLY the JSON object. No prose, no backticks."
     )
 
 def director_schema() -> Dict[str, Any]:
@@ -148,7 +157,7 @@ def director_schema() -> Dict[str, Any]:
                 "items": {
                     "type": "object",
                     "properties": {
-                        "type": {"type": "string", "enum": ["search_cover"]},
+                        "type": {"type": "string", "enum": ["search_cover", "search_portrait", "search_logo"]},
                         "kind": {"type": "string", "enum": ["book", "podcast", "person", "tool"]},
                         "title": {"type": "string"},
                         "author": {"type": "string"},
@@ -157,7 +166,7 @@ def director_schema() -> Dict[str, Any]:
                     "required": ["type", "kind"]
                 }
             },
-            "notes": {"type": "string"}
+            "next_topic_hint": {"type": "string", "enum": ["book", "podcast", "person", "tool"]}
         },
         "required": ["assistant_visible", "facts_partial", "actions"]
     }
@@ -171,46 +180,41 @@ def websearch_system_prompt(kind: str) -> str:
         "No extra text; JSON only."
     )
     if kind == "book":
-        return base + "\nEnsure the images are book covers (portrait aspect, visible title/author typical of covers)."
+        return base + "\nEnsure the images are BOOK COVERS (portrait aspect, visible title/author typical of covers)."
     if kind == "podcast":
-        return base + "\nLook for podcast/youtube channel artwork (logo/title)."
+        return base + "\nFind PODCAST/YOUTUBE CHANNEL ARTWORK (logo/title)."
     if kind == "person":
-        return base + "\nLook for portraits (press photos, Wikipedia portrait)."
+        return base + "\nFind PORTRAITS (press photos, Wikipedia portrait)."
     if kind == "tool":
-        return base + "\nLook for product/app logos or official product shots."
+        return base + "\nFind LOGOS or official product images."
     return base
 
 def validator_system_prompt(kind: str) -> str:
     return (
         "You are a VISION validator.\n"
         "Inputs:\n"
-        "- expected (title/author/name) strings,\n"
+        "- expected strings (title/author/name),\n"
         "- up to 3 candidate images (as image inputs) with metadata (page_url, source, scraped title/authors if available).\n"
         "Task:\n"
         f"- Inspect each image VISUALLY to judge whether it is a plausible {kind} image.\n"
-        "- Verify if visible title/author/name align with expected strings (tolerate minor punctuation/case differences).\n"
-        "- Prefer trustworthy sources (publisher, Amazon, Goodreads, Open Library, official site) if images look similar.\n"
+        "- Verify if visible title/author/name aligns with expected strings (minor differences are fine).\n"
+        "- Prefer trustworthy sources (publisher, Amazon, Goodreads, Open Library, official site) if similar.\n"
         "Output STRICT JSON: {best_index: 0|1|2|-1, reason: string, confidence: number}. No prose."
     )
 
 def finalizer_system_prompt() -> str:
     return (
         "You are a finalizing writer. Create a professional, warm, uplifting 3–5 sentence paragraph that presents the user positively without flattery. "
-        "Use the interview facts (why the item matters to them) and the verified media (title/author/name). Be specific, concise, and human."
+        "Use the interview facts (why the item matters) and the verified media (title/author/name). Be specific, concise, and human."
     )
 
 # =======================
 # JSON PARSER (robust)
 # =======================
 CODE_FENCE_RE = re.compile(r"^```(?:json)?\s*|\s*```$", re.IGNORECASE | re.MULTILINE)
-
 def strip_code_fences(s: str) -> str:
     return CODE_FENCE_RE.sub("", s).strip()
-
 def extract_balanced_json(s: str) -> Optional[str]:
-    """
-    Find the first balanced {...} block and return it. Handles nested braces, quotes, and escapes.
-    """
     start = s.find("{")
     if start < 0:
         return None
@@ -236,12 +240,7 @@ def extract_balanced_json(s: str) -> Optional[str]:
                 if depth == 0:
                     return s[start:i+1]
     return None
-
 def parse_json_strict_or_best_effort(text: str) -> Tuple[Optional[dict], Optional[str]]:
-    """
-    Try to parse JSON. If it fails, try to strip code fences and extract a balanced JSON block.
-    Returns (data, raw_used_text) — data is dict or None; raw_used_text shows what we attempted.
-    """
     raw = text or ""
     try:
         return json.loads(raw), raw
@@ -264,7 +263,6 @@ def parse_json_strict_or_best_effort(text: str) -> Tuple[Optional[dict], Optiona
 # OPENAI WRAPPER
 # =======================
 def responses_create(client: OpenAI, **kwargs):
-    # leichte „Deterministik“
     kwargs.setdefault("temperature", 0.2)
     try:
         return client.responses.create(**kwargs)
@@ -283,38 +281,9 @@ def ensure_topic(profile: Dict[str, Any], kind: str, key_value: str) -> int:
     for i, t in enumerate(topics):
         if t.get("kind") == kind and (t.get("facts", {}).get(key_field, "") or "").lower() == (key_value or "").lower():
             return i
-    topic = {
-        "kind": kind,
-        "facts": {key_field: key_value},
-        "status": "collecting",
-        "media": {}
-    }
+    topic = {"kind": kind, "facts": {key_field: key_value}, "status": "collecting", "media": {}}
     topics.append(topic)
     return len(topics) - 1
-
-def merge_facts(profile: Dict[str, Any], partial: Dict[str, Any]):
-    if not partial:
-        return
-    # BOOK
-    if "book" in partial and isinstance(partial["book"], dict):
-        title = partial["book"].get("title", "") or profile_key(profile, "book")
-        idx = ensure_topic(profile, "book", title)
-        profile["topics"][idx]["facts"].update({k: v for k, v in partial["book"].items() if isinstance(v, str) and v.strip()})
-    # PODCAST
-    if "podcast" in partial and isinstance(partial["podcast"], dict):
-        title = partial["podcast"].get("title", "") or profile_key(profile, "podcast")
-        idx = ensure_topic(profile, "podcast", title)
-        profile["topics"][idx]["facts"].update({k: v for k, v in partial["podcast"].items() if isinstance(v, str) and v.strip()})
-    # ROLE MODEL
-    if "role_model" in partial and isinstance(partial["role_model"], dict):
-        name = partial["role_model"].get("name", "") or profile_key(profile, "person")
-        idx = ensure_topic(profile, "person", name)
-        profile["topics"][idx]["facts"].update({k: v for k, v in partial["role_model"].items() if isinstance(v, str) and v.strip()})
-    # TOOL
-    if "tool" in partial and isinstance(partial["tool"], dict):
-        title = partial["tool"].get("title", "") or profile_key(profile, "tool")
-        idx = ensure_topic(profile, "tool", title)
-        profile["topics"][idx]["facts"].update({k: v for k, v in partial["tool"].items() if isinstance(v, str) and v.strip()})
 
 def profile_key(profile: Dict[str, Any], kind: str) -> str:
     for t in profile["topics"]:
@@ -323,18 +292,37 @@ def profile_key(profile: Dict[str, Any], kind: str) -> str:
             return t.get("facts", {}).get(key_field, "")
     return ""
 
+def merge_facts(profile: Dict[str, Any], partial: Dict[str, Any]):
+    if not partial:
+        return
+    if "book" in partial and isinstance(partial["book"], dict):
+        title = partial["book"].get("title", "") or profile_key(profile, "book")
+        idx = ensure_topic(profile, "book", title)
+        profile["topics"][idx]["facts"].update({k: v for k, v in partial["book"].items() if isinstance(v, str) and v.strip()})
+    if "podcast" in partial and isinstance(partial["podcast"], dict):
+        title = partial["podcast"].get("title", "") or profile_key(profile, "podcast")
+        idx = ensure_topic(profile, "podcast", title)
+        profile["topics"][idx]["facts"].update({k: v for k, v in partial["podcast"].items() if isinstance(v, str) and v.strip()})
+    if "role_model" in partial and isinstance(partial["role_model"], dict):
+        name = partial["role_model"].get("name", "") or profile_key(profile, "person")
+        idx = ensure_topic(profile, "person", name)
+        profile["topics"][idx]["facts"].update({k: v for k, v in partial["role_model"].items() if isinstance(v, str) and v.strip()})
+    if "tool" in partial and isinstance(partial["tool"], dict):
+        title = partial["tool"].get("title", "") or profile_key(profile, "tool")
+        idx = ensure_topic(profile, "tool", title)
+        profile["topics"][idx]["facts"].update({k: v for k, v in partial["tool"].items() if isinstance(v, str) and v.strip()})
+
 # =======================
 # AGENT CALLS
 # =======================
 def call_director(client: OpenAI, history: List[Dict[str, Any]]) -> Dict[str, Any]:
-    schema = director_schema()
     payload = {
         "model": CHAT_MODEL_PRIMARY,
         "response_format": {"type": "json_schema",
-                            "json_schema": {"name": "director_control", "schema": schema, "strict": True}},
+                            "json_schema": {"name": "director_control", "schema": director_schema(), "strict": True}},
         "input": [
             {"role": "system", "content": system_director_prompt()},
-            *history[2:]  # initial system + first assistant already in history
+            *history[2:]
         ]
     }
     last_err = None
@@ -342,17 +330,15 @@ def call_director(client: OpenAI, history: List[Dict[str, Any]]) -> Dict[str, An
         payload["model"] = m
         try:
             r = responses_create(client, **payload)
-            # Raw-Text extrahieren
             text = getattr(r, "output_text", "")
             if not text and getattr(r, "output", None):
                 blk = r.output[0]
                 if blk and blk.get("content") and blk["content"][0].get("text"):
                     text = blk["content"][0]["text"]
             st.session_state.last_raw_director_text = text or ""
-            data, used = parse_json_strict_or_best_effort(text or "")
+            data, _ = parse_json_strict_or_best_effort(text or "")
             if data is not None:
                 return data
-            # Fallback: sichere Minimalstruktur
             return {
                 "assistant_visible": "Got it! What makes it stand out for you? A sentence or two is enough.",
                 "facts_partial": {},
@@ -361,7 +347,6 @@ def call_director(client: OpenAI, history: List[Dict[str, Any]]) -> Dict[str, An
         except Exception as e:
             last_err = e
             continue
-    # Wenn gar nichts klappt, immer noch eine sichere Antwort zurückgeben
     if last_err:
         st.session_state.last_raw_director_text = f"(error: {last_err})"
     return {
@@ -378,9 +363,7 @@ def call_websearch(client: OpenAI, kind: str, title_or_name: str, author: str = 
         "input": [
             {"role": "system", "content": websearch_system_prompt(kind)},
             {"role": "user", "content": json.dumps({
-                "kind": kind,
-                "title_or_name": title_or_name,
-                "author": author
+                "kind": kind, "title_or_name": title_or_name, "author": author
             }, separators=(",", ":"))}
         ]
     }
@@ -396,38 +379,33 @@ def call_websearch(client: OpenAI, kind: str, title_or_name: str, author: str = 
         except Exception as e:
             last_err = e
             continue
-    # Fallback
     return {"candidates": []}
 
 def call_vision_validator(client: OpenAI, kind: str,
                           expected_title: str, expected_author_or_name: str,
                           candidates: List[Dict[str, Any]]) -> Dict[str, Any]:
-    # Text + bis zu 3 Bilder
-    content_parts: List[Dict[str, Any]] = [
+    parts: List[Dict[str, Any]] = [
         {"type": "input_text",
          "text": json.dumps({
              "kind": kind,
              "expected_title": expected_title,
              "expected_author_or_name": expected_author_or_name,
              "candidates_meta": [
-                 {
-                     "page_url": c.get("page_url", ""),
-                     "source": c.get("source", ""),
-                     "title": c.get("title", ""),
-                     "authors": c.get("authors", []),
-                     "image_url": c.get("image_url", "")
-                 } for c in candidates[:3]
+                 {"page_url": c.get("page_url", ""), "source": c.get("source", ""),
+                  "title": c.get("title", ""), "authors": c.get("authors", []),
+                  "image_url": c.get("image_url", "")}
+                 for c in candidates[:3]
              ]
          }, separators=(",", ":"))}
     ]
     for c in candidates[:3]:
         if c.get("image_url"):
-            content_parts.append({"type": "input_image", "image_url": c["image_url"]})
+            parts.append({"type": "input_image", "image_url": c["image_url"]})
 
     payload = {
         "model": CHAT_MODEL_PRIMARY,  # Vision-fähig
         "response_format": {"type": "json_schema",
-                            "json_schema": {"name": "cover_validation",
+                            "json_schema": {"name": "validation",
                                             "schema": {
                                                 "type": "object",
                                                 "properties": {
@@ -440,7 +418,7 @@ def call_vision_validator(client: OpenAI, kind: str,
                                             "strict": True}},
         "input": [
             {"role": "system", "content": validator_system_prompt(kind)},
-            {"role": "user", "content": content_parts}
+            {"role": "user", "content": parts}
         ]
     }
     last_err = None
@@ -461,29 +439,24 @@ def call_vision_validator(client: OpenAI, kind: str,
 def call_finalizer(client: OpenAI, facts: Dict[str, Any], chosen_meta: Dict[str, Any]) -> str:
     payload = {
         "model": CHAT_MODEL_PRIMARY,
-        "temperature": 0.6,  # finaler Text darf etwas wärmer sein
+        "temperature": 0.6,
         "input": [
             {"role": "system", "content": finalizer_system_prompt()},
-            {"role": "user", "content": json.dumps({
-                "facts": facts,
-                "verified_media": chosen_meta
-            }, separators=(",", ":"))}
+            {"role": "user", "content": json.dumps({"facts": facts, "verified_media": chosen_meta}, separators=(",", ":"))}
         ]
     }
-    last_err = None
     for m in [CHAT_MODEL_PRIMARY, *CHAT_MODEL_FALLBACKS]:
         payload["model"] = m
         try:
             r = responses_create(client, **payload)
             txt = getattr(r, "output_text", "") or (r.output[0]["content"][0]["text"] if getattr(r, "output", None) else "")
             return (txt or "").strip()
-        except Exception as e:
-            last_err = e
+        except Exception:
             continue
     return "A concise, positive summary will appear here once the network recovers."
 
 # =======================
-# DOWNLOADER (nur für Anzeige)
+# DOWNLOADER (Anzeige)
 # =======================
 def safe_download_image(url: str) -> Optional[str]:
     try:
@@ -493,7 +466,7 @@ def safe_download_image(url: str) -> Optional[str]:
             if ctype not in ALLOWED_IMAGE_MIME:
                 return None
             suf = {"image/jpeg": ".jpg", "image/png": ".png", "image/webp": ".webp"}.get(ctype, ".img")
-            fd, path = tempfile.mkstemp(prefix="cover_", suffix=suf)
+            fd, path = tempfile.mkstemp(prefix="img_", suffix=suf)
             with os.fdopen(fd, "wb") as f:
                 for chunk in r.iter_content(8192):
                     f.write(chunk)
@@ -504,9 +477,13 @@ def safe_download_image(url: str) -> Optional[str]:
 # =======================
 # BACKGROUND TASKS
 # =======================
-def start_cover_task(client: OpenAI, kind: str, title_or_name: str, author: str, topic_index: int, facts_snapshot: Dict[str, Any]):
+def start_media_task(client: OpenAI, action_type: str, kind: str,
+                     title_or_name: str, author: str, topic_index: int, facts_snapshot: Dict[str, Any]):
+    """
+    Startet: Websuche -> Vision-Validierung -> Finalizer für alle Action-Typen.
+    """
     task_id = str(uuid.uuid4())
-    st.session_state.tasks[task_id] = {"status": "running", "kind": "cover", "topic_index": topic_index, "error": "", "result": None}
+    st.session_state.tasks[task_id] = {"status": "running", "kind": action_type, "topic_index": topic_index, "error": "", "result": None}
 
     def worker():
         try:
@@ -517,9 +494,9 @@ def start_cover_task(client: OpenAI, kind: str, title_or_name: str, author: str,
             candidates = (found.get("candidates") or [])[:3]
             st.session_state.profile["topics"][topic_index].setdefault("media", {})["candidates"] = candidates
 
-            # 2) Vision-Validierung
+            # 2) Vision-Validierung (Expectation je nach kind)
             st.session_state.profile["topics"][topic_index]["status"] = "validating"
-            expected_title = title_or_name if kind != "person" else ""
+            expected_title = title_or_name if kind in ("book", "podcast", "tool") else ""
             expected_author_or_name = author if kind == "book" else (title_or_name if kind == "person" else "")
             val = call_vision_validator(client, kind, expected_title, expected_author_or_name, candidates)
             best_i = val.get("best_index", -1)
@@ -530,7 +507,7 @@ def start_cover_task(client: OpenAI, kind: str, title_or_name: str, author: str,
             st.session_state.profile["topics"][topic_index]["media"]["validator"] = val
             st.session_state.profile["topics"][topic_index]["media"]["chosen"] = chosen
 
-            # 3) Finalizer-Text
+            # 3) Finalizer
             final_txt = call_finalizer(client, facts_snapshot, chosen)
 
             res = {
@@ -547,12 +524,41 @@ def start_cover_task(client: OpenAI, kind: str, title_or_name: str, author: str,
             st.session_state.results.append(res)
 
             st.session_state.profile["topics"][topic_index]["status"] = "ready"
-            st.session_state.tasks[task_id] = {"status": "done", "kind": "cover", "topic_index": topic_index, "error": "", "result": res}
+            st.session_state.tasks[task_id] = {"status": "done", "kind": action_type, "topic_index": topic_index, "error": "", "result": res}
         except Exception as e:
             st.session_state.profile["topics"][topic_index]["status"] = "failed"
-            st.session_state.tasks[task_id] = {"status": "error", "kind": "cover", "topic_index": topic_index, "error": str(e), "result": None}
+            st.session_state.tasks[task_id] = {"status": "error", "kind": action_type, "topic_index": topic_index, "error": str(e), "result": None}
 
     threading.Thread(target=worker, daemon=True).start()
+
+# =======================
+# TOPIC MANAGER (Wechsel & Followups)
+# =======================
+def current_topic() -> str:
+    return st.session_state.topic_state["current"]
+
+def inc_followup(kind: str):
+    st.session_state.topic_state["followups"][kind] = st.session_state.topic_state["followups"].get(kind, 0) + 1
+
+def followups(kind: str) -> int:
+    return st.session_state.topic_state["followups"].get(kind, 0)
+
+def switch_to_next_topic(hint: Optional[str] = None):
+    order = TOPIC_ORDER
+    cur = current_topic()
+    # wenn Hinweis vorhanden und gültig, nimm ihn
+    if hint in order:
+        st.session_state.topic_state["current"] = hint
+        return
+    # sonst nächste in Reihenfolge
+    idx = order.index(cur) if cur in order else -1
+    nxt = order[idx + 1] if 0 <= idx < len(order) - 1 else order[0]
+    st.session_state.topic_state["current"] = nxt
+
+def maybe_switch_topic(hint: Optional[str] = None):
+    cur = current_topic()
+    if followups(cur) >= MAX_FOLLOWUPS_PER_TOPIC:
+        switch_to_next_topic(hint)
 
 # =======================
 # STREAMLIT UI
@@ -561,11 +567,25 @@ st.set_page_config(page_title=APP_TITLE, page_icon="🟡", layout="centered")
 colA, colB = st.columns([1, 1])
 with colA:
     st.title("Dein Kurz-Steckbrief")
-    st.caption("Director decides • parallel web search + vision validate • final shows as two columns")
+    st.caption("Director decides • parallel search + vision • final text per item")
 with colB:
     st.toggle("Debug", key="SHOW_DEBUG", help="Show raw JSON/text outputs for troubleshooting")
 
 ensure_session()
+
+# Fortschritt/Badges je Topic
+st.subheader("Topics")
+badge_cols = st.columns(len(TOPIC_ORDER))
+for i, kind in enumerate(TOPIC_ORDER):
+    status = "—"
+    for t in st.session_state.profile["topics"]:
+        if t["kind"] == kind:
+            status = t.get("status", "collecting")
+            break
+    with badge_cols[i]:
+        cur_marker = " (current)" if current_topic() == kind else ""
+        st.markdown(f"**{kind.capitalize()}**{cur_marker}")
+        st.caption(f"status: {status} • followups: {followups(kind)}")
 
 # Verlauf (ohne initiales system)
 for m in st.session_state.messages:
@@ -587,52 +607,55 @@ except Exception as e:
 user_text = st.chat_input("Type your answer…")
 if user_text:
     st.session_state.messages.append({"role": "user", "content": user_text})
-
     if agent_ready:
-        # Director entscheidet (liefert sichtbaren Satz + actions + facts_partial)
         director_json = call_director(client, st.session_state.messages)
         st.session_state.last_director_json = director_json
 
-        # Merge Facts
+        # Facts mergen
         merge_facts(st.session_state.profile, director_json.get("facts_partial") or {})
 
         # Sichtbare Antwort
         vis = (director_json.get("assistant_visible") or "").strip()
         if vis:
             st.session_state.messages.append({"role": "assistant", "content": vis})
+            # Heuristik: wenn sichtbare Antwort eine Vertiefung im aktuellen Topic ist → Followup zählen
+            inc_followup(current_topic())
 
-        # Aktionen ausführen (parallel)
+        # Aktionen ausführen (parallel), deduplizieren
         for act in (director_json.get("actions") or []):
-            if act.get("type") == "search_cover":
-                kind = (act.get("kind") or "").strip()
-                if not kind:
-                    continue
-                if kind == "person":
-                    name = (act.get("name") or profile_key(st.session_state.profile, "person")).strip()
-                    if not name:
-                        continue
-                    idx = ensure_topic(st.session_state.profile, "person", name)
-                    if st.session_state.profile["topics"][idx]["status"] in ("queued", "searching", "validating"):
-                        continue
-                    st.session_state.profile["topics"][idx]["status"] = "queued"
-                    snapshot = json.loads(json.dumps(st.session_state.profile["topics"][idx]["facts"]))
-                    start_cover_task(client, "person", name, "", idx, {"topic": snapshot})
-                else:
-                    title = (act.get("title") or profile_key(st.session_state.profile, kind)).strip()
-                    author = (act.get("author") or "").strip()
-                    if not title:
-                        continue
-                    idx = ensure_topic(st.session_state.profile, kind, title)
-                    if st.session_state.profile["topics"][idx]["status"] in ("queued", "searching", "validating"):
-                        continue
-                    st.session_state.profile["topics"][idx]["status"] = "queued"
-                    snapshot = json.loads(json.dumps(st.session_state.profile["topics"][idx]["facts"]))
-                    start_cover_task(client, kind, title, author, idx, {"topic": snapshot})
+            a_type = act.get("type", "")
+            kind = (act.get("kind") or "").strip()
+            if not a_type or not kind:
+                continue
 
+            # Schlüssel extrahieren
+            if kind == "person":
+                name = (act.get("name") or profile_key(st.session_state.profile, "person")).strip()
+                if not name:
+                    continue
+                idx = ensure_topic(st.session_state.profile, "person", name)
+                if st.session_state.profile["topics"][idx]["status"] in ("queued", "searching", "validating"):
+                    continue
+                st.session_state.profile["topics"][idx]["status"] = "queued"
+                snapshot = json.loads(json.dumps(st.session_state.profile["topics"][idx]["facts"]))
+                start_media_task(client, a_type, "person", name, "", idx, {"topic": snapshot})
+            else:
+                title = (act.get("title") or profile_key(st.session_state.profile, kind)).strip()
+                author = (act.get("author") or "").strip()
+                if not title:
+                    continue
+                idx = ensure_topic(st.session_state.profile, kind, title)
+                if st.session_state.profile["topics"][idx]["status"] in ("queued", "searching", "validating"):
+                    continue
+                st.session_state.profile["topics"][idx]["status"] = "queued"
+                snapshot = json.loads(json.dumps(st.session_state.profile["topics"][idx]["facts"]))
+                start_media_task(client, a_type, kind, title, author, idx, {"topic": snapshot})
+
+        # Topic-Wechsel?
+        maybe_switch_topic(director_json.get("next_topic_hint"))
     else:
         st.session_state.messages.append({"role": "assistant",
                                           "content": "(Demo mode — set OPENAI_API_KEY in Streamlit Secrets.)"})
-
     st.rerun()
 
 # Laufende Tasks
@@ -653,9 +676,7 @@ if st.session_state.results:
                 st.write("No image available.")
         with c2:
             kind = res.get("kind", "")
-            # einfache Überschrift
-            header = kind.capitalize() if kind else "Item"
-            st.markdown(f"**{header}**")
+            st.markdown(f"**{kind.capitalize() if kind else 'Item'}**")
             st.write(res.get("text", {}).get("final_paragraph", ""))
             page_url = res.get("image", {}).get("page_url")
             if page_url:
@@ -668,7 +689,7 @@ if st.session_state.results:
 c1, c2, c3 = st.columns(3)
 with c1:
     if st.button("🔄 Restart interview"):
-        for k in ["messages", "profile", "tasks", "results", "last_director_json", "last_raw_director_text"]:
+        for k in ["messages", "profile", "tasks", "results", "last_director_json", "last_raw_director_text", "topic_state"]:
             if k in st.session_state:
                 del st.session_state[k]
         ensure_session()
