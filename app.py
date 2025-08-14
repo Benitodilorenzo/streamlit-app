@@ -1,9 +1,8 @@
-# app.py — Expert Card Creator
-# - Director mit festen Leitplanken & Limits
-# - Unsichtbare [[ACTIONS]]-Blöcke (falls vorhanden)
-# - Auto-Trigger für Hintergrundsuche (läuft auch ohne [[ACTIONS]])
-# - Parallele Recherche + Vision-Validierung (LLM-basiert)
-# - Harte Stopps & Finalizer
+# app.py — Expert Card Creator (GPT-5, Single-Agent mit versteckten ACTIONS)
+# - Chat-Agent (Director) stellt Fragen, extrahiert Infos und emittiert versteckte ACTIONS
+# - Background-Threads starten aus ACTIONS (Websuche-Simulation + Vision-Validierung via GPT-5)
+# - Fortschritt, Debug-Panel, Finalizer
+# - Keine Heuristiken: Extraktion 100% durch das LLM
 
 import os
 import re
@@ -15,7 +14,7 @@ import streamlit as st
 from openai import OpenAI
 
 # ─────────────────────────────────────────────
-# Config
+# Grundkonfiguration
 # ─────────────────────────────────────────────
 st.set_page_config(page_title="Expert Card Creator", page_icon="📝", layout="centered")
 st.title("📝 Expert Card Creator")
@@ -26,28 +25,23 @@ if not OPENAI_API_KEY:
     st.stop()
 
 client = OpenAI(api_key=OPENAI_API_KEY)
+CHAT_MODEL = os.getenv("DTBR_CHAT_MODEL", "gpt-5")  # ein Modell für alles
 
-# Modelle
-CHAT_MODEL = os.getenv("DTBR_CHAT_MODEL", "gpt-5")          # Director / Validator / Finalizer
-SEARCH_MODEL = os.getenv("DTBR_SEARCH_MODEL", CHAT_MODEL)   # Websearch-Simulation (LLM)
-
-# Gesprächs-Plan (Themen, Followups, Minimalfelder, erlaubte Actions)
+# Themen-Plan: Reihenfolge, Followups, erlaubte Actions
 TOPICS_PLAN = [
-    {"name": "Book",    "followups": 2, "min_fields": ["title"], "actions": ["SEARCH_COVER"]},
-    {"name": "Podcast", "followups": 2, "min_fields": ["title"], "actions": ["SEARCH_PODCAST", "SEARCH_LOGO"]},
-    {"name": "Person",  "followups": 1, "min_fields": ["name"],  "actions": ["SEARCH_PORTRAIT"]},
-    {"name": "Tool",    "followups": 0, "min_fields": ["title"], "actions": ["SEARCH_LOGO"]},
+    {"name": "Book",    "followups": 2, "actions": ["SEARCH_COVER"]},
+    {"name": "Podcast", "followups": 2, "actions": ["SEARCH_PODCAST", "SEARCH_LOGO"]},
+    {"name": "Person",  "followups": 1, "actions": ["SEARCH_PORTRAIT"]},
+    {"name": "Tool",    "followups": 0, "actions": ["SEARCH_LOGO"]},
 ]
 
-# Harte Grenzen fürs ganze Gespräch
-MAX_TOTAL_QUESTIONS = 10
-MAX_TOPICS = len(TOPICS_PLAN)
+MAX_TOTAL_QUESTIONS = 10  # harter Deckel, damit es nicht endlos weitergeht
 
-# Background queues/state (thread-safe)
+# Globale Queues/State für Background-Ergebnisse
 RESULTS_QUEUE: "queue.Queue[Dict[str, Any]]" = queue.Queue()
 
 # ─────────────────────────────────────────────
-# Session init
+# Session-Initialisierung
 # ─────────────────────────────────────────────
 def ensure_session():
     if "history" not in st.session_state:
@@ -55,7 +49,7 @@ def ensure_session():
             {
                 "role": "system",
                 "content": (
-                    "You are a warm, focused interviewer creating a concise 'expert card'. "
+                    "You are a warm, focused interviewer for a concise expert card. "
                     "Avoid redundant confirmations. Ask short, meaningful questions."
                 ),
             },
@@ -71,13 +65,18 @@ def ensure_session():
     if "profile" not in st.session_state:
         st.session_state.profile = {
             "topics": [
-                {"name": t["name"], "status": "queued", "followups": t["followups"],
-                 "answers": [], "media": {}, "research_started": False}
+                {
+                    "name": t["name"],
+                    "status": "queued",
+                    "followups": t["followups"],
+                    "answers": [],
+                    "media": {},
+                }
                 for t in TOPICS_PLAN
             ],
             "current_topic_index": 0,
-            "finalizing": False,
             "bot_questions": 0,
+            "finalizing": False,
         }
     if "inflight_keys" not in st.session_state:
         st.session_state.inflight_keys = set()
@@ -85,18 +84,11 @@ def ensure_session():
         st.session_state.results: List[Dict[str, Any]] = []
     if "final_output" not in st.session_state:
         st.session_state.final_output = None
-    if "progress_total" not in st.session_state:
-        st.session_state.progress_total = len(TOPICS_PLAN) * 2  # Interview + Research je Topic
-    if "progress_done" not in st.session_state:
-        st.session_state.progress_done = 0
     if "debug" not in st.session_state:
         st.session_state.debug: List[str] = []
 
 ensure_session()
 
-# ─────────────────────────────────────────────
-# Topic Helpers
-# ─────────────────────────────────────────────
 def log_debug(msg: str):
     st.session_state.debug.append(msg)
 
@@ -104,14 +96,8 @@ def current_topic() -> Dict[str, Any]:
     idx = st.session_state.profile["current_topic_index"]
     return st.session_state.profile["topics"][idx]
 
-def find_topic_index_by_name(name: str) -> int:
-    for i, t in enumerate(st.session_state.profile["topics"]):
-        if t["name"].lower() == name.lower():
-            return i
-    return -1
-
 def advance_topic_if_needed():
-    """Wenn Followups aufgebraucht → Topic done → nächstes Thema wählen (falls vorhanden)."""
+    """Wenn Followups aufgebraucht → Status done → nächstes Topic (falls vorhanden)."""
     idx = st.session_state.profile["current_topic_index"]
     topic = st.session_state.profile["topics"][idx]
     if topic["followups"] <= 0 and topic["status"] != "done":
@@ -130,51 +116,59 @@ def reached_global_limits() -> bool:
 
 def finalize_if_possible():
     if not st.session_state.profile["finalizing"]:
-        if all_topics_completed():
-            st.session_state.profile["finalizing"] = True
-            log_debug("finalize_if_possible(): set finalizing=True (all topics completed)")
+        st.session_state.profile["finalizing"] = True
+        log_debug("finalize_if_possible(): set finalizing=True")
 
 # ─────────────────────────────────────────────
-# Director Prompt / ACTIONS Parsing
+# Director-Agent (einziger Chat-Agent)
 # ─────────────────────────────────────────────
 DIRECTOR_INSTRUCTIONS = """
 You are the Director Agent for a short expert-card interview.
 
-SCOPE & ORDER
-- You must follow this exact topic order and stop after the last one:
-  1) Book → ask up to 2 follow-ups
-  2) Podcast → up to 2
-  3) Person → up to 1
-  4) Tool → 0 follow-ups (just collect a name if available)
-- Never introduce new topics outside this list.
-- Per topic, ask only within that topic’s scope.
+SCOPE & ORDER (STRICT)
+- Follow THIS exact topic order and never introduce others:
+  1) Book — ask up to 2 short follow-ups
+  2) Podcast — up to 2
+  3) Person — up to 1
+  4) Tool — 0 follow-ups (just collect a name if available)
+- Move on when you have enough signal for the current topic (no confirmations unless truly ambiguous).
 
-STYLE & BEHAVIOR
+STYLE
 - One concise, fresh question per turn.
-- Avoid repeating the same meaning.
-- No “Is that correct?” confirmations unless truly ambiguous.
-- Mirror the user's language if it's clearly not English; otherwise use English.
-- After a topic reaches its follow-up limit or has enough substance, move on.
+- No repetitive phrasings; no “Is that correct?” unless ambiguous.
+- Mirror user's language if clearly not English; otherwise use English.
 
-TRIGGERS (optional, hidden):
-- If minimal info for the current topic is present, emit a hidden [[ACTIONS]] block with one action per line:
+HIDDEN ACTIONS (CRITICAL)
+- When you have enough to launch background research for the current topic, emit a hidden block:
   [[ACTIONS]]
-  ACTION: SEARCH_COVER title="..." author="..."
+  ACTION: <TYPE> [title="..."] [author="..."] [name="..."]
   [[/ACTIONS]]
-- Allowed actions by topic:
-  Book: SEARCH_COVER
-  Podcast: SEARCH_PODCAST or SEARCH_LOGO
-  Person: SEARCH_PORTRAIT
-  Tool: SEARCH_LOGO
-- Emit FINALIZE_READY only when all topics in scope have sufficient material.
+- Allowed actions:
+  Book:    SEARCH_COVER (require title; author if available)
+  Podcast: SEARCH_PODCAST or SEARCH_LOGO (require canonical podcast title)
+  Person:  SEARCH_PORTRAIT (require canonical person name)
+  Tool:    SEARCH_LOGO (require canonical brand/tool title)
 
-OUTPUT FORMAT
-1) First lines: the VISIBLE question (one or two short sentences).
-2) Then, if any, a hidden block exactly like:
+EXTRACTION
+- You must extract canonical titles/names directly from the user's latest answer.
+- Do not pass full sentences as titles. Use proper-cased, concise names (e.g., “Escape to Rural France”, not the whole sentence).
+
+STOPPING
+- Stop asking when:
+  (a) all topics are collected in the minimal scope, or
+  (b) the global question budget is reached.
+- When you believe enough content is collected across all topics, emit:
+  [[ACTIONS]]
+  ACTION: FINALIZE_READY
+  [[/ACTIONS]]
+
+OUTPUT FORMAT (MANDATORY)
+1) First lines: the VISIBLE user-facing question (one or two short sentences).
+2) Then, if any, a hidden ACTION block exactly in this form:
 [[ACTIONS]]
 ACTION: <TYPE> [title="..."] [author="..."] [name="..."]
 [[/ACTIONS]]
-Never mix actions into the visible question.
+Do NOT show actions in the visible question.
 """
 
 ACTIONS_BLOCK_RE = re.compile(r"\[\[ACTIONS\]\](.*?)\[\[/ACTIONS\]\]", re.DOTALL | re.IGNORECASE)
@@ -187,16 +181,15 @@ ACTION_LINE_RE = re.compile(
 )
 
 def split_visible_and_actions(text: str) -> Tuple[str, List[Dict[str, str]]]:
-    """Extrahiert [[ACTIONS]]-Block, strippt ihn aus dem sichtbaren Text, parst Action-Zeilen.
-       Fallback: ACTION:-Zeilen auch ohne Block entfernen.
-    """
+    """Zerlegt Assistant-Output in sichtbaren Teil + geparste ACTIONS; ACTION-Zeilen im sichtbaren entfernen."""
     actions: List[Dict[str, str]] = []
+    t = text or ""
 
-    # 1) [[ACTIONS]]...[[/ACTIONS]] block
-    block_match = ACTIONS_BLOCK_RE.search(text or "")
+    # [[ACTIONS]] Block zuerst
+    block_match = ACTIONS_BLOCK_RE.search(t)
     if block_match:
         block = block_match.group(1)
-        visible = ACTIONS_BLOCK_RE.sub("", text).strip()
+        visible = ACTIONS_BLOCK_RE.sub("", t).strip()
         for line in block.splitlines():
             m = ACTION_LINE_RE.match(line)
             if not m:
@@ -207,13 +200,14 @@ def split_visible_and_actions(text: str) -> Tuple[str, List[Dict[str, str]]]:
             if gd.get("author"): act["author"] = gd["author"].strip()
             if gd.get("name"):   act["name"]   = gd["name"].strip()
             actions.append(act)
-        # Sicherheit: im sichtbaren Teil evtl. hineingeratene ACTION-Zeilen entfernen
-        visible = "\n".join([ln for ln in visible.splitlines() if not ln.strip().upper().startswith("ACTION:")]).strip()
+        # evtl. übriggebliebene ACTION:-Zeilen aus visible entfernen
+        visible = "\n".join([ln for ln in visible.splitlines()
+                             if not ln.strip().upper().startswith("ACTION:")]).strip()
         return visible, actions
 
-    # 2) kein Block → entferne ACTION:-Zeilen aus sichtbarem Text
+    # Kein Block → entferne einzelne ACTION-Zeilen sicherheitshalber
     visible_lines = []
-    for ln in (text or "").splitlines():
+    for ln in t.splitlines():
         if ACTION_LINE_RE.match(ln):
             gd = ACTION_LINE_RE.match(ln).groupdict()
             act = {"kind": gd["kind"].upper()}
@@ -225,18 +219,16 @@ def split_visible_and_actions(text: str) -> Tuple[str, List[Dict[str, str]]]:
             visible_lines.append(ln)
     return "\n".join(visible_lines).strip(), actions
 
-def director_ask_next() -> Tuple[str, List[Dict[str, str]]]:
-    """Frage vom Director generieren; sichtbarer Text + geparste Actions zurückgeben."""
+def director_turn() -> Tuple[str, List[Dict[str, str]]]:
+    """Erzeuge nächste Frage + ACTIONS mit GPT-5."""
     topic = current_topic()
-    bot_q = st.session_state.profile.get("bot_questions", 0)
-
     sys = (
         f"{DIRECTOR_INSTRUCTIONS}\n\n"
         f"CURRENT TOPIC: {topic['name']}\n"
         f"REMAINING FOLLOW-UPS: {topic['followups']}\n"
         f"ALREADY SAID FOR THIS TOPIC: {topic['answers']}\n"
-        f"TOTAL BOT QUESTIONS SO FAR: {bot_q} (hard limit {MAX_TOTAL_QUESTIONS})\n"
-        "Remember: visible question first; optional [[ACTIONS]] block after."
+        f"TOTAL BOT QUESTIONS SO FAR: {st.session_state.profile['bot_questions']} (limit {MAX_TOTAL_QUESTIONS})\n"
+        "Reminder: emit a hidden [[ACTIONS]] block whenever you have enough info to launch background search."
     )
     try:
         resp = client.chat.completions.create(
@@ -254,124 +246,152 @@ def director_ask_next() -> Tuple[str, List[Dict[str, str]]]:
     return visible, acts
 
 # ─────────────────────────────────────────────
-# Guards: nur sinnvolle Actions zulassen
+# ACTION Guards & Background-Starter
 # ─────────────────────────────────────────────
-def allow_action(action: Dict[str, str], last_user_text: str) -> bool:
-    """Nur passende, ausreichend informierte Actions akzeptieren – strikt pro Topic."""
+def allow_action(action: Dict[str, str]) -> bool:
+    """Nur zum aktuellen Topic passende Actions zulassen, und minimal Felder prüfen."""
     kind = action.get("kind", "").upper()
     topic = current_topic()
     name = topic["name"]
 
-    # Finalize kann immer – aber nur, wenn noch nicht im Finalisieren
     if kind == "FINALIZE_READY":
-        return not st.session_state.profile["finalizing"]
+        return True  # Director entscheidet
 
-    # Zulässige Actions laut Plan
     allowed = next((t["actions"] for t in TOPICS_PLAN if t["name"] == name), [])
     if kind not in set(allowed):
         return False
 
-    # Minimalfelder je Topic/Action
+    # Minimalfelder strikt: wir vertrauen darauf, dass der Director kanonische Werte liefert
     if name == "Book" and kind == "SEARCH_COVER":
+        return bool(action.get("title"))
+    if name == "Podcast" and kind in ("SEARCH_PODCAST", "SEARCH_LOGO"):
+        return bool(action.get("title"))
+    if name == "Person" and kind == "SEARCH_PORTRAIT":
+        return bool(action.get("name"))
+    if name == "Tool" and kind == "SEARCH_LOGO":
+        return bool(action.get("title"))
+
+    return False
+
+def start_background_action(action: Dict[str, str], topic_hint: str = ""):
+    """Startet Nebenläufer. Key-Dedupe, Worker mit GPT-5 (Websuche-Simulation + Vision-Validierung)."""
+    kind = action["kind"].upper()
+
+    # Finalize-Flag
+    if kind == "FINALIZE_READY":
+        st.session_state.profile["finalizing"] = True
+        log_debug("Action: FINALIZE_READY → finalizing=True")
+        return
+
+    # Topic-Zuordnung
+    tk_name = topic_hint or current_topic()["name"]
+
+    # kompakten Key bauen (max 80 chars)
+    def norm_key(s: str) -> str:
+        s = (s or "").strip().lower()
+        return s[:80]
+
+    # Mapping
+    if kind in ("SEARCH_COVER", "SEARCH_LOGO", "SEARCH_PODCAST"):
         title = (action.get("title") or "").strip()
-        if not title:
-            return False
-    elif name == "Podcast" and kind in ("SEARCH_PODCAST", "SEARCH_LOGO"):
-        title = (action.get("title") or "").strip()
-        if not title and not last_user_text.strip():
-            return False
-    elif name == "Person" and kind == "SEARCH_PORTRAIT":
-        person = (action.get("name") or "").strip()
-        if not person:
-            return False
-    elif name == "Tool" and kind == "SEARCH_LOGO":
-        title = (action.get("title") or "").strip()
-        if not title and not last_user_text.strip():
-            return False
-
-    # Nicht doppelt, falls bereits Media vorhanden
-    if topic.get("media", {}).get("done"):
-        return False
-
-    return True
-
-# ─────────────────────────────────────────────
-# Simple Extractors & Auto-Trigger
-# ─────────────────────────────────────────────
-def extract_book_title_author(text: str) -> Tuple[str, str]:
-    """Sehr einfache Heuristik: 'Title by Author' oder nur Title."""
-    t = text.strip().strip('"“”')
-    # Split on ' by ' (case-insensitive)
-    m = re.split(r"\s+by\s+", t, flags=re.IGNORECASE)
-    if len(m) >= 2:
-        return m[0].strip(' "“”'), m[1].strip(' "“”')
-    return t, ""
-
-def maybe_trigger_auto_actions(last_user_text: str):
-    """Falls Director keine [[ACTIONS]] sendet, aber wir genug Info haben → selber Background starten."""
-    topic = current_topic()
-    name = topic["name"]
-    if topic.get("research_started"):
-        return  # schon einmal gestartet
-
-    # Buch
-    if name == "Book":
-        # wir schauen alle bisherigen Antworten zum Thema durch (erste Antwort reicht oft)
-        content = " ".join(topic["answers"]).strip()
-        if not content:
+        author = (action.get("author") or "").strip()
+        if not title and not author:
+            log_debug(f"Reject action (missing title/author): {kind}")
             return
-        title, author = extract_book_title_author(content)
-        if not title:
+        if kind == "SEARCH_COVER":
+            srch_kind = "book"
+            key_id = norm_key(title or author)
+        elif kind == "SEARCH_LOGO":
+            srch_kind = "brand"
+            key_id = norm_key(title)
+        else:  # SEARCH_PODCAST
+            srch_kind = "podcast"
+            key_id = norm_key(title)
+        key = f"{kind}:{key_id}"
+
+        if key in st.session_state.inflight_keys:
+            log_debug(f"Dedupe inflight: {key}")
             return
-        action = {"kind": "SEARCH_COVER", "title": title}
-        if author:
-            action["author"] = author
-        # Starten & markieren
-        start_background_action(action, topic_hint="Book")
-        topic["research_started"] = True
-        log_debug(f"auto-trigger Book: {title} | {author}")
+        st.session_state.inflight_keys.add(key)
+        log_debug(f"Start background: {key} for topic={tk_name}")
+
+        def worker():
+            try:
+                # 1) Websuche (LLM-simuliert)
+                candidates = websearch_agent(srch_kind, title or author, author)
+
+                # 2) Vision/Plausibilitätscheck
+                validator = vision_validator_agent(
+                    srch_kind,
+                    expected_title=title or author,
+                    expected_author_or_name=(author or title),
+                    candidates=candidates,
+                )
+                best = validator.get("best_index", -1)
+                chosen = candidates[best] if 0 <= best < len(candidates) else {}
+
+                # Ergebnis ablegen
+                RESULTS_QUEUE.put({
+                    "key": key,
+                    "topic_kind": tk_name,
+                    "title": title,
+                    "name": action.get("name", ""),
+                    "image": chosen,
+                    "candidates": candidates,
+                    "validator": validator,
+                })
+            finally:
+                # Key bleibt bis Harvest; wir räumen beim Merge auf
+                pass
+
+        threading.Thread(target=worker, daemon=True).start()
         return
 
-    # Podcast
-    if name == "Podcast":
-        if topic["answers"]:
-            title = topic["answers"][0].strip()
-            if title:
-                action = {"kind": "SEARCH_PODCAST", "title": title}
-                start_background_action(action, topic_hint="Podcast")
-                topic["research_started"] = True
-                log_debug(f"auto-trigger Podcast: {title}")
-        return
+    if kind == "SEARCH_PORTRAIT":
+        name = (action.get("name") or "").strip()
+        if not name:
+            log_debug("Reject action (missing name) for SEARCH_PORTRAIT")
+            return
+        key = f"{kind}:{norm_key(name)}"
+        if key in st.session_state.inflight_keys:
+            log_debug(f"Dedupe inflight: {key}")
+            return
+        st.session_state.inflight_keys.add(key)
+        log_debug(f"Start background: {key} for topic={tk_name}")
 
-    # Person
-    if name == "Person":
-        if topic["answers"]:
-            person = topic["answers"][0].strip()
-            if person:
-                action = {"kind": "SEARCH_PORTRAIT", "name": person}
-                start_background_action(action, topic_hint="Person")
-                topic["research_started"] = True
-                log_debug(f"auto-trigger Person: {person}")
-        return
+        def worker():
+            try:
+                candidates = websearch_agent("person", name, "")
+                validator = vision_validator_agent(
+                    "person",
+                    expected_title=name,
+                    expected_author_or_name=name,
+                    candidates=candidates,
+                )
+                best = validator.get("best_index", -1)
+                chosen = candidates[best] if 0 <= best < len(candidates) else {}
+                RESULTS_QUEUE.put({
+                    "key": key,
+                    "topic_kind": tk_name,
+                    "name": name,
+                    "image": chosen,
+                    "candidates": candidates,
+                    "validator": validator,
+                })
+            finally:
+                pass
 
-    # Tool
-    if name == "Tool":
-        if topic["answers"]:
-            title = topic["answers"][0].strip()
-            if title:
-                action = {"kind": "SEARCH_LOGO", "title": title}
-                start_background_action(action, topic_hint="Tool")
-                topic["research_started"] = True
-                log_debug(f"auto-trigger Tool: {title}")
+        threading.Thread(target=worker, daemon=True).start()
         return
 
 # ─────────────────────────────────────────────
-# Background agents (Websearch + Validation) – Natural Language
+# Websuche & Validator (LLM-basiert, Natural Language)
 # ─────────────────────────────────────────────
 def websearch_agent(kind: str, title_or_name: str, author: str = "") -> List[Dict[str, str]]:
     """
-    LLM-simulierte Bildsuche. Format:
-    CANDIDATE: image_url|page_url|source
+    LLM-simulierte Bildsuche (3 Kandidaten).
+    Format (jede Zeile):
+      CANDIDATE: image_url|page_url|source
     """
     sys = (
         "You are a web image search assistant. Return 1-3 plausible candidates.\n"
@@ -380,7 +400,7 @@ def websearch_agent(kind: str, title_or_name: str, author: str = "") -> List[Dic
     user = f"kind={kind}; query_title_or_name={title_or_name}; author={author}"
     try:
         r = client.chat.completions.create(
-            model=SEARCH_MODEL,
+            model=CHAT_MODEL,
             messages=[
                 {"role": "system", "content": sys},
                 {"role": "user", "content": user},
@@ -407,11 +427,12 @@ def websearch_agent(kind: str, title_or_name: str, author: str = "") -> List[Dic
 def vision_validator_agent(kind: str, expected_title: str, expected_author_or_name: str,
                            candidates: List[Dict[str, str]]) -> Dict[str, Any]:
     """
-    Plausibilitätswahl. Antwort in einer Zeile:
-    BEST: <0..2 or -1> | CONF: <0.0..1.0> | REASON: ...
+    Sehr einfacher Plausibilitäts-Validator (ohne Bilddownload):
+    Antwortzeile:
+      BEST: <0..2 or -1> | CONF: <0.0..1.0> | REASON: ...
     """
     header = (
-        "You are a vision/plausibility validator. Pick the best candidate index for the expected item.\n"
+        "You are a plausibility validator. Pick the best candidate index for the expected item.\n"
         "Answer in one line: BEST: <0..2 or -1> | CONF: <0.0..1.0> | REASON: <short>.\n"
         "If uncertain, pick -1 with low confidence."
     )
@@ -444,233 +465,12 @@ def vision_validator_agent(kind: str, expected_title: str, expected_author_or_na
         reason = m.group(1).strip()
     return {"best_index": best, "confidence": conf, "reason": reason, "raw": line}
 
-def start_background_action(action: Dict[str, str], topic_hint: str = ""):
-    """Startet nebenläufige Suche/Validierung oder setzt Finalize-Flag. Dedup über inflight_keys.
-       topic_hint erlaubt Zuordnung, falls current_topic sich inzwischen geändert hat.
-    """
-    kind = action["kind"].upper()
-
-    if kind == "FINALIZE_READY":
-        st.session_state.profile["finalizing"] = True
-        log_debug("Action: FINALIZE_READY → set finalizing=True")
-        return
-
-    # Zieltopic bestimmen
-    if topic_hint:
-        tk_name = topic_hint
-    else:
-        tk_name = current_topic()["name"]
-
-    # Map Action → key + worker
-    if kind in ("SEARCH_COVER", "SEARCH_LOGO", "SEARCH_PODCAST"):
-        title = (action.get("title") or "").strip()
-        author = (action.get("author") or "").strip()
-        if kind == "SEARCH_COVER":
-            srch_kind = "book"
-        elif kind == "SEARCH_LOGO":
-            srch_kind = "brand"
-        else:  # SEARCH_PODCAST
-            srch_kind = "podcast"
-
-        key = f"{kind}:{(title or author).lower()}"
-        if not (title or author):
-            log_debug(f"Action rejected (missing title/author): {kind}")
-            return
-        if key in st.session_state.inflight_keys:
-            log_debug(f"Action dedup (already inflight): {key}")
-            return
-        st.session_state.inflight_keys.add(key)
-        log_debug(f"Action start: {key} for topic={tk_name}")
-
-        def worker():
-            try:
-                cands = websearch_agent(srch_kind, title or author, author)
-                val = vision_validator_agent(srch_kind,
-                                             expected_title=title or author,
-                                             expected_author_or_name=(author or title),
-                                             candidates=cands)
-                best = val.get("best_index", -1)
-                chosen = cands[best] if 0 <= best < len(cands) else {}
-                RESULTS_QUEUE.put({
-                    "key": key,
-                    "topic_kind": tk_name,
-                    "title": title,
-                    "image": chosen,
-                    "candidates": cands,
-                    "validator": val
-                })
-            finally:
-                pass
-
-        threading.Thread(target=worker, daemon=True).start()
-        return
-
-    if kind == "SEARCH_PORTRAIT":
-        name = (action.get("name") or "").strip()
-        key = f"{kind}:{name.lower()}"
-        if not name:
-            log_debug("Action rejected (missing name) for SEARCH_PORTRAIT")
-            return
-        if key in st.session_state.inflight_keys:
-            log_debug(f"Action dedup (already inflight): {key}")
-            return
-        st.session_state.inflight_keys.add(key)
-        log_debug(f"Action start: {key} for topic={tk_name}")
-
-        def worker():
-            try:
-                cands = websearch_agent("person", name)
-                val = vision_validator_agent("person",
-                                             expected_title=name,
-                                             expected_author_or_name=name,
-                                             candidates=cands)
-                best = val.get("best_index", -1)
-                chosen = cands[best] if 0 <= best < len(cands) else {}
-                RESULTS_QUEUE.put({
-                    "key": key,
-                    "topic_kind": tk_name,
-                    "name": name,
-                    "image": chosen,
-                    "candidates": cands,
-                    "validator": val
-                })
-            finally:
-                pass
-
-        threading.Thread(target=worker, daemon=True).start()
-        return
-
 # ─────────────────────────────────────────────
-# Handle user turn
+# Finalizer (nach Abschluss aller Topics + Recherchen)
 # ─────────────────────────────────────────────
-user_text = st.chat_input("Your answer…")
-if user_text:
-    # 1) Save user message
-    st.session_state.history.append({"role": "user", "content": user_text})
-
-    # 2) Update topic (store answer & budget)
-    topic = current_topic()
-    topic["answers"].append(user_text)
-    if topic["followups"] > 0:
-        topic["followups"] -= 1
-    # ggf. Topic abschließen & weiter
-    advance_topic_if_needed()
-
-    # 2.5) Auto-Trigger: Wenn ausreichend Info vorhanden, sofort Background starten
-    try:
-        maybe_trigger_auto_actions(user_text)
-    except Exception as e:
-        log_debug(f"auto-trigger error: {e}")
-
-    # 3) Ask Director (visible + actions) – nur wenn nicht bereits finalisieren und Limits nicht erreicht
-    if not st.session_state.profile["finalizing"] and not reached_global_limits():
-        visible, acts = director_ask_next()
-
-        # Sichtbare Frage in den Chat
-        st.session_state.history.append({"role": "assistant", "content": visible})
-        # Bot-Frage zählen
-        st.session_state.profile["bot_questions"] += 1
-
-        # 4) Actions nur starten, wenn Guards OK
-        for act in acts:
-            if allow_action(act, user_text):
-                start_background_action(act)
-
-        # Falls jetzt globale Grenzen erreicht → finalisieren
-        if reached_global_limits():
-            finalize_if_possible()
-            st.session_state.history.append({
-                "role": "assistant",
-                "content": "Thanks, I’ve got a solid picture now. I’ll assemble your expert card in the background."
-            })
-    else:
-        # Bereits im Finalisieren → keine neue Frage mehr; ggf. einmalig Hinweis
-        if not any(m["content"].endswith("in the background.") for m in st.session_state.history if m["role"] == "assistant"):
-            st.session_state.history.append({
-                "role": "assistant",
-                "content": "Thanks, I’ve got a solid picture now. I’ll assemble your expert card in the background."
-            })
-
-    st.rerun()
-
-# ─────────────────────────────────────────────
-# Harvest background results & integrate into session
-# ─────────────────────────────────────────────
-harvested = []
-while True:
-    try:
-        harvested.append(RESULTS_QUEUE.get_nowait())
-    except queue.Empty:
-        break
-
-for res in harvested:
-    key = res.get("key", "")
-    if key:
-        st.session_state.inflight_keys.discard(key)
-    kind = res.get("topic_kind")
-    # Ordne Ergebnis dem passenden Topic-Slot zu
-    idx = find_topic_index_by_name(kind)
-    if idx == -1:
-        continue
-    t = st.session_state.profile["topics"][idx]
-    t["media"]["chosen"] = res.get("image", {})
-    t["media"]["candidates"] = res.get("candidates", [])
-    t["media"]["validator"] = res.get("validator", {})
-    t["media"]["done"] = True
-
-    # Ergebnisliste (Anzeige) deduplizieren
-    img_url = (res.get("image") or {}).get("image_url", "")
-    dup = any((r.get("image", {}).get("image_url") == img_url) and (r.get("topic_kind") == kind)
-              for r in st.session_state.results)
-    if not dup:
-        st.session_state.results.append(res)
-    log_debug(f"harvested: {kind} | image={img_url or '-'}")
-
-# ─────────────────────────────────────────────
-# Progress bar (Interview + Research)
-# ─────────────────────────────────────────────
-interview_done = sum(1 for t in st.session_state.profile["topics"] if t["status"] == "done")
-research_done  = sum(1 for t in st.session_state.profile["topics"] if t.get("media", {}).get("done"))
-progress = min(interview_done + research_done, st.session_state.progress_total)
-st.progress(progress / st.session_state.progress_total, text=f"Progress: {progress}/{st.session_state.progress_total}")
-
-if st.session_state.inflight_keys:
-    st.info("🔎 Background research running… you can keep chatting.")
-
-# ─────────────────────────────────────────────
-# Render chat history (visible only)
-# ─────────────────────────────────────────────
-for msg in st.session_state.history:
-    with st.chat_message(msg["role"]):
-        st.markdown(msg["content"])
-
-# Debugpaneel (optional einklappbar)
-with st.expander("Debug"):
-    if st.session_state.inflight_keys:
-        st.write("In-flight:", list(st.session_state.inflight_keys))
-    else:
-        st.write("In-flight: —")
-    if st.session_state.results:
-        st.write(f"Results count: {len(st.session_state.results)}")
-    else:
-        st.write("Results: —")
-    if st.session_state.debug:
-        for d in st.session_state.debug[-30:]:
-            st.code(d, language="text")
-
-# ─────────────────────────────────────────────
-# Finalizer trigger & rendering
-# ─────────────────────────────────────────────
-def all_research_done_for_answered_topics() -> bool:
-    for t in st.session_state.profile["topics"]:
-        if t["answers"]:
-            if not t.get("media", {}).get("done"):
-                return False
-    return True
-
 def finalizer_agent(profile: Dict[str, Any]) -> str:
     """
-    Freundlicher, professioneller Abschluss + kompakte Liste je Topic.
+    Warmer, professioneller Abschluss (3–5 Sätze) + kompakte Liste je Topic mit One-Liner.
     Reine Sprache, kein JSON.
     """
     sys = (
@@ -678,7 +478,7 @@ def finalizer_agent(profile: Dict[str, Any]) -> str:
         "that presents the user positively without flattery. Then provide a compact list per item "
         "(Book/Podcast/Person/Tool) with a one-liner why it matters. Keep it crisp."
     )
-    # Profil als einfacher Text
+    # Fakten als einfacher Text
     lines = []
     for t in profile["topics"]:
         if not t["answers"]:
@@ -687,8 +487,11 @@ def finalizer_agent(profile: Dict[str, Any]) -> str:
         facts = "; ".join([a.strip() for a in t["answers"] if a.strip()])
         chosen = t.get("media", {}).get("chosen", {})
         media_hint = chosen.get("image_url", "")
-        lines.append(f"{head} {facts} (image: {media_hint})")
-    user = "Interview facts:\n" + "\n".join(lines)
+        if media_hint:
+            lines.append(f"{head} {facts} (image: {media_hint})")
+        else:
+            lines.append(f"{head} {facts}")
+    user = "Interview facts:\n" + "\n".join(lines) if lines else "Interview facts: (empty)"
 
     try:
         r = client.chat.completions.create(
@@ -701,14 +504,138 @@ def finalizer_agent(profile: Dict[str, Any]) -> str:
     except Exception as e:
         return f"(Finalizer error: {e})"
 
-# Finalisieren nur, wenn Director „bereit“ signalisiert hat ODER Limits erreicht, und alle Recherchen fertig sind
+def all_research_done_for_answered_topics() -> bool:
+    for t in st.session_state.profile["topics"]:
+        if t["answers"]:
+            if not t.get("media", {}).get("done"):
+                return False
+    return True
+
+# ─────────────────────────────────────────────
+# Chat-Eingabe
+# ─────────────────────────────────────────────
+user_text = st.chat_input("Your answer…")
+if user_text:
+    # 1) User-Message ins Log
+    st.session_state.history.append({"role": "user", "content": user_text})
+
+    # 2) Topic aktualisieren
+    topic = current_topic()
+    topic["answers"].append(user_text)
+    if topic["followups"] > 0:
+        topic["followups"] -= 1
+    advance_topic_if_needed()
+
+    # 3) Director antwortet (Frage + versteckte ACTIONS)
+    if not st.session_state.profile["finalizing"] and not reached_global_limits():
+        visible, actions = director_turn()
+
+        # sichtbare Frage
+        st.session_state.history.append({"role": "assistant", "content": visible})
+        st.session_state.profile["bot_questions"] += 1
+
+        # ACTIONS starten (nur gültige)
+        for act in actions:
+            if allow_action(act):
+                start_background_action(act)
+
+        # ggf. sofort Finalisierung anschalten (falls Director FINALIZE_READY geschickt hat)
+        if reached_global_limits():
+            finalize_if_possible()
+            st.session_state.history.append({
+                "role": "assistant",
+                "content": "Thanks, I’ve got a solid picture now. I’ll assemble your expert card in the background."
+            })
+    else:
+        # Bereits im Finalisieren → keine neuen Fragen mehr
+        if not any(m["content"].endswith("in the background.") for m in st.session_state.history if m["role"] == "assistant"):
+            st.session_state.history.append({
+                "role": "assistant",
+                "content": "Thanks, I’ve got a solid picture now. I’ll assemble your expert card in the background."
+            })
+
+    st.rerun()
+
+# ─────────────────────────────────────────────
+# Background-Ergebnisse ernten & Session mergen
+# ─────────────────────────────────────────────
+harvested = []
+while True:
+    try:
+        harvested.append(RESULTS_QUEUE.get_nowait())
+    except queue.Empty:
+        break
+
+def find_topic_index_by_name(name: str) -> int:
+    for i, t in enumerate(st.session_state.profile["topics"]):
+        if t["name"].lower() == (name or "").lower():
+            return i
+    return -1
+
+for res in harvested:
+    key = res.get("key", "")
+    if key:
+        st.session_state.inflight_keys.discard(key)
+
+    kind = res.get("topic_kind", "")
+    idx = find_topic_index_by_name(kind)
+    if idx == -1:
+        continue
+    t = st.session_state.profile["topics"][idx]
+    # Media mergen
+    t["media"]["chosen"] = res.get("image", {})
+    t["media"]["candidates"] = res.get("candidates", [])
+    t["media"]["validator"] = res.get("validator", {})
+    t["media"]["done"] = True
+
+    # Ergebnisse deduplizieren & anzeigen
+    img_url = (res.get("image") or {}).get("image_url", "")
+    dup = any((r.get("image", {}).get("image_url") == img_url) and (r.get("topic_kind") == kind)
+              for r in st.session_state.results)
+    if not dup:
+        st.session_state.results.append(res)
+    log_debug(f"harvested: {kind} | image={img_url or '-'}")
+
+# ─────────────────────────────────────────────
+# Fortschritt / Status
+# ─────────────────────────────────────────────
+interview_done = sum(1 for t in st.session_state.profile["topics"] if t["status"] == "done")
+research_done  = sum(1 for t in st.session_state.profile["topics"] if t.get("media", {}).get("done"))
+progress_total = len(TOPICS_PLAN) * 2
+progress_val = min(interview_done + research_done, progress_total)
+st.progress(progress_val / progress_total, text=f"Progress: {progress_val}/{progress_total}")
+
+if st.session_state.inflight_keys:
+    st.info("🔎 Background research running… you can keep chatting.")
+
+# ─────────────────────────────────────────────
+# Chatverlauf (nur sichtbare Messages)
+# ─────────────────────────────────────────────
+for msg in st.session_state.history:
+    with st.chat_message(msg["role"]):
+        st.markdown(msg["content"])
+
+# Debug
+with st.expander("Debug"):
+    st.write("In-flight:", list(st.session_state.inflight_keys) or "—")
+    if st.session_state.results:
+        st.write(f"Results count: {len(st.session_state.results)}")
+    else:
+        st.write("Results: —")
+    if st.session_state.debug:
+        for d in st.session_state.debug[-30:]:
+            st.code(d, language="text")
+
+# ─────────────────────────────────────────────
+# Finalisierung (wenn: finalizing an ODER Limits erreicht) UND alle Recherchen fertig
+# ─────────────────────────────────────────────
 if (st.session_state.profile["finalizing"] or reached_global_limits()) \
         and not st.session_state.inflight_keys \
         and all_research_done_for_answered_topics():
     if not st.session_state.final_output:
         st.session_state.final_output = finalizer_agent(st.session_state.profile)
 
-# Ergebnisse (Bilder + Kurzinfos)
+# Ergebnisse in kompakter Form
 if st.session_state.results:
     st.subheader("Results")
     for res in st.session_state.results[::-1]:
@@ -736,8 +663,7 @@ if st.session_state.final_output:
 c1, c2 = st.columns(2)
 with c1:
     if st.button("🔄 Restart"):
-        for k in ["history", "profile", "inflight_keys", "results", "final_output",
-                  "progress_total", "progress_done", "debug"]:
+        for k in ["history", "profile", "inflight_keys", "results", "final_output", "debug"]:
             if k in st.session_state:
                 del st.session_state[k]
         # Queue leeren
