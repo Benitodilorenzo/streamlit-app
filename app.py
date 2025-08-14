@@ -1,11 +1,15 @@
-# app.py — Expert Card Creator (Director mit festen Leitplanken, invisible ACTIONS, Guards, Parallel-Research, sauberer Stopp)
-# Modelle: gpt-5 (per ENV übersteuerbar). Setze OPENAI_API_KEY in Streamlit Secrets.
+# app.py — Expert Card Creator
+# - Director mit festen Leitplanken & Limits
+# - Unsichtbare [[ACTIONS]]-Blöcke (falls vorhanden)
+# - Auto-Trigger für Hintergrundsuche (läuft auch ohne [[ACTIONS]])
+# - Parallele Recherche + Vision-Validierung (LLM-basiert)
+# - Harte Stopps & Finalizer
 
 import os
 import re
 import queue
 import threading
-from typing import List, Dict, Any
+from typing import List, Dict, Any, Tuple
 
 import streamlit as st
 from openai import OpenAI
@@ -23,6 +27,7 @@ if not OPENAI_API_KEY:
 
 client = OpenAI(api_key=OPENAI_API_KEY)
 
+# Modelle
 CHAT_MODEL = os.getenv("DTBR_CHAT_MODEL", "gpt-5")          # Director / Validator / Finalizer
 SEARCH_MODEL = os.getenv("DTBR_SEARCH_MODEL", CHAT_MODEL)   # Websearch-Simulation (LLM)
 
@@ -35,7 +40,7 @@ TOPICS_PLAN = [
 ]
 
 # Harte Grenzen fürs ganze Gespräch
-MAX_TOTAL_QUESTIONS = 10         # maximale Anzahl aller Bot-Fragen
+MAX_TOTAL_QUESTIONS = 10
 MAX_TOPICS = len(TOPICS_PLAN)
 
 # Background queues/state (thread-safe)
@@ -72,10 +77,10 @@ def ensure_session():
             ],
             "current_topic_index": 0,
             "finalizing": False,
-            "bot_questions": 0,  # Zähler aller gestellten Bot-Fragen
-        }
+            "bot_questions": 0,
+        ]
     if "inflight_keys" not in st.session_state:
-        st.session_state.inflight_keys = set()       # dedup laufender Jobs
+        st.session_state.inflight_keys = set()
     if "results" not in st.session_state:
         st.session_state.results: List[Dict[str, Any]] = []
     if "final_output" not in st.session_state:
@@ -84,15 +89,26 @@ def ensure_session():
         st.session_state.progress_total = len(TOPICS_PLAN) * 2  # Interview + Research je Topic
     if "progress_done" not in st.session_state:
         st.session_state.progress_done = 0
+    if "debug" not in st.session_state:
+        st.session_state.debug: List[str] = []
 
 ensure_session()
 
 # ─────────────────────────────────────────────
 # Topic Helpers
 # ─────────────────────────────────────────────
+def log_debug(msg: str):
+    st.session_state.debug.append(msg)
+
 def current_topic() -> Dict[str, Any]:
     idx = st.session_state.profile["current_topic_index"]
     return st.session_state.profile["topics"][idx]
+
+def find_topic_index_by_name(name: str) -> int:
+    for i, t in enumerate(st.session_state.profile["topics"]):
+        if t["name"].lower() == name.lower():
+            return i
+    return -1
 
 def advance_topic_if_needed():
     """Wenn Followups aufgebraucht → Topic done → nächstes Thema wählen (falls vorhanden)."""
@@ -116,6 +132,7 @@ def finalize_if_possible():
     if not st.session_state.profile["finalizing"]:
         if all_topics_completed():
             st.session_state.profile["finalizing"] = True
+            log_debug("finalize_if_possible(): set finalizing=True (all topics completed)")
 
 # ─────────────────────────────────────────────
 # Director Prompt / ACTIONS Parsing
@@ -169,7 +186,7 @@ ACTION_LINE_RE = re.compile(
     re.IGNORECASE
 )
 
-def split_visible_and_actions(text: str) -> (str, List[Dict[str, str]]):
+def split_visible_and_actions(text: str) -> Tuple[str, List[Dict[str, str]]]:
     """Extrahiert [[ACTIONS]]-Block, strippt ihn aus dem sichtbaren Text, parst Action-Zeilen.
        Fallback: ACTION:-Zeilen auch ohne Block entfernen.
     """
@@ -208,7 +225,7 @@ def split_visible_and_actions(text: str) -> (str, List[Dict[str, str]]):
             visible_lines.append(ln)
     return "\n".join(visible_lines).strip(), actions
 
-def director_ask_next() -> (str, List[Dict[str, str]]):
+def director_ask_next() -> Tuple[str, List[Dict[str, str]]]:
     """Frage vom Director generieren; sichtbarer Text + geparste Actions zurückgeben."""
     topic = current_topic()
     bot_q = st.session_state.profile.get("bot_questions", 0)
@@ -277,6 +294,76 @@ def allow_action(action: Dict[str, str], last_user_text: str) -> bool:
         return False
 
     return True
+
+# ─────────────────────────────────────────────
+# Simple Extractors & Auto-Trigger
+# ─────────────────────────────────────────────
+def extract_book_title_author(text: str) -> Tuple[str, str]:
+    """Sehr einfache Heuristik: 'Title by Author' oder nur Title."""
+    t = text.strip().strip('"“”')
+    # Split on ' by ' (case-insensitive)
+    m = re.split(r"\s+by\s+", t, flags=re.IGNORECASE)
+    if len(m) >= 2:
+        return m[0].strip(' "“”'), m[1].strip(' "“”')
+    return t, ""
+
+def maybe_trigger_auto_actions(last_user_text: str):
+    """Falls Director keine [[ACTIONS]] sendet, aber wir genug Info haben → selber Background starten."""
+    topic = current_topic()
+    name = topic["name"]
+    if topic.get("research_started"):
+        return  # schon einmal gestartet
+
+    # Buch
+    if name == "Book":
+        # wir schauen alle bisherigen Antworten zum Thema durch (erste Antwort reicht oft)
+        content = " ".join(topic["answers"]).strip()
+        if not content:
+            return
+        title, author = extract_book_title_author(content)
+        if not title:
+            return
+        action = {"kind": "SEARCH_COVER", "title": title}
+        if author:
+            action["author"] = author
+        # Starten & markieren
+        start_background_action(action, topic_hint="Book")
+        topic["research_started"] = True
+        log_debug(f"auto-trigger Book: {title} | {author}")
+        return
+
+    # Podcast
+    if name == "Podcast":
+        if topic["answers"]:
+            title = topic["answers"][0].strip()
+            if title:
+                action = {"kind": "SEARCH_PODCAST", "title": title}
+                start_background_action(action, topic_hint="Podcast")
+                topic["research_started"] = True
+                log_debug(f"auto-trigger Podcast: {title}")
+        return
+
+    # Person
+    if name == "Person":
+        if topic["answers"]:
+            person = topic["answers"][0].strip()
+            if person:
+                action = {"kind": "SEARCH_PORTRAIT", "name": person}
+                start_background_action(action, topic_hint="Person")
+                topic["research_started"] = True
+                log_debug(f"auto-trigger Person: {person}")
+        return
+
+    # Tool
+    if name == "Tool":
+        if topic["answers"]:
+            title = topic["answers"][0].strip()
+            if title:
+                action = {"kind": "SEARCH_LOGO", "title": title}
+                start_background_action(action, topic_hint="Tool")
+                topic["research_started"] = True
+                log_debug(f"auto-trigger Tool: {title}")
+        return
 
 # ─────────────────────────────────────────────
 # Background agents (Websearch + Validation) – Natural Language
@@ -357,32 +444,43 @@ def vision_validator_agent(kind: str, expected_title: str, expected_author_or_na
         reason = m.group(1).strip()
     return {"best_index": best, "confidence": conf, "reason": reason, "raw": line}
 
-def start_background_action(action: Dict[str, str]):
-    """Startet nebenläufige Suche/Validierung oder setzt Finalize-Flag. Dedup über inflight_keys."""
+def start_background_action(action: Dict[str, str], topic_hint: str = ""):
+    """Startet nebenläufige Suche/Validierung oder setzt Finalize-Flag. Dedup über inflight_keys.
+       topic_hint erlaubt Zuordnung, falls current_topic sich inzwischen geändert hat.
+    """
     kind = action["kind"].upper()
 
     if kind == "FINALIZE_READY":
         st.session_state.profile["finalizing"] = True
+        log_debug("Action: FINALIZE_READY → set finalizing=True")
         return
+
+    # Zieltopic bestimmen
+    if topic_hint:
+        tk_name = topic_hint
+    else:
+        tk_name = current_topic()["name"]
 
     # Map Action → key + worker
     if kind in ("SEARCH_COVER", "SEARCH_LOGO", "SEARCH_PODCAST"):
         title = (action.get("title") or "").strip()
         author = (action.get("author") or "").strip()
         if kind == "SEARCH_COVER":
-            topic_kind = "Book"; srch_kind = "book"
+            srch_kind = "book"
         elif kind == "SEARCH_LOGO":
-            topic_kind = current_topic()["name"]  # Logo kann bei Podcast/Tool gebraucht werden
             srch_kind = "brand"
         else:  # SEARCH_PODCAST
-            topic_kind = "Podcast"; srch_kind = "podcast"
+            srch_kind = "podcast"
 
         key = f"{kind}:{(title or author).lower()}"
         if not (title or author):
+            log_debug(f"Action rejected (missing title/author): {kind}")
             return
         if key in st.session_state.inflight_keys:
+            log_debug(f"Action dedup (already inflight): {key}")
             return
         st.session_state.inflight_keys.add(key)
+        log_debug(f"Action start: {key} for topic={tk_name}")
 
         def worker():
             try:
@@ -395,7 +493,7 @@ def start_background_action(action: Dict[str, str]):
                 chosen = cands[best] if 0 <= best < len(cands) else {}
                 RESULTS_QUEUE.put({
                     "key": key,
-                    "topic_kind": topic_kind,
+                    "topic_kind": tk_name,
                     "title": title,
                     "image": chosen,
                     "candidates": cands,
@@ -410,9 +508,14 @@ def start_background_action(action: Dict[str, str]):
     if kind == "SEARCH_PORTRAIT":
         name = (action.get("name") or "").strip()
         key = f"{kind}:{name.lower()}"
-        if not name or key in st.session_state.inflight_keys:
+        if not name:
+            log_debug("Action rejected (missing name) for SEARCH_PORTRAIT")
+            return
+        if key in st.session_state.inflight_keys:
+            log_debug(f"Action dedup (already inflight): {key}")
             return
         st.session_state.inflight_keys.add(key)
+        log_debug(f"Action start: {key} for topic={tk_name}")
 
         def worker():
             try:
@@ -425,7 +528,7 @@ def start_background_action(action: Dict[str, str]):
                 chosen = cands[best] if 0 <= best < len(cands) else {}
                 RESULTS_QUEUE.put({
                     "key": key,
-                    "topic_kind": "Person",
+                    "topic_kind": tk_name,
                     "name": name,
                     "image": chosen,
                     "candidates": cands,
@@ -452,6 +555,12 @@ if user_text:
         topic["followups"] -= 1
     # ggf. Topic abschließen & weiter
     advance_topic_if_needed()
+
+    # 2.5) Auto-Trigger: Wenn ausreichend Info vorhanden, sofort Background starten
+    try:
+        maybe_trigger_auto_actions(user_text)
+    except Exception as e:
+        log_debug(f"auto-trigger error: {e}")
 
     # 3) Ask Director (visible + actions) – nur wenn nicht bereits finalisieren und Limits nicht erreicht
     if not st.session_state.profile["finalizing"] and not reached_global_limits():
@@ -500,11 +609,8 @@ for res in harvested:
         st.session_state.inflight_keys.discard(key)
     kind = res.get("topic_kind")
     # Ordne Ergebnis dem passenden Topic-Slot zu
-    idx = None
-    for i, t in enumerate(st.session_state.profile["topics"]):
-        if t["name"] == kind:
-            idx = i; break
-    if idx is None:
+    idx = find_topic_index_by_name(kind)
+    if idx == -1:
         continue
     t = st.session_state.profile["topics"][idx]
     t["media"]["chosen"] = res.get("image", {})
@@ -518,6 +624,7 @@ for res in harvested:
               for r in st.session_state.results)
     if not dup:
         st.session_state.results.append(res)
+    log_debug(f"harvested: {kind} | image={img_url or '-'}")
 
 # ─────────────────────────────────────────────
 # Progress bar (Interview + Research)
@@ -536,6 +643,20 @@ if st.session_state.inflight_keys:
 for msg in st.session_state.history:
     with st.chat_message(msg["role"]):
         st.markdown(msg["content"])
+
+# Debugpaneel (optional einklappbar)
+with st.expander("Debug"):
+    if st.session_state.inflight_keys:
+        st.write("In-flight:", list(st.session_state.inflight_keys))
+    else:
+        st.write("In-flight: —")
+    if st.session_state.results:
+        st.write(f"Results count: {len(st.session_state.results)}")
+    else:
+        st.write("Results: —")
+    if st.session_state.debug:
+        for d in st.session_state.debug[-30:]:
+            st.code(d, language="text")
 
 # ─────────────────────────────────────────────
 # Finalizer trigger & rendering
@@ -616,7 +737,7 @@ c1, c2 = st.columns(2)
 with c1:
     if st.button("🔄 Restart"):
         for k in ["history", "profile", "inflight_keys", "results", "final_output",
-                  "progress_total", "progress_done"]:
+                  "progress_total", "progress_done", "debug"]:
             if k in st.session_state:
                 del st.session_state[k]
         # Queue leeren
