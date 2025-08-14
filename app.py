@@ -1,5 +1,3 @@
-# app.py — Expert Card Creator (fixed)
-
 import os, json, re, time, random, threading, queue, uuid
 from typing import List, Dict, Any, Optional
 
@@ -13,63 +11,64 @@ from openai._exceptions import BadRequestError
 APP_TITLE = "📝 Expert Card Creator"
 
 TOPICS_SPEC = [
-    {"name": "Book",    "followups": (1, 3), "focus": "books shaping strategy & Data/AI thinking"},
-    {"name": "Podcast", "followups": (1, 3), "focus": "inspiring audio/video sources"},
+    {"name": "Book",    "followups": (1, 2), "focus": "books shaping strategy & Data/AI thinking"},
+    {"name": "Podcast", "followups": (1, 2), "focus": "inspiring audio/video sources"},
     {"name": "Person",  "followups": (1, 2), "focus": "mentors or thought leaders"},
     {"name": "Tool",    "followups": (1, 2), "focus": "tools/methods for Data & AI Business Design"},
     {"name": "Idea",    "followups": (1, 2), "focus": "strategic concepts or AI approaches"},
 ]
 
-GLOBAL_QUESTION_CAP = 12  # prevent endless interviews
+GLOBAL_QUESTION_CAP = 12  # safety guard
 
-# Models (override via Secrets/env)
 OPENAI_API_KEY  = os.getenv("OPENAI_API_KEY", "")
-CHAT_MODEL      = os.getenv("OPENAI_CHAT_MODEL", "gpt-5")  # director/extractor/vision
-RESPONSES_MODEL = os.getenv("OPENAI_RESPONSES_MODEL", "gpt-5")  # for web_search via Responses API
+CHAT_MODEL      = os.getenv("OPENAI_CHAT_MODEL", "gpt-5")      # Director / Extractor / Vision
+RESPONSES_MODEL = os.getenv("OPENAI_RESPONSES_MODEL", "gpt-5") # web_search via Responses
 
-# UI flags
-SHOW_DEBUG = False   # True = show internal logs box
+SHOW_DEBUG = False   # True = Debug-Expander sichtbar
 
 # =======================
-# SYSTEM PROMPTS
+# PROMPTS
 # =======================
 DIRECTOR_SYSTEM_PROMPT = (
-    "You are a warm, curious interviewer crafting an 'Expert Card' about the user.\n"
-    "Domain focus: strategy, Data & AI Business Design, and Data & AI in general, with room for personality.\n\n"
+    "You are a warm, curious interviewer crafting an 'Expert Card'.\n"
+    "Domain: strategy, Data & AI Business Design; keep it focused but personable.\n"
     "Rules:\n"
-    "- Follow host order: Book → Podcast → Person → Tool → Idea.\n"
-    "- For each topic, ask 1–3 short follow-ups (budget set by host). Keep it focused and varied.\n"
-    "- Avoid redundant confirmations and never mention background tools.\n"
-    "- Move on naturally when enough for the topic is gathered.\n"
-    "- Stop when all topics covered or a global cap is reached; then thank the user.\n"
+    "- Topic order: Book → Podcast → Person → Tool → Idea.\n"
+    "- Ask EXACTLY ONE short question per turn (never multiple). Avoid confirmations.\n"
+    "- Vary angles: what/why/example/impact, within 1–2 follow-ups per topic (host controls budget).\n"
+    "- Move on naturally once enough is gathered for the topic.\n"
+    "- Stop when topics finished or global cap reached. Then thank the user succinctly.\n"
 )
 
 EXTRACTOR_SYSTEM_PROMPT = (
-    "Extract a single atomic value from the user's latest answer for the CURRENT TOPIC.\n"
-    "Return EXACTLY ONE line. No extra text.\n"
-    "Formats:\n"
-    "- Book → <title> | <author?>\n"
-    "- Podcast → <podcast/channel title>\n"
-    "- Person → <full name>\n"
-    "- Tool → <tool name>\n"
-    "- Idea → <short concept>\n"
+    "Extract one atomic value from the user's latest answer for the CURRENT TOPIC.\n"
+    "Return EXACTLY one line (no extra text):\n"
+    "Book → <title> | <author?>\n"
+    "Podcast → <podcast/channel title>\n"
+    "Person → <full name>\n"
+    "Tool → <tool name>\n"
+    "Idea → <short concept>\n"
     "If nothing extractable, return: —"
 )
 
 SEARCHER_SYSTEM_PROMPT = (
-    "You are a web image search assistant using a web_search tool. Find up to 3 high-quality candidate images.\n"
+    "You are a researcher using a web search tool.\n"
+    "Find high-quality candidate images that best represent the item.\n"
     "Heuristics:\n"
     "- Book: publisher/Amazon/Open Library/Wikipedia; avoid fan art.\n"
-    "- Podcast: official channel art (YouTube/Spotify/Apple) or site logo.\n"
-    "- Person: clear, respectful portrait (Wikipedia or official site).\n"
+    "- Podcast: official channel art (YouTube/Spotify/Apple) or website.\n"
+    "- Person: clear, respectful portrait (Wikipedia/official site preferred).\n"
     "- Tool: official logo/hero image.\n"
-    "Output format: Each candidate on its own line exactly like:\n"
-    "CANDIDATE: <direct_image_url> | <page_url> | <source>\n"
+    "IMPORTANT:\n"
+    "- Perform at most 3 focused searches. Stop early if you have 2–3 strong candidates.\n"
+    "- Output 1–3 lines. Each line EXACTLY:\n"
+    "IMAGE: <direct_image_url> | SOURCE: <source_page_url>\n"
     "No extra commentary."
 )
 
 VALIDATOR_SYSTEM_PROMPT = (
-    "Choose the single best image among candidates for the target item. Consider clarity, correctness, and professional look.\n"
+    "Pick the single best image among candidates for the target item.\n"
+    "Criteria: clarity, correctness, professional look. No fan art.\n"
     "Respond in exactly TWO lines:\n"
     "BEST: <direct_image_url>\n"
     "REASON: <short reason>"
@@ -78,12 +77,12 @@ VALIDATOR_SYSTEM_PROMPT = (
 FINALIZER_SYSTEM_PROMPT = (
     "Compose a concise, warm, professional mini-profile ('Expert Card') from collected topics.\n"
     "Write 3–5 sentences summarizing the user with a positive, authentic tone (no flattery).\n"
-    "Then provide a compact bullet per item (Book/Podcast/Person/Tool/Idea) with one short reason why it matters.\n"
-    "Use the user's language if it's clearly not English; else English."
+    "Then provide a compact bullet per item (Book/Podcast/Person/Tool/Idea) with one short reason.\n"
+    "Use the user's language if it’s clearly not English; otherwise English."
 )
 
 # =======================
-# OPENAI CLIENT
+# OPENAI
 # =======================
 def get_client() -> OpenAI:
     if not OPENAI_API_KEY:
@@ -91,7 +90,7 @@ def get_client() -> OpenAI:
     return OpenAI(api_key=OPENAI_API_KEY)
 
 # =======================
-# STATE
+# STATE INIT
 # =======================
 def init_state():
     if "history" not in st.session_state:
@@ -103,16 +102,17 @@ def init_state():
         ]
     if "profile" not in st.session_state:
         topics = []
-        for spec in TOPICS_SPEC:
+        for i, spec in enumerate(TOPICS_SPEC):
             lo, hi = spec["followups"]
             budget = random.randint(lo, hi)
             topics.append({
                 "name": spec["name"],
-                "status": "active" if not topics else "queued",  # first is active
-                "budget": budget,
-                "answers": [],
-                "research": {},        # NEVER None
-                "field": None          # extracted atomic value dict
+                "status": "active" if i == 0 else "queued",  # first active
+                "budget": budget,             # follow-ups allowed for this topic
+                "answers": [],                # raw user strings
+                "research": {},               # dict always (never None)
+                "field": None,                # extracted atomic (title/author or name)
+                "job_inflight": False         # background search guard
             })
         st.session_state.profile = {
             "topics": topics,
@@ -152,10 +152,10 @@ def can_ask_more(profile: Dict[str, Any]) -> bool:
     return profile["bot_questions"] < GLOBAL_QUESTION_CAP
 
 # =======================
-# OPENAI CALL HELPERS
+# OPENAI HELPERS
 # =======================
 def chat_stream_with_fallback(client: OpenAI, messages: List[Dict[str, Any]]) -> str:
-    """Try streaming; if 400 unsupported, fall back to one-shot."""
+    # try stream, fall back if org not verified
     out = []
     try:
         with st.chat_message("assistant"):
@@ -174,8 +174,7 @@ def chat_stream_with_fallback(client: OpenAI, messages: List[Dict[str, Any]]) ->
                     out.append(delta)
                     ph.markdown("".join(out))
         return "".join(out).strip()
-    except BadRequestError as e:
-        # fall back to non-stream
+    except BadRequestError:
         r = client.chat.completions.create(model=CHAT_MODEL, messages=messages)
         text = r.choices[0].message.content or ""
         with st.chat_message("assistant"):
@@ -207,11 +206,11 @@ def responses_web_search(client: OpenAI, query_text: str) -> str:
     return txt or ""
 
 def vision_pick_best(client: OpenAI, item_desc: str, candidate_lines: List[str]) -> Optional[str]:
-    # Feed up to 3 images to validator
+    # include up to 3 image URLs
     content: List[Dict[str, Any]] = [{"type": "text", "text": f"{VALIDATOR_SYSTEM_PROMPT}\nTarget: {item_desc}"}]
     added = 0
     for ln in candidate_lines:
-        m = re.search(r"CANDIDATE:\s*([^| \t]+)", ln, re.IGNORECASE)
+        m = re.search(r"(?:IMAGE|CANDIDATE):\s*([^| \t]+)", ln, re.IGNORECASE)
         if not m:
             continue
         content.append({"type": "image_url", "image_url": {"url": m.group(1).strip()}})
@@ -220,10 +219,7 @@ def vision_pick_best(client: OpenAI, item_desc: str, candidate_lines: List[str])
             break
     if added == 0:
         return None
-    r = client.chat.completions.create(
-        model=CHAT_MODEL,
-        messages=[{"role": "user", "content": content}],
-    )
+    r = client.chat.completions.create(model=CHAT_MODEL, messages=[{"role": "user", "content": content}])
     txt = r.choices[0].message.content or ""
     m = re.search(r"BEST:\s*(\S+)", txt)
     return m.group(1).strip() if m else None
@@ -243,9 +239,7 @@ def extractor_pull_fields(client: OpenAI, topic_name: str, user_text: str, recen
         if not title:
             return None
         return {"title": title, "author": author}
-    elif topic_name in ("Podcast", "Tool", "Idea"):
-        return {"name": line}
-    elif topic_name == "Person":
+    elif topic_name in ("Podcast", "Tool", "Idea", "Person"):
         return {"name": line}
     return None
 
@@ -259,56 +253,64 @@ def bg_worker(client: OpenAI, in_q: "queue.Queue[Dict[str, Any]]", out_q: "queue
             in_q.task_done()
             break
         try:
-            kind = job["kind"]  # "book"|"podcast"|"person"|"tool"|"idea"
+            kind = job["kind"]
             title = job.get("title", "")
             author = job.get("author", "")
             name  = job.get("name", "")
 
-            # Build query
             if kind == "book":
                 item_desc = f'Book: "{title}" {author}'.strip()
-                query = f"{SEARCHER_SYSTEM_PROMPT}\nQuery: Book cover: \"{title}\" {author}"
+                q = f"{SEARCHER_SYSTEM_PROMPT}\nQuery: Book cover: \"{title}\" {author}"
             elif kind == "podcast":
                 item_desc = f'Podcast: "{title}"'
-                query = f"{SEARCHER_SYSTEM_PROMPT}\nQuery: Podcast cover art: \"{title}\""
+                q = f"{SEARCHER_SYSTEM_PROMPT}\nQuery: Podcast cover art: \"{title}\""
             elif kind == "person":
-                item_desc = f'Person: "{name}"'
-                query = f"{SEARCHER_SYSTEM_PROMPT}\nQuery: Portrait photo: \"{name}\""
+                item_desc = f'Person: \"{name}\"'
+                q = f"{SEARCHER_SYSTEM_PROMPT}\nQuery: Portrait photo: \"{name}\""
             elif kind == "tool":
-                item_desc = f'Tool: "{title}"'
-                query = f"{SEARCHER_SYSTEM_PROMPT}\nQuery: Official logo or hero image: \"{title}\""
+                item_desc = f'Tool: \"{title}\"'
+                q = f"{SEARCHER_SYSTEM_PROMPT}\nQuery: Official logo or hero image: \"{title}\""
             else:
-                item_desc = f'Idea: "{title}"'
-                query = f"{SEARCHER_SYSTEM_PROMPT}\nQuery: Representative image/diagram: \"{title}\""
+                item_desc = f'Idea: \"{title}\"'
+                q = f"{SEARCHER_SYSTEM_PROMPT}\nQuery: Representative image/diagram: \"{title}\""
 
-            txt = responses_web_search(client, query)
-            # Normalize to our single format
+            txt = responses_web_search(client, q)
+            # Accept IMAGE: ... or CANDIDATE: ... → normalize to IMAGE
             lines = []
             for ln in (txt or "").splitlines():
-                ln = ln.strip()
-                if not ln:
+                s = ln.strip()
+                if not s:
                     continue
-                if not ln.upper().startswith("CANDIDATE:"):
+                if not (s.upper().startswith("IMAGE:") or s.upper().startswith("CANDIDATE:")):
                     continue
-                # ensure we have at least the image url
-                payload = ln.split(":", 1)[1].strip() if ":" in ln else ""
-                # expect "<image> | <page> | <source>" but tolerate missing parts
+                if ":" in s:
+                    payload = s.split(":", 1)[1].strip()
+                else:
+                    payload = s
+                # Try to pick first URL in the payload as image; also capture SOURCE url if present
+                # Expected " <image> | SOURCE: <page>"
+                image_url = ""
+                page_url  = ""
+                # simple split on '|' parts
                 parts = [p.strip() for p in payload.split("|")]
-                image_url = parts[0] if len(parts) >= 1 else ""
-                page_url  = parts[1] if len(parts) >= 2 else ""
-                source    = parts[2] if len(parts) >= 3 else ""
+                if parts:
+                    # first token may already be a URL
+                    first = parts[0]
+                    # remove optional "SOURCE:" from first if misordered
+                    if first.lower().startswith("source:"):
+                        # then no image, skip
+                        continue
+                    image_url = first
+                for p in parts[1:]:
+                    if p.lower().startswith("source:"):
+                        page_url = p.split(":", 1)[1].strip()
                 if image_url:
-                    lines.append(f"CANDIDATE: {image_url} | {page_url} | {source}")
+                    lines.append(f"IMAGE: {image_url} | SOURCE: {page_url}")
 
             best = vision_pick_best(client, item_desc, lines) if lines else None
 
-            out_q.put({
-                "ok": True,
-                "job_id": job["job_id"],
-                "kind": kind,
-                "candidates": lines,
-                "best": best
-            })
+            out_q.put({"ok": True, "job_id": job["job_id"], "kind": kind,
+                       "candidates": lines, "best": best})
         except Exception as e:
             out_q.put({"ok": False, "job_id": job.get("job_id",""), "error": str(e)})
         finally:
@@ -333,13 +335,13 @@ def drain_bg_results():
         try:
             if res.get("ok"):
                 kind = res["kind"]
-                # write back safely (research dict, never None)
                 for t in st.session_state.profile["topics"]:
                     if t["name"].lower() == kind:
                         t["research"] = {
                             "candidates": res.get("candidates") or [],
                             "best": res.get("best") or ""
                         }
+                        t["job_inflight"] = False
                         changed = True
                         break
             else:
@@ -349,25 +351,20 @@ def drain_bg_results():
     return changed
 
 # =======================
-# SEARCH TRIGGER
+# ENQUEUE SEARCH
 # =======================
 def enqueue_search_if_ready(client: OpenAI, topic: Dict[str, Any], user_text: str):
-    # Skip if field already extracted or research already present
     research = topic.get("research") or {}
-    if topic.get("field") or research.get("best") or research.get("candidates"):
+    if topic.get("job_inflight") or research.get("best") or research.get("candidates"):
         return
 
-    # Light context for extractor
-    recent = []
-    for m in reversed([m for m in st.session_state.history if m["role"] != "system"][-6:]):
-        recent.append(m["content"])
-    short_ctx = " | ".join(recent[::-1])[:600]
-
-    fields = extractor_pull_fields(client, topic["name"], user_text, short_ctx)
+    # extract atomic field
+    recent_msgs = [m for m in st.session_state.history if m["role"] != "system"][-6:]
+    recent = " | ".join(m["content"] for m in recent_msgs)[-600:]
+    fields = extractor_pull_fields(client, topic["name"], user_text, recent)
     if not fields:
         return
-
-    topic["field"] = fields  # store atomic value
+    topic["field"] = fields
 
     job = {"job_id": str(uuid.uuid4())[:8]}
     nm = topic["name"].lower()
@@ -383,6 +380,7 @@ def enqueue_search_if_ready(client: OpenAI, topic: Dict[str, Any], user_text: st
         job.update({"kind": "idea", "title": fields.get("name","")})
 
     st.session_state.bg_task_queue.put(job)
+    topic["job_inflight"] = True
     if SHOW_DEBUG:
         st.session_state.debug_log.append(f"[ENQ] {job}")
 
@@ -393,15 +391,14 @@ def build_final_text(client: OpenAI, profile: Dict[str, Any]) -> str:
     bullets = []
     for t in profile["topics"]:
         name = t["name"]
+        atom = (t.get("field") or {}).get("title") or (t.get("field") or {}).get("name") or ""
         why = t["answers"][-1] if t["answers"] else ""
-        field = t.get("field") or {}
-        atom = field.get("title") or field.get("name") or ""
         bullets.append(f"- {name}: {atom} — {why}".strip())
     facts = "Interview facts:\n" + "\n".join(bullets)
     return chat_once(client, FINALIZER_SYSTEM_PROMPT, facts)
 
 # =======================
-# UI HELPERS
+# UI
 # =======================
 def render_timeline(profile: Dict[str, Any]):
     cols = st.columns(len(profile["topics"]))
@@ -413,6 +410,17 @@ def render_timeline(profile: Dict[str, Any]):
             best_url = (t.get("research") or {}).get("best")
             if best_url:
                 st.image(best_url, caption="Selected", use_column_width=True)
+
+def enforce_single_question(text: str) -> str:
+    """Director may try multiple lines; keep only first question/sentence."""
+    if not text:
+        return text
+    # split by question mark or newline; keep first non-empty chunk
+    first = re.split(r'\?\s+|\n+', text.strip(), maxsplit=1)[0]
+    # if original had a '?', add it back to keep it a question
+    if "?" in text:
+        return first.strip() + "?"
+    return first.strip()
 
 # =======================
 # APP
@@ -427,29 +435,33 @@ if SHOW_DEBUG:
     with st.expander("🔧 Debug", expanded=False):
         st.json(st.session_state.debug_log)
 
+# Client + worker
+agent_ready = True
+try:
+    client = get_client()
+    # Start background worker once
+    th = st.session_state.bg_threads.get("main")
+    if not th or not th.is_alive():
+        ensure_worker(client)
+except Exception as e:
+    agent_ready = False
+    st.warning(f"OpenAI not configured: {e}")
+
+# Drain finished background results (causes UI refresh when something arrived)
+if drain_bg_results():
+    st.rerun()
+
+# Timeline
 render_timeline(st.session_state.profile)
 
-# Render chat history (skip system)
+# Show chat so far (skip system)
 for m in st.session_state.history:
     if m["role"] == "system":
         continue
     with st.chat_message(m["role"]):
         st.markdown(m["content"])
 
-# OpenAI client
-agent_ready = True
-try:
-    client = get_client()
-    ensure_worker(client)
-except Exception as e:
-    agent_ready = False
-    st.warning(f"OpenAI not configured: {e}")
-
-# Consume finished background results
-if drain_bg_results():
-    st.rerun()
-
-# Chat input
+# Input
 user_text = st.chat_input("Type your answer…")
 if user_text:
     st.session_state.history.append({"role": "user", "content": user_text})
@@ -460,45 +472,62 @@ if user_text:
     if agent_ready:
         enqueue_search_if_ready(client, topic, user_text)
 
-    # budget logic → move on when exhausted
-    if topic["budget"] > 0:
-        topic["budget"] -= 1
-    else:
-        topic["status"] = "done"
-        advance_topic(st.session_state.profile)
-
-    # Director reply (with stream fallback)
-    reply_text = "Thanks — I’ll assemble your expert card."
-    if agent_ready and not all_topics_done(st.session_state.profile) and can_ask_more(st.session_state.profile):
-        reply_text = chat_stream_with_fallback(client, st.session_state.history[-12:])
+    # Ask Director only if we still have follow-up budget for this topic
+    if agent_ready and topic["budget"] > 0 and can_ask_more(st.session_state.profile):
+        # Ask for the next (single) question
+        reply = chat_stream_with_fallback(client, st.session_state.history[-12:])
+        reply = enforce_single_question(reply)
         st.session_state.profile["bot_questions"] += 1
+        topic["budget"] -= 1                  # <-- budget sink occurs when bot asks
+        st.session_state.history.append({"role": "assistant", "content": reply})
 
-    st.session_state.history.append({"role": "assistant", "content": reply_text})
+        # If budget is now 0 → advance to next topic
+        if topic["budget"] <= 0:
+            topic["status"] = "done"
+            advance_topic(st.session_state.profile)
 
-    # End condition
+    else:
+        # No more questions for this topic → advance (if not already done)
+        if topic["status"] == "active":
+            topic["status"] = "done"
+            advance_topic(st.session_state.profile)
+
+        # If there are remaining topics, prompt first question for the new topic
+        if agent_ready and not all_topics_done(st.session_state.profile) and can_ask_more(st.session_state.profile):
+            reply = chat_stream_with_fallback(client, st.session_state.history[-12:])
+            reply = enforce_single_question(reply)
+            st.session_state.profile["bot_questions"] += 1
+            next_topic = current_topic(st.session_state.profile)
+            if next_topic["budget"] > 0:
+                next_topic["budget"] -= 1
+            st.session_state.history.append({"role": "assistant", "content": reply})
+
+    # End condition: either all topics done or cap reached
     if all_topics_done(st.session_state.profile) or not can_ask_more(st.session_state.profile):
         if not st.session_state.finalized:
             st.session_state.history.append({
                 "role": "assistant",
-                "content": "Thanks, I’ve got a solid picture now. I’ll assemble your expert card in the background."
+                "content": "Thanks — I’ve got a solid picture now. I’ll assemble your expert card in the background."
             })
             st.session_state.finalized = True
+
     st.rerun()
 
 # Final assembly (once)
 if st.session_state.finalized and agent_ready and not st.session_state.final_text:
-    time.sleep(0.2)  # brief grace for background
+    # small grace so background search can populate some images
+    time.sleep(0.2)
     st.session_state.final_text = build_final_text(client, st.session_state.profile)
 
 # Output table + export
 if st.session_state.finalized:
-    st.subheader("Expert Card (compact)")
+    st.subheader("Expert Card")
     rows = []
     for t in st.session_state.profile["topics"]:
         name = t["name"]
         atom = (t.get("field") or {}).get("title") or (t.get("field") or {}).get("name") or ""
-        why = t["answers"][-1] if t["answers"] else ""
-        img = (t.get("research") or {}).get("best") or ""
+        why  = t["answers"][-1] if t["answers"] else ""
+        img  = (t.get("research") or {}).get("best") or ""
         rows.append((name, atom, why, img))
 
     for name, atom, why, img in rows:
@@ -510,7 +539,10 @@ if st.session_state.finalized:
                 st.markdown(f"**{name}**")
                 st.caption("No image yet.")
         with c2:
-            st.markdown(f"**{name}** — {atom if atom else ''}")
+            header = f"**{name}**"
+            if atom:
+                header += f" — {atom}"
+            st.markdown(header)
             st.write(why if why else "_—_")
 
     if st.session_state.final_text:
@@ -523,7 +555,9 @@ if st.session_state.finalized:
         "history": [m for m in st.session_state.history if m["role"] != "system"],
         "final_text": st.session_state.final_text,
     }
-    st.download_button("⬇️ Download JSON",
-                       data=json.dumps(export, ensure_ascii=False, indent=2).encode("utf-8"),
-                       file_name="expert_card.json",
-                       mime="application/json")
+    st.download_button(
+        "⬇️ Download JSON",
+        data=json.dumps(export, ensure_ascii=False, indent=2).encode("utf-8"),
+        file_name="expert_card.json",
+        mime="application/json",
+    )
