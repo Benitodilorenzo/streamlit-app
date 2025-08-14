@@ -1,5 +1,5 @@
-# app.py — Expert Card Creator (Natural-Language Multi-Agents, no JSON)
-# Director decides; background research & validation in parallel; finalizer runs when ready.
+# app.py — Expert Card Creator (Natural-Language Multi-Agents, invisible ACTIONS, guarded)
+# Director decides; hidden [[ACTIONS]] block; parallel research; guarded triggers; finalizer after ready.
 
 import os
 import re
@@ -24,17 +24,22 @@ if not OPENAI_API_KEY:
 
 client = OpenAI(api_key=OPENAI_API_KEY)
 
-CHAT_MODEL = os.getenv("DTBR_CHAT_MODEL", "gpt-5")  # director / validator / finalizer
-SEARCH_MODEL = os.getenv("DTBR_SEARCH_MODEL", CHAT_MODEL)  # websearch (wir nutzen ebenfalls Chat, ohne Tools)
+CHAT_MODEL = os.getenv("DTBR_CHAT_MODEL", "gpt-5")      # director / validator / finalizer
+SEARCH_MODEL = os.getenv("DTBR_SEARCH_MODEL", CHAT_MODEL)  # websearch (hier via LLM ohne Tools)
 
 TOPICS_ORDER = ["Book", "Podcast", "Person", "Tool"]
 FOLLOWUP_BUDGET = {"Book": 2, "Podcast": 2, "Person": 1, "Tool": 0}
 
-# Background queues/state (thread-safe, kein direkter Session-Zugriff in Threads)
-RESULTS_QUEUE: "queue.Queue[Dict[str, Any]]" = queue.Queue()
-INFLIGHT_KEYS = set()   # auf Session gespiegelt, wir führen zusätzlich lokal für Sichtbarkeit
-TASKS_LOCK = threading.Lock()
+# Für jedes Topic: welche Action-Typen sind überhaupt sinnvoll/erlaubt?
+ALLOWED_ACTIONS_BY_TOPIC = {
+    "Book": {"SEARCH_COVER"},
+    "Podcast": {"SEARCH_PODCAST", "SEARCH_LOGO"},
+    "Person": {"SEARCH_PORTRAIT"},
+    "Tool": {"SEARCH_LOGO"},
+}
 
+# Background queues/state (thread-safe)
+RESULTS_QUEUE: "queue.Queue[Dict[str, Any]]" = queue.Queue()
 
 # ─────────────────────────────────────────────
 # Session init
@@ -66,25 +71,23 @@ def ensure_session():
                 for name in TOPICS_ORDER
             ],
             "current_topic_index": 0,
-            "finalizing": False  # wird vom Director signalisiert
+            "finalizing": False  # wird vom Director via ACTION signalisiert
         }
     if "inflight_keys" not in st.session_state:
-        st.session_state.inflight_keys = set()
+        st.session_state.inflight_keys = set()         # aktive Jobs (Dedup)
     if "results" not in st.session_state:
-        st.session_state.results: List[Dict[str, Any]] = []  # fertige Resultate (für Anzeige)
+        st.session_state.results: List[Dict[str, Any]] = []   # gesammelte Resultate
     if "final_output" not in st.session_state:
         st.session_state.final_output = None
-    if "progress_steps" not in st.session_state:
-        # total: pro Topic (Interview + Research) = 2
-        st.session_state.progress_total = len(TOPICS_ORDER) * 2
-        st.session_state.progress_done = 0  # wird dynamisch berechnet
-
+    if "progress_total" not in st.session_state:
+        st.session_state.progress_total = len(TOPICS_ORDER) * 2  # Interview + Research je Topic
+    if "progress_done" not in st.session_state:
+        st.session_state.progress_done = 0
 
 ensure_session()
 
-
 # ─────────────────────────────────────────────
-# Utility: topic helpers
+# Topic Helpers
 # ─────────────────────────────────────────────
 def current_topic() -> Dict[str, Any]:
     idx = st.session_state.profile["current_topic_index"]
@@ -99,69 +102,98 @@ def advance_topic_if_needed():
     if topic["status"] == "done" and idx + 1 < len(st.session_state.profile["topics"]):
         st.session_state.profile["current_topic_index"] += 1
 
-
 # ─────────────────────────────────────────────
-# Director prompt & parsing (natural language + action lines)
+# Director Prompt / ACTIONS Parsing
 # ─────────────────────────────────────────────
 DIRECTOR_INSTRUCTIONS = """
 You are the Director Agent for an expert card interview.
 
-RULES:
+RULES
 - Default to English; mirror the user's language if it is clearly not English.
-- Current topic is provided in the extra system instructions appended below.
-- Ask ONE concise, fresh question that progresses the interview.
-- Avoid repeating the same question with the same meaning.
-- ~1–2 follow-ups per topic; then move on naturally to the next topic.
-- Do NOT ask for confirmations like “Is that correct?” unless there is genuine ambiguity.
-- If the current topic already has enough information to trigger background work,
-  output an ACTION line at the very end (after your question), one per line, for example:
-  ACTION: SEARCH_COVER title="Antifragility" author="Nassim Taleb"
-  ACTION: SEARCH_PORTRAIT name="Gabor Maté"
-  ACTION: SEARCH_LOGO title="Secular Talk"
-- If you believe the overall interview is sufficient to finalize, also add:
-  ACTION: FINALIZE_READY
+- Ask ONE concise, fresh question that progresses the current topic only.
+- Avoid repeating questions with the same meaning.
+- Keep a gentle, professional tone. Do not ask for confirmations like “Is that correct?” unless truly ambiguous.
+- Roughly 1–2 follow-ups per topic; then transition naturally to the next topic.
+- Only propose background actions for items the user actually mentioned (no guessing).
+- Allowed action types per topic:
+  Book → SEARCH_COVER
+  Podcast → SEARCH_PODCAST or SEARCH_LOGO
+  Person → SEARCH_PORTRAIT
+  Tool → SEARCH_LOGO
+- Trigger actions only when minimal info is present:
+  • SEARCH_COVER: at least a title; author optional but helpful.
+  • SEARCH_PODCAST / SEARCH_LOGO: podcast/channel/tool name present.
+  • SEARCH_PORTRAIT: person name present.
+- If you believe the entire interview has enough material to finalize, also emit: FINALIZE_READY.
 
-FORMAT:
-- Your visible chat question first (one or two short sentences).
-- Then (optionally) one or more ACTION lines, each on its own line, starting with 'ACTION:'.
-- No JSON. No markdown fences.
+OUTPUT FORMAT
+1) First lines: the VISIBLE chat question (one or two short sentences).
+2) Then, if any, a hidden block:
+[[ACTIONS]]
+ACTION: <TYPE> [title="..."] [author="..."] [name="..."]
+(one action per line)
+[[/ACTIONS]]
+
+No markdown fences beyond the [[ACTIONS]] block. No JSON. The VISIBLE text must not include actions.
 """
 
-ACTION_RE = re.compile(
-    r'^ACTION:\s*(?P<kind>SEARCH_COVER|SEARCH_PORTRAIT|SEARCH_LOGO|FINALIZE_READY)'
+ACTIONS_BLOCK_RE = re.compile(r"\[\[ACTIONS\]\](.*?)\[\[/ACTIONS\]\]", re.DOTALL | re.IGNORECASE)
+ACTION_LINE_RE = re.compile(
+    r'^\s*ACTION:\s*(?P<kind>SEARCH_COVER|SEARCH_PODCAST|SEARCH_LOGO|SEARCH_PORTRAIT|FINALIZE_READY)'
     r'(?:\s+title="(?P<title>[^"]*)")?'
     r'(?:\s+author="(?P<author>[^"]*)")?'
-    r'(?:\s+name="(?P<name>[^"]*)")?',
+    r'(?:\s+name="(?P<name>[^"]*)")?\s*$',
     re.IGNORECASE
 )
 
-def parse_actions(text: str) -> List[Dict[str, str]]:
-    actions = []
-    for line in text.splitlines():
-        m = ACTION_RE.match(line.strip())
-        if not m:
-            continue
-        gd = m.groupdict()
-        kind = m.group("kind").upper()
-        act = {"kind": kind}
-        if gd.get("title"):
-            act["title"] = gd["title"].strip()
-        if gd.get("author"):
-            act["author"] = gd["author"].strip()
-        if gd.get("name"):
-            act["name"] = gd["name"].strip()
-        actions.append(act)
-    return actions
+def split_visible_and_actions(text: str) -> (str, List[Dict[str, str]]):
+    """Extrahiert [[ACTIONS]]-Block, strippt ihn aus dem sichtbaren Text, parst Action-Zeilen.
+       Fällt zurück auf Einzelzeilen mit 'ACTION:' falls kein Block benutzt wurde.
+    """
+    actions: List[Dict[str, str]] = []
 
-def director_ask_next() -> str:
-    """Frage vom Director generieren; addiere Systemhinweis zum aktuellen Topic."""
+    # 1) [[ACTIONS]]...[[/ACTIONS]] block
+    block_match = ACTIONS_BLOCK_RE.search(text or "")
+    if block_match:
+        block = block_match.group(1)
+        visible = ACTIONS_BLOCK_RE.sub("", text).strip()
+        for line in block.splitlines():
+            m = ACTION_LINE_RE.match(line)
+            if not m:
+                continue
+            gd = m.groupdict()
+            act = {"kind": gd["kind"].upper()}
+            if gd.get("title"):  act["title"]  = gd["title"].strip()
+            if gd.get("author"): act["author"] = gd["author"].strip()
+            if gd.get("name"):   act["name"]   = gd["name"].strip()
+            actions.append(act)
+        # zusätzlich: evtl. versehentlich im sichtbaren Teil verbliebene ACTION-Zeilen entfernen
+        visible = "\n".join([ln for ln in visible.splitlines() if not ln.strip().upper().startswith("ACTION:")]).strip()
+        return visible, actions
+
+    # 2) kein Block → entferne Zeilen, die mit ACTION: beginnen
+    visible_lines = []
+    for ln in (text or "").splitlines():
+        if ACTION_LINE_RE.match(ln):
+            gd = ACTION_LINE_RE.match(ln).groupdict()
+            act = {"kind": gd["kind"].upper()}
+            if gd.get("title"):  act["title"]  = gd["title"].strip()
+            if gd.get("author"): act["author"] = gd["author"].strip()
+            if gd.get("name"):   act["name"]   = gd["name"].strip()
+            actions.append(act)
+        else:
+            visible_lines.append(ln)
+    return "\n".join(visible_lines).strip(), actions
+
+def director_ask_next() -> (str, List[Dict[str, str]]):
+    """Frage vom Director generieren; sichtbarer Text + geparste Actions zurückgeben."""
     topic = current_topic()
     sys = (
         f"{DIRECTOR_INSTRUCTIONS}\n\n"
         f"CURRENT TOPIC: {topic['name']}\n"
-        f"REMAINING FOLLOW-UPS FOR CURRENT TOPIC: {topic['followups']}\n"
-        f"PREVIOUS ANSWERS FOR THIS TOPIC (if any): {topic['answers']}\n"
-        "Remember: visible question first; optional ACTION lines at the end."
+        f"REMAINING FOLLOW-UPS: {topic['followups']}\n"
+        f"ALREADY SAID FOR THIS TOPIC: {topic['answers']}\n"
+        "Remember: visible question first; optional [[ACTIONS]] block after."
     )
     try:
         resp = client.chat.completions.create(
@@ -169,18 +201,68 @@ def director_ask_next() -> str:
             messages=st.session_state.history + [{"role": "system", "content": sys}],
             temperature=0.6,
         )
-        return (resp.choices[0].message.content or "").strip()
+        raw = (resp.choices[0].message.content or "").strip()
     except Exception as e:
-        return f"(Director error: {e})"
+        raw = f"(Director error: {e})"
+    visible, acts = split_visible_and_actions(raw)
+    # Fallback, falls Modell nichts Sinnvolles liefert
+    if not visible:
+        visible = f"One more on {topic['name'].lower()}: what makes it stand out for you?"
+    return visible, acts
 
+# ─────────────────────────────────────────────
+# Guards: Nur sinnvolle Actions zulassen
+# ─────────────────────────────────────────────
+def allow_action(action: Dict[str, str], last_user_text: str) -> bool:
+    """Harter Programm-Guard: nur passende, ausreichend informierte Actions akzeptieren."""
+    kind = action.get("kind", "").upper()
+    topic = current_topic()
+    name = topic["name"]
+
+    # 1) Nur Actions erlauben, die zum aktuellen Topic passen
+    if kind not in ALLOWED_ACTIONS_BY_TOPIC.get(name, set()):
+        return False
+
+    # 2) Minimalinformationen prüfen je nach Action-Typ
+    if kind == "SEARCH_COVER":
+        # Braucht mind. einen Titel
+        title = (action.get("title") or "").strip()
+        if not title:
+            return False
+        # Wenn das Topic bereits recherchiert wurde, nicht doppelt
+        if topic.get("media", {}).get("done"):
+            return False
+        return True
+
+    if kind in ("SEARCH_PODCAST", "SEARCH_LOGO"):
+        title = (action.get("title") or "").strip()
+        # Für Podcast/Logo braucht es zumindest einen Namen/Hinweis
+        if not title and not last_user_text.strip():
+            return False
+        if topic.get("media", {}).get("done"):
+            return False
+        return True
+
+    if kind == "SEARCH_PORTRAIT":
+        person = (action.get("name") or "").strip()
+        if not person:
+            return False
+        if topic.get("media", {}).get("done"):
+            return False
+        return True
+
+    if kind == "FINALIZE_READY":
+        # Director bestimmt das, kein weiterer Guard nötig
+        return True
+
+    return False
 
 # ─────────────────────────────────────────────
 # Background agents (websearch + validation) — natural language outputs
 # ─────────────────────────────────────────────
 def websearch_agent(kind: str, title_or_name: str, author: str = "") -> List[Dict[str, str]]:
     """
-    Fragt das Modell nach 1–3 plausiblen Kandidaten. Reine Sprache, einfach parsbar:
-    Bitte im Output Zeilen wie:
+    LLM simulierte Bildsuche. Format:
     CANDIDATE: image_url|page_url|source
     """
     sys = (
@@ -217,9 +299,8 @@ def websearch_agent(kind: str, title_or_name: str, author: str = "") -> List[Dic
 def vision_validator_agent(kind: str, expected_title: str, expected_author_or_name: str,
                            candidates: List[Dict[str, str]]) -> Dict[str, Any]:
     """
-    Bitten wir das Modell, mit Vision (falls verfügbar) bzw. Plausibilität zu wählen:
-    Antwortformat: "BEST: <index 0..2> | CONF: 0.0..1.0 | REASON: ..."
-    Dazu geben wir vorher alle Kandidaten aufgelistet (als Text + Bild-URLs).
+    Vision/Plausibilitätswahl. Format:
+    BEST: <0..2 or -1> | CONF: <0.0..1.0> | REASON: ...
     """
     header = (
         "You are a vision/plausibility validator. Pick the best candidate index for the expected item.\n"
@@ -256,41 +337,42 @@ def vision_validator_agent(kind: str, expected_title: str, expected_author_or_na
     return {"best_index": best, "confidence": conf, "reason": reason, "raw": line}
 
 def start_background_action(action: Dict[str, str]):
-    """
-    Startet eine Suche/Validierung/Finalisierung nebenläufig.
-    Dedup über topic_key.
-    """
+    """Startet nebenläufige Suche/Validierung oder setzt Finalize-Flag. Dedup über inflight_keys."""
     kind = action["kind"].upper()
 
     if kind == "FINALIZE_READY":
         st.session_state.profile["finalizing"] = True
         return
 
-    if kind in ("SEARCH_COVER", "SEARCH_LOGO"):
-        # item based on title (+ optional author)
-        title = action.get("title", "").strip()
-        author = action.get("author", "").strip()
-        topic_kind = "Book" if kind == "SEARCH_COVER" else "Tool" if kind == "SEARCH_LOGO" else "Podcast"
-        if kind == "SEARCH_COVER" and not title:
+    # Map Action → key + worker
+    if kind in ("SEARCH_COVER", "SEARCH_LOGO", "SEARCH_PODCAST"):
+        title = (action.get("title") or "").strip()
+        author = (action.get("author") or "").strip()
+        if kind == "SEARCH_COVER":
+            topic_kind = "Book"; srch_kind = "book"
+        elif kind == "SEARCH_LOGO":
+            # kann für Tool/Podcast genutzt werden; hier behandeln wir es generisch als 'brand'
+            topic_kind = current_topic()["name"]  # bleibt beim aktuellen Topic
+            srch_kind = "brand"
+        else:  # SEARCH_PODCAST
+            topic_kind = "Podcast"; srch_kind = "podcast"
+
+        key = f"{kind}:{title.lower() or author.lower()}"
+        if key in st.session_state.inflight_keys:
             return
-        if kind == "SEARCH_LOGO" and not title:
-            return
-        topic_key = f"{topic_kind}:{title.lower()}"
-        if topic_key in st.session_state.inflight_keys:
-            return
-        st.session_state.inflight_keys.add(topic_key)
+        st.session_state.inflight_keys.add(key)
 
         def worker():
             try:
-                cands = websearch_agent("book" if kind == "SEARCH_COVER" else "tool", title, author)
-                val = vision_validator_agent("book" if kind == "SEARCH_COVER" else "tool",
-                                             expected_title=title,
+                cands = websearch_agent(srch_kind, title or author, author)
+                val = vision_validator_agent(srch_kind,
+                                             expected_title=title or author,
                                              expected_author_or_name=(author or title),
                                              candidates=cands)
                 best = val.get("best_index", -1)
                 chosen = cands[best] if 0 <= best < len(cands) else {}
                 RESULTS_QUEUE.put({
-                    "topic_key": topic_key,
+                    "key": key,
                     "topic_kind": topic_kind,
                     "title": title,
                     "image": chosen,
@@ -298,20 +380,17 @@ def start_background_action(action: Dict[str, str]):
                     "validator": val
                 })
             finally:
-                # inflight-flag freigeben passiert im Main-Thread beim Harvest
                 pass
 
         threading.Thread(target=worker, daemon=True).start()
         return
 
     if kind == "SEARCH_PORTRAIT":
-        name = action.get("name", "").strip()
-        if not name:
+        name = (action.get("name") or "").strip()
+        key = f"{kind}:{name.lower()}"
+        if not name or key in st.session_state.inflight_keys:
             return
-        topic_key = f"Person:{name.lower()}"
-        if topic_key in st.session_state.inflight_keys:
-            return
-        st.session_state.inflight_keys.add(topic_key)
+        st.session_state.inflight_keys.add(key)
 
         def worker():
             try:
@@ -323,7 +402,7 @@ def start_background_action(action: Dict[str, str]):
                 best = val.get("best_index", -1)
                 chosen = cands[best] if 0 <= best < len(cands) else {}
                 RESULTS_QUEUE.put({
-                    "topic_key": topic_key,
+                    "key": key,
                     "topic_kind": "Person",
                     "name": name,
                     "image": chosen,
@@ -335,7 +414,6 @@ def start_background_action(action: Dict[str, str]):
 
         threading.Thread(target=worker, daemon=True).start()
         return
-
 
 # ─────────────────────────────────────────────
 # Handle user turn
@@ -353,18 +431,17 @@ if user_text:
     # ggf. Topic abschließen & weiter
     advance_topic_if_needed()
 
-    # 3) Ask Director (visible question + optional ACTION lines)
-    director_reply = director_ask_next()
-    if director_reply:
-        st.session_state.history.append({"role": "assistant", "content": director_reply})
+    # 3) Ask Director (visible + actions)
+    visible, acts = director_ask_next()
+    # Sichtbare Frage in den Chat, ohne ACTIONS
+    st.session_state.history.append({"role": "assistant", "content": visible})
 
-        # 4) Parse and start actions (parallel, multi)
-        actions = parse_actions(director_reply)
-        for act in actions:
+    # 4) Actions nur starten, wenn Guards OK
+    for act in acts:
+        if allow_action(act, user_text):
             start_background_action(act)
 
     st.rerun()
-
 
 # ─────────────────────────────────────────────
 # Harvest background results & integrate into session
@@ -377,34 +454,29 @@ while True:
         break
 
 for res in harvested:
-    topic_key = res.get("topic_key", "")
-    if topic_key:
-        st.session_state.inflight_keys.discard(topic_key)
-    # map to topic by kind + title/name
+    key = res.get("key", "")
+    if key:
+        st.session_state.inflight_keys.discard(key)
     kind = res.get("topic_kind")
-    title = res.get("title", "") or res.get("name", "")
-    # find or create topic slot (based on kind)
+    # Ordne Ergebnis dem passenden Topic-Slot zu
     idx = None
     for i, t in enumerate(st.session_state.profile["topics"]):
         if t["name"] == kind:
-            idx = i
-            break
+            idx = i; break
     if idx is None:
         continue
     t = st.session_state.profile["topics"][idx]
     t["media"]["chosen"] = res.get("image", {})
     t["media"]["candidates"] = res.get("candidates", [])
     t["media"]["validator"] = res.get("validator", {})
-    # Markiere Research „done“, ohne den Interviewstatus zu überschreiben
     t["media"]["done"] = True
-    # Ergebnis für die Liste (Anzeige)
-    # vermeide Duplikate anhand image_url + kind
+
+    # Ergebnisliste (Anzeige) deduplizieren
     img_url = (res.get("image") or {}).get("image_url", "")
     dup = any((r.get("image", {}).get("image_url") == img_url) and (r.get("topic_kind") == kind)
               for r in st.session_state.results)
     if not dup:
         st.session_state.results.append(res)
-
 
 # ─────────────────────────────────────────────
 # Progress bar (Interview + Research)
@@ -414,44 +486,38 @@ research_done = sum(1 for t in st.session_state.profile["topics"] if t.get("medi
 progress = min(interview_done + research_done, st.session_state.progress_total)
 st.progress(progress / st.session_state.progress_total, text=f"Progress: {progress}/{st.session_state.progress_total}")
 
-# Hinweis: laufende Jobs?
 if st.session_state.inflight_keys:
     st.info("🔎 Background research running… you can keep chatting.")
 
-
 # ─────────────────────────────────────────────
-# Render chat history
+# Render chat history (visible only)
 # ─────────────────────────────────────────────
 for msg in st.session_state.history:
     with st.chat_message(msg["role"]):
         st.markdown(msg["content"])
 
-
 # ─────────────────────────────────────────────
 # Finalizer trigger & rendering
 # ─────────────────────────────────────────────
 def all_research_done_for_answered_topics() -> bool:
-    # Wir betrachten Topics, die mindestens eine Antwort haben – dort muss Research (falls angestoßen) fertig sein.
     for t in st.session_state.profile["topics"]:
         if t["answers"]:
-            # wenn inflight zu diesem kind existiert → noch nicht fertig
-            # (leichte Heuristik: prüfe 'done' Flag)
             if not t.get("media", {}).get("done"):
                 return False
     return True
 
 def finalizer_agent(profile: Dict[str, Any]) -> str:
     """
-    Baut einen freundlichen, fokussierten Abschlussabsatz + kompakte Liste je Topic.
-    Reine Sprache, keine JSON-Abhängigkeiten.
+    Freundlicher, professioneller Abschluss + kompakte Liste je Topic.
+    Reine Sprache, kein JSON.
     """
     sys = (
         "You are a finalizer. Compose a concise, warm, professional summary (3–5 sentences) "
         "that presents the user positively without flattery. Then provide a compact list per item "
         "(Book/Podcast/Person/Tool) with a one-liner why it matters. Keep it crisp."
     )
-    # Wir geben das Profil als einfacher Text weiter
-    text_profile = []
+    # Profil als einfacher Text
+    lines = []
     for t in profile["topics"]:
         if not t["answers"]:
             continue
@@ -459,8 +525,8 @@ def finalizer_agent(profile: Dict[str, Any]) -> str:
         facts = "; ".join([a.strip() for a in t["answers"] if a.strip()])
         chosen = t.get("media", {}).get("chosen", {})
         media_hint = chosen.get("image_url", "")
-        text_profile.append(f"{head} {facts} (image: {media_hint})")
-    user = "Interview facts:\n" + "\n".join(text_profile)
+        lines.append(f"{head} {facts} (image: {media_hint})")
+    user = "Interview facts:\n" + "\n".join(lines)
 
     try:
         r = client.chat.completions.create(
@@ -473,12 +539,12 @@ def finalizer_agent(profile: Dict[str, Any]) -> str:
     except Exception as e:
         return f"(Finalizer error: {e})"
 
-# Wenn Director FINALIZE_READY signalisiert hat UND alle Recherchen durch sind → finalisieren
+# Finalisieren nur, wenn Director „bereit“ signalisiert hat und alle Recherchen fertig sind
 if st.session_state.profile["finalizing"] and not st.session_state.inflight_keys and all_research_done_for_answered_topics():
     if not st.session_state.final_output:
         st.session_state.final_output = finalizer_agent(st.session_state.profile)
 
-# Anzeige der Ergebnisse (Bilder + Kurztext), parallel zum Chat
+# Ergebnisse (Bilder + Kurzinfos) zeigen
 if st.session_state.results:
     st.subheader("Results")
     for res in st.session_state.results[::-1]:
@@ -490,7 +556,6 @@ if st.session_state.results:
             else:
                 st.write("(no image)")
         with c2:
-            # kurzer, informeller Platzhaltertext; Finalizer liefert später schönen Text
             tk = res.get("topic_kind", "")
             title = res.get("title") or res.get("name") or ""
             st.markdown(f"**{tk}** — *{title}*")
@@ -498,7 +563,7 @@ if st.session_state.results:
             if pg:
                 st.markdown(f"[Source]({pg})")
 
-# Finaler Output (Text)
+# Finaler Text
 if st.session_state.final_output:
     st.subheader("Your Expert Card (Draft)")
     st.markdown(st.session_state.final_output)
@@ -511,11 +576,10 @@ with c1:
                   "progress_total", "progress_done"]:
             if k in st.session_state:
                 del st.session_state[k]
-        # auch globale Queues leeren
+        # Queue leeren
         while not RESULTS_QUEUE.empty():
             try: RESULTS_QUEUE.get_nowait()
             except queue.Empty: break
-        INFLIGHT_KEYS.clear()
         ensure_session()
         st.rerun()
 with c2:
