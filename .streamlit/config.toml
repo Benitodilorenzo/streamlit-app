@@ -3,6 +3,15 @@ enableCORS = true
 enableXsrfProtection = true
 headless = true
 port = 8501
+fileWatcherType = "poll"
+folderWatchBlacklist = [
+    "/.git/",
+    "/.venv/",
+    "/venv/",
+    "/node_modules/",
+    "/__pycache__/",
+    "/.mypy_cache/"
+]
 
 [browser]
 gatherUsageStats = false
