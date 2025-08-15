@@ -91,28 +91,38 @@ def phase_prompt() -> str:
         return "GOAL (Consolidation)\nChoose a precise label (e.g., Must-Read, Podcast, Role Model, Go-to Tool, Practice, Contrarian View). Craft 2–4 concise bullets (facts, evidence, phrasing cues). Save slot."
     return "GOAL (Finalize)\nThere are 4 slots. Produce 4 labeled lines (1–2 sentences each), specific and grounded in the notes. Call finalize_card(notes)."
 
-def few_shots_for_phase() -> List[Dict[str,Any]]:
-    """Few-shots WITHOUT tool_calls. We keep them linguistic only;
-       the model will decide to call tools based on the system prompt + tools schema."""
+def examples_block_for_phase() -> str:
     ph = st.session_state.phase
-    shots: List[Dict[str,Any]] = []
     if ph == "discovery":
-        # Buch
-        shots.append({"role":"user","content":"Data-Inspired von Sebastian Wernicke."})
-        shots.append({"role":"assistant","content":"Welcher Aspekt daraus hat deine Praxis am stärksten verändert?"})
-        # Podcast
-        shots.append({"role":"user","content":"Ich höre Hard Fork am meisten."})
-        shots.append({"role":"assistant","content":"Welche Folge würdest du Einsteiger*innen zuerst empfehlen – und warum?"})
-    elif ph == "deepening":
-        shots.append({"role":"user","content":"Ich bin geduldiger in AI-Trainings geworden."})
-        shots.append({"role":"assistant","content":"An welcher Stelle im Training sparst du dadurch heute am meisten Friktion?"})
-        shots.append({"role":"user","content":"Lieblingsfilm: Arrival."})
-        shots.append({"role":"assistant","content":"Was nimmst du aus Arrival mit, das sich in deiner Arbeit tatsächlich zeigt?"})
-    elif ph == "consolidation":
-        shots.append({"role":"assistant","content":"Wem folgst du aktuell, um bei Datenstrategie frisch zu bleiben? Nur ein Name."})
-    else:  # finalize
-        shots.append({"role":"assistant","content":"Danke — ich habe genug Notizen."})
-    return shots
+        return (
+            "EXAMPLES (not conversation; do NOT treat as current messages)\n"
+            "- Example 1\n"
+            "  User: Data-Inspired von Sebastian Wernicke.\n"
+            "  Assistant: Welcher Aspekt daraus hat deine Praxis am stärksten verändert?\n\n"
+            "- Example 2\n"
+            "  User: Ich schaue oft Interviews mit Demis Hassabis.\n"
+            "  Assistant: Was hast du aus Hassabis’ Arbeit konkret in deinem Alltag übernommen?\n"
+        )
+    if ph == "deepening":
+        return (
+            "EXAMPLES (not conversation)\n"
+            "- User: Ich bin geduldiger in AI-Trainings geworden.\n"
+            "  Assistant: An welcher Stelle im Training sparst du dadurch heute am meisten Friktion?\n\n"
+            "- User: Lieblingsfilm: Arrival.\n"
+            "  Assistant: Was nimmst du aus Arrival mit, das sich in deiner Arbeit tatsächlich zeigt?\n"
+        )
+    if ph == "consolidation":
+        return (
+            "EXAMPLES (not conversation)\n"
+            "- Assistant: Nenne eine Person, der du folgst, um bei Datenstrategie frisch zu bleiben. Nur ein Name.\n"
+            "- Assistant: Formuliere 2–4 kurze bullets zu Wirkung/Beispiel.\n"
+        )
+    # finalize
+    return (
+        "EXAMPLES (not conversation)\n"
+        "- Assistant: Danke — ich habe genug Notizen und finalisiere jetzt die 4 Linien.\n"
+    )
+
 
 def current_slot_id() -> str:
     ix = st.session_state.current_slot_ix
@@ -510,13 +520,27 @@ class Orchestrator:
 # CHAT (Streaming + Function Calls)
 # =========================================================
 def build_messages(user_text: Optional[str]) -> List[Dict[str,Any]]:
-    msgs = list(st.session_state.history)  # copy
-    msgs.append({"role":"system","content": phase_prompt()})
-    for ex in few_shots_for_phase():
-        msgs.append(ex)
+    msgs: List[Dict[str,Any]] = []
+
+    # 1) Core-Policy (bereits in session_state.history vorhanden – wir übernehmen sie sauber)
+    #    Statt blind history zu kopieren, filtern wir hier nur nicht-example system msgs + bisherige Dialogturns:
+    for m in st.session_state.history:
+        # history enthält unsere anfängliche core policy als system – die nehmen wir mit
+        if m["role"] in ("system","user","assistant"):
+            msgs.append(m)
+
+    # 2) Phase-Ziel als system
+    msgs.append({"role": "system", "content": phase_prompt()})
+
+    # 3) Few-shot Beispiele als EIN system-Block (kein user/assistant!)
+    msgs.append({"role": "system", "content": examples_block_for_phase()})
+
+    # 4) Aktuelle Benutzereingabe (falls vorhanden)
     if user_text:
         msgs.append({"role":"user","content": user_text})
+
     return msgs
+
 
 def handle_tool_calls(tool_calls: List[Any], orchestrator: Orchestrator):
     for tc in tool_calls:
