@@ -9,15 +9,6 @@ import streamlit as st
 from openai import OpenAI
 
 # =====================================
-# STREAMLIT OPTIONS (avoid inotify issues in web UIs)
-# =====================================
-# Use polling-based file watcher to prevent inotify EMFILE errors in hosted environments
-st.set_option("server.fileWatcherType", "poll")
-st.set_option("server.folderWatchBlacklist", [
-    "/.git/", "/.venv/", "/venv/", "/node_modules/", "/__pycache__/", "/.mypy_cache/"
-])
-
-# =====================================
 # CONFIGURATION
 # =====================================
 APP_TITLE = "🟡 Expert Card Creator — Two-Agent Architecture"
@@ -438,19 +429,22 @@ def get_slot(slot_id: str) -> Optional[Dict[str, Any]]:
             return s
     return None
 
-
 # =====================================
 # Chat Loop Handling (Function Calling with correct ordering)
 # =====================================
 
+def enforce_single_question_in_msg(message_obj) -> str:
+    content = (message_obj.content or "").strip()
+    return enforce_single_question(content) if content else ""
+
 def append_assistant_with_tool_calls(message_obj) -> List[Dict[str, Any]]:
     """Append assistant message preserving tool_calls for API pairing. Returns normalized tool_calls list."""
-    content = (message_obj.content or "").strip()
+    content = enforce_single_question_in_msg(message_obj)
     tool_calls = getattr(message_obj, "tool_calls", None) or []
 
     assistant_msg: Dict[str, Any] = {
         "role": "assistant",
-        "content": enforce_single_question(content) if content else ""
+        "content": content
     }
     if tool_calls:
         assistant_msg["tool_calls"] = [
@@ -466,7 +460,7 @@ def append_assistant_with_tool_calls(message_obj) -> List[Dict[str, Any]]:
         ]
     st.session_state.history.append(assistant_msg)
 
-    if assistant_msg["content"].endswith("?"):
+    if content.endswith("?"):
         st.session_state.agent_budget = max(0, st.session_state.agent_budget - 1)
 
     # Return simple list for iteration
