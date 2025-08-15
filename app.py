@@ -1,21 +1,18 @@
 # app_expert_card_gpt5.py
-# Single-file, production-ready Streamlit app
-# Architecture: GPT-5 Chat Agent (interview) + Hosted Web Search (OpenAI Responses API) + Finalizer
-# - GPT-5 only (no other models), minimal prompts, no temperature/think settings
-# - Hosted Web Search (no own Google/Bing keys). Prefer official domains via instructions.
-# - Fire-and-forget media jobs (ThreadPoolExecutor). Chat stays responsive.
-# - Entity extraction & insight distillation via compact structured calls.
-# - Always show one short visible question per turn (even if tools run).
-# - Robust session init, idempotent scheduling, placeholder images, URL/upload overrides.
+# Single-file Streamlit app — GPT-5 only, Hosted Web Search, async media, minimal prompting
+# Includes patches:
+#  (1) Placeholder image generation compatible with Pillow ≥10 (uses textbbox, not textsize)
+#  (2) Hosted web_search errors are surfaced (not swallowed) + preflight check + UI notes
 #
 # Requirements:
 #   pip install streamlit openai pillow requests
 # Environment:
-#   OPENAI_API_KEY (required)
+#   OPENAI_API_KEY  (required)
 # Optional:
-#   set STREAMLIT_SERVER_PORT, etc.
+#   OPENAI_GPT5_SNAPSHOT (defaults to gpt-5-2025-08-07)
+#   OPENAI_CHAT_MODEL    (defaults to snapshot)
 
-import os, re, uuid, urllib.parse, json, time
+import os, re, uuid, urllib.parse, json
 from typing import List, Dict, Any, Optional, Tuple
 from concurrent.futures import ThreadPoolExecutor, Future
 
@@ -28,7 +25,7 @@ from openai import OpenAI
 # CONFIG
 # =========================
 APP_TITLE = "🟡 Expert Card — GPT-5 (Hosted Web Search, Async, Single File)"
-MODEL_SNAPSHOT = os.getenv("OPENAI_GPT5_SNAPSHOT", "gpt-5-2025-08-07")  # pin for stable behavior
+MODEL_SNAPSHOT = os.getenv("OPENAI_GPT5_SNAPSHOT", "gpt-5-2025-08-07")  # snapshot pin
 OPENAI_MODEL = os.getenv("OPENAI_CHAT_MODEL", MODEL_SNAPSHOT)            # GPT-5 only
 
 HTTP_TIMEOUT = 10
@@ -85,6 +82,10 @@ def init_state():
     # finalized lines
     st.session_state.final_lines: Dict[str, str] = {}
 
+    # web_search preflight
+    st.session_state.web_search_ok = None
+    st.session_state.web_search_err = ""
+
 def current_slot_id() -> str:
     ix = st.session_state.current_slot_ix
     return st.session_state.slot_order[min(ix, 3)]
@@ -101,19 +102,29 @@ def _get(url, params=None, headers=None, timeout=HTTP_TIMEOUT):
     return requests.get(url, params=params, headers=h, timeout=timeout)
 
 def generate_placeholder_icon(text: str, slot_id: str) -> str:
+    """Patch (1): Pillow ≥10 compatible placeholder (textbbox)."""
     size = (640, 640)
     img = Image.new("RGB", size, color=(24, 31, 55))
     draw = ImageDraw.Draw(img)
     for r, col in [(260, (57, 96, 199)), (200, (73, 199, 142)), (140, (255, 205, 86))]:
         draw.ellipse([(size[0]//2 - r, size[1]//2 - r), (size[0]//2 + r, size[1]//2 + r)], outline=col, width=8)
+
     txt = (text or "Idea").strip()
-    if len(txt) < PLACEHOLDER_MIN_TEXT: txt = "Idea"
+    if len(txt) < PLACEHOLDER_MIN_TEXT:
+        txt = "Idea"
     try:
         font = ImageFont.truetype("DejaVuSans-Bold.ttf", 42)
     except Exception:
         font = ImageFont.load_default()
-    w, h = draw.textsize(txt, font=font)
-    draw.text(((size[0] - w)//2, (size[1] - h)//2), txt, fill=(240, 240, 240), font=font)
+
+    # Pillow ≥10: textbbox; fallback to textsize if necessary
+    try:
+        bbox = draw.textbbox((0, 0), txt, font=font)
+        w, h = bbox[2] - bbox[0], bbox[3] - bbox[1]
+    except Exception:
+        w, h = draw.textsize(txt, font=font)
+
+    draw.text(((size[0]-w)//2, (size[1]-h)//2), txt, fill=(240, 240, 240), font=font)
     path = os.path.join(MEDIA_DIR, f"{slot_id}_ph.png")
     img.save(path, format="PNG")
     return path
@@ -147,18 +158,15 @@ def normalize_entity(raw: str) -> Tuple[Optional[str], Optional[str]]:
     if re.search(r'\bmovie|film|poster\b', s, re.I):
         return ("film", s.replace("poster", "").strip(' "'))
 
-    # If it looks like a person "Firstname Lastname"
+    # If it looks like a person "Firstname Lastname" → ambiguous, router decides
     if len(s.split()) in (2, 3) and s[0].isupper():
-        # ambiguous—leave to router
         return (None, None)
 
     return (None, None)
 
 # =========================
-# GPT-5 HELPERS (Responses API)
+# GPT-5 (Responses API) SCHEMAS
 # =========================
-
-# Hosted Web Search result schema for a single best image
 BEST_IMAGE_SCHEMA = {
     "name": "BestImage",
     "schema": {
@@ -175,7 +183,6 @@ BEST_IMAGE_SCHEMA = {
     "strict": True
 }
 
-# Entity Router schema
 ENTITY_SCHEMA = {
     "name": "EntityPick",
     "schema": {
@@ -190,7 +197,6 @@ ENTITY_SCHEMA = {
     "strict": True
 }
 
-# Insight distillation schema
 INSIGHT_SCHEMA = {
     "name": "InsightBullets",
     "schema": {
@@ -204,19 +210,21 @@ INSIGHT_SCHEMA = {
     "strict": True
 }
 
+# =========================
+# GPT-5 HELPERS (Hosted Web Search + Structured outputs)
+# =========================
 def hosted_search_best_image(entity_type: str, entity_name: str) -> Dict[str, Any]:
     """
     Use GPT-5 Responses API with hosted web_search to pick ONE authoritative image.
+    Patch (2): Do NOT swallow errors — return status=error with notes.
     """
     prefer = PREFERRED_DOMAINS.get(entity_type, [])
     instructions = (
         "Find ONE authoritative image for the given public item.\n"
         f"Item type: {entity_type}\n"
-        "Requirements:\n"
         f"- Prefer domains: {', '.join(prefer) if prefer else 'no preference'}\n"
         "- MUST return a direct image URL (.jpg or .png), not a page.\n"
         "- Avoid thumbnails, memes, watermarks, wrong items.\n"
-        "- If multiple candidates: pick official/primary source, large resolution, correct match.\n"
         "Return structured JSON only."
     )
     try:
@@ -238,14 +246,32 @@ def hosted_search_best_image(entity_type: str, entity_name: str) -> Dict[str, An
         data = getattr(resp, "output_parsed", None) or getattr(resp, "output", None)
         if isinstance(data, dict) and data.get("url") and data.get("page_url"):
             return {"status":"found","best_image_url": data["url"], "candidates":[data], "notes": data.get("reason","")}
-    except Exception:
-        pass
-    return {"status":"none","best_image_url":"","candidates":[],"notes":"no result"}
+        return {"status":"error","best_image_url":"","candidates":[],"notes":"web_search returned no structured result"}
+    except Exception as e:
+        return {"status":"error","best_image_url":"","candidates":[],"notes": f"web_search error: {e}"}
+
+def preflight_web_search():
+    """One-time probe to detect if hosted web_search is available and callable."""
+    try:
+        resp = client.responses.create(
+            model=OPENAI_MODEL,
+            tools=[{"type":"web_search"}],
+            tool_choice="auto",
+            reasoning={"effort":"minimal"},
+            verbosity="low",
+            response_format={"type":"json_schema","json_schema": BEST_IMAGE_SCHEMA},
+            input=[{"role":"user","content":[
+                {"type":"text","text":"Test web search availability. Return any valid JSON per schema."}
+            ]}]
+        )
+        _ = getattr(resp, "output_parsed", None) or getattr(resp, "output", None)
+        st.session_state.web_search_ok = True
+    except Exception as e:
+        st.session_state.web_search_ok = False
+        st.session_state.web_search_err = str(e)
 
 def route_entity_with_gpt(text: str) -> Tuple[Optional[str], Optional[str]]:
-    """
-    Lightweight router: ask GPT-5 to classify and produce normalized name.
-    """
+    """Lightweight router: GPT-5 classifies and normalizes entity name."""
     try:
         resp = client.responses.create(
             model=OPENAI_MODEL,
@@ -262,9 +288,7 @@ def route_entity_with_gpt(text: str) -> Tuple[Optional[str], Optional[str]]:
     return (None, None)
 
 def distill_insights_with_gpt(text: str, context_hint: str = "") -> Tuple[Optional[str], List[str]]:
-    """
-    Extract a short label + 2–4 concise bullets from user's explanation.
-    """
+    """Extract a short label + 2–4 bullets from the user's explanation."""
     try:
         inst = (
             "From the user's message, extract one concise label and 2–4 crisp bullets (facts/insights). "
@@ -288,7 +312,7 @@ def distill_insights_with_gpt(text: str, context_hint: str = "") -> Tuple[Option
     return (None, [])
 
 def finalize_card_with_gpt(notes: List[Dict[str, Any]]) -> Dict[str, str]:
-    # Strict, minimal finalizer (4 labeled lines)
+    """Strict, minimal finalizer (4 labeled lines) via Chat Completions."""
     prompt = (
         "Create a concise Expert Card with exactly 4 labeled items.\n"
         "Each item: 1–2 short sentences, grounded in bullets; no fluff.\n"
@@ -315,7 +339,7 @@ def finalize_card_with_gpt(notes: List[Dict[str, Any]]) -> Dict[str, str]:
         return {}
 
 # =========================
-# CHAT AGENT (One question per turn)
+# CHAT AGENT
 # =========================
 CHAT_POLICY = (
     "ROLE\n"
@@ -339,24 +363,18 @@ def state_summary() -> str:
         parts.append(f"{sid}: {s.get('label','(pending)')} [{done}]")
     return "STATE\n" + " | ".join(parts) + f"\nCURRENT_SLOT_ID={current_slot_id()}"
 
-def chat_reply(last_user_text: Optional[str]) -> str:
+def chat_reply() -> str:
     msgs = [
         {"role":"system","content": CHAT_POLICY},
         {"role":"system","content": state_summary()}
     ]
-    # last 6 turns only
     tail = [m for m in st.session_state.history if m["role"] in ("user","assistant")]
     tail = tail[-6:]
     msgs.extend(tail)
-    if last_user_text:
-        msgs.append({"role":"user","content": last_user_text})
 
-    # One-shot completion; keep it snappy
     res = client.chat.completions.create(model=OPENAI_MODEL, messages=msgs)
     text = (res.choices[0].message.content or "").strip()
-    # Guarantee one visible question
-    if not text or not text.strip().endswith("?"):
-        # Fallback by type hint (best effort)
+    if not text or not text.endswith("?"):
         text = "What changed in your practice after this?"
     return text
 
@@ -377,9 +395,9 @@ class Orchestrator:
             "label": "",
             "bullets": [],
             "done": False,
-            "media": {"status":"pending","best_image_url":"","candidates":[]}
+            "media": {"status":"pending","best_image_url":"","candidates":[],"notes":""}
         })
-        if label is not None: s["label"] = label[:80]
+        if label is not None: s["label"] = label[:120]
         if bullets is not None: s["bullets"] = [b.strip() for b in bullets][:4]
         if done is not None: s["done"] = bool(done)
         self.slots[slot_id] = s
@@ -389,9 +407,14 @@ class Orchestrator:
         if key in self.fp:
             return  # already scheduled
         self.fp.add(key)
-        s = self.slots.get(slot_id) or {"slot_id": slot_id, "label":"", "bullets":[], "done": False, "media":{}}
-        s["media"] = {"status":"searching","best_image_url":"","candidates":[]}
+
+        s = self.slots.get(slot_id) or {
+            "slot_id": slot_id, "label":"", "bullets":[], "done": False,
+            "media": {"status":"pending","best_image_url":"","candidates":[],"notes":""}
+        }
+        s["media"] = {"status":"searching","best_image_url":"","candidates":[],"notes":""}
         self.slots[slot_id] = s
+
         fut = self.executor.submit(self._media_job, slot_id, entity_type, entity_name)
         job_id = str(uuid.uuid4())[:8]
         self.media_jobs[job_id] = (slot_id, fut)
@@ -399,16 +422,23 @@ class Orchestrator:
 
     def _media_job(self, slot_id: str, entity_type: str, entity_name: str) -> Dict[str, Any]:
         res = hosted_search_best_image(entity_type, entity_name)
-        if res.get("status") != "found":
-            # fallback placeholder
-            res = {
-                "status":"generated",
-                "best_image_url": generate_placeholder_icon(entity_name or entity_type, slot_id),
-                "candidates": [],
-                "notes": "placeholder"
-            }
-        res["slot_id"] = slot_id
-        return res
+        if res.get("status") == "found":
+            res["slot_id"] = slot_id
+            return res
+
+        # Patch (2): On error, return status=error with notes (do not go to placeholder yet)
+        if res.get("status") == "error":
+            res["slot_id"] = slot_id
+            return res
+
+        # Only if genuinely none: generate placeholder
+        return {
+            "slot_id": slot_id,
+            "status":"generated",
+            "best_image_url": generate_placeholder_icon(entity_name or entity_type, slot_id),
+            "candidates": [],
+            "notes": "placeholder"
+        }
 
     def poll_media(self) -> List[str]:
         updated = []
@@ -419,9 +449,11 @@ class Orchestrator:
                     res = fut.result()
                     s = self.slots.get(slot_id)
                     if s:
-                        s["media"]["status"] = res.get("status","none")
-                        s["media"]["best_image_url"] = res.get("best_image_url","")
-                        s["media"]["candidates"] = res.get("candidates",[])
+                        m = s["media"]
+                        m["status"] = res.get("status","none")
+                        m["best_image_url"] = res.get("best_image_url","")
+                        m["candidates"] = res.get("candidates",[])
+                        m["notes"] = res.get("notes","")
                         updated.append(slot_id)
                 finally:
                     to_delete.append(job_id)
@@ -454,7 +486,6 @@ def process_user_message(text: str, orch: Orchestrator):
     # If public entity: create/assign slot & schedule search
     if e_type and e_type != "none" and e_name:
         sid = current_slot_id()
-        # set slot label early (for UI)
         label_hint = {
             "book":"Must-Read",
             "podcast":"Podcast",
@@ -470,12 +501,9 @@ def process_user_message(text: str, orch: Orchestrator):
     hint = e_name or ""
     lab, bullets = distill_insights_with_gpt(text, context_hint=hint)
     if bullets:
-        # If current slot already used for entity, prefer next slot for practice—unless empty.
-        # Simple policy: if current has a media search pending and no bullets yet, fill it; else next slot.
         target_sid = sid2
         s_cur = st.session_state.slots.get(sid2)
         if s_cur and s_cur.get("media",{}).get("status") in ("searching","found","generated") and s_cur.get("bullets"):
-            # current already has bullets -> move to next
             if st.session_state.current_slot_ix < 3:
                 st.session_state.current_slot_ix += 1
                 target_sid = current_slot_id()
@@ -484,7 +512,7 @@ def process_user_message(text: str, orch: Orchestrator):
         advance_slot()
 
     # 3) Generate next short question (always visible)
-    reply = chat_reply(None)  # history includes user's turn; no extra text needed
+    reply = chat_reply()
     st.session_state.history.append({"role":"assistant","content": reply})
 
 # =========================
@@ -495,22 +523,26 @@ def render_progress_and_timeline():
     filled = sum(1 for s in slots.values() if s.get("label") and s.get("bullets"))
     st.progress(min(1.0, filled/4), text=f"Progress: {filled}/4")
 
-    if not slots: return
     cols = st.columns(4)
     for i, sid in enumerate(st.session_state.slot_order):
         s = slots.get(sid)
         with cols[i]:
             st.markdown(f"**{(s or {}).get('label') or sid}**")
-            if s:
-                st.caption("status: " + (s.get("media",{}).get("status") or "pending"))
-                best = (s.get("media",{}).get("best_image_url") or "").strip()
-                if best:
-                    try: st.image(best, use_container_width=True)
-                    except Exception: st.caption("(image unavailable)")
-                else:
-                    st.caption("(image pending)")
-            else:
+            if not s:
                 st.caption("(empty)")
+                continue
+            m = s.get("media",{})
+            st.caption(f"status: {m.get('status') or 'pending'}")
+            best = (m.get("best_image_url") or "").strip()
+            if best:
+                try: st.image(best, use_container_width=True)
+                except Exception: st.caption("(image unavailable)")
+            else:
+                st.caption("(image pending)")
+            # Show notes (Patch 2: surface errors)
+            notes = (m.get("notes") or "").strip()
+            if notes:
+                st.code(notes, language="text")
 
 def render_chat_history():
     for m in st.session_state.history:
@@ -527,6 +559,7 @@ def render_overrides():
                 if url and url.startswith("http"):
                     s["media"]["status"] = "found"
                     s["media"]["best_image_url"] = url
+                    s["media"]["notes"] = "override url"
                     st.success("Using URL override.")
             with c2:
                 up = st.file_uploader("Upload image", type=["png","jpg","jpeg"], key=f"up_{sid}")
@@ -535,6 +568,7 @@ def render_overrides():
                     if path:
                         s["media"]["status"] = "uploaded"
                         s["media"]["best_image_url"] = path
+                        s["media"]["notes"] = "uploaded file"
                         st.success("Using uploaded image.")
 
 def render_final_card():
@@ -569,6 +603,14 @@ st.caption("GPT-5 only • Hosted Web Search • Async media • One short quest
 
 client = get_client()
 init_state()
+
+# Preflight hosted web_search (once)
+if st.session_state.web_search_ok is None:
+    preflight_web_search()
+
+if st.session_state.web_search_ok is False:
+    st.error(f"Hosted web_search not available: {st.session_state.web_search_err}")
+
 orch = Orchestrator()
 
 # Poll media jobs every run
