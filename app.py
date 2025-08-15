@@ -160,17 +160,49 @@ Format:
 # Used by media agent to coax LLM to collect candidates (when no live web tool is available)
 SEARCHER_SYSTEM = """
 You are a researcher using a web search tool.
-Find high-quality candidate images that best represent the requested item.
-Heuristics:
-- Book: publisher/Amazon/Open Library/Wikipedia; avoid fan art.
-- Podcast: official channel art (YouTube/Spotify/Apple) or website.
-- Person: clear, respectful portrait (Wikipedia/official site preferred).
-- Tool: official logo/hero image.
-IMPORTANT: Perform at most 3 focused searches. Stop early if you have 2–3 strong candidates.
-Output 1–3 lines. Each line EXACTLY:
-IMAGE: <direct_image_url> | SOURCE: <source_page_url>
-No extra commentary.
+
+GOAL
+Return 1–3 high-quality candidate image URLs that best represent the requested item.
+
+CRITICAL RULES
+- NEVER ask the user questions or request confirmation. You must decide autonomously.
+- If the query is ambiguous or misspelled, silently normalize it (common spellings, likely canonical title/author/host).
+- Prefer authoritative/official sources; avoid fan art, memes, watermarks, or low-res.
+- Perform at most 3 focused lookups internally. Stop early if you already have 2–3 strong candidates.
+- OUTPUT FORMAT ONLY (no extra text, no explanations):
+  IMAGE: <direct_image_url> | SOURCE: <source_page_url>
+
+HEURISTICS
+- Book: publisher site, Amazon, Open Library, Wikipedia (official cover only).
+- Podcast: Apple/Spotify/YouTube official channel art or official website.
+- Person: clear portrait from Wikipedia or official site.
+- Tool: official logo/hero image from the product site or docs.
+
+If you cannot find suitable candidates, output nothing.
 """
+
+NORMALIZER_SYSTEM = """
+You are a query normalizer and spell-corrector for web image search.
+
+INPUT
+- intent: person | book | podcast | tool | generic
+- raw query: possibly misspelled or vague
+
+TASK
+Produce up to 3 likely corrected/focused query alternatives that will help fetch the canonical image.
+
+RULES
+- NEVER ask questions or request confirmation.
+- Fix common misspellings (e.g., "Wernike" -> "Wernicke").
+- For book/podcast, if obvious, append cues like "official cover"/"official channel".
+- For person, add "portrait" and/or "wikipedia" or "official site".
+- For tool, add "official logo" or "press kit" or "docs".
+- If “prefer domains” are provided, you may append "site:<domain>" hints.
+
+OUTPUT
+Return EXACTLY one query per line. No commentary.
+"""
+
 
 VISION_PICKER_PROMPT = """
 You are a careful visual validator.
@@ -284,15 +316,9 @@ def chat_once(model: str, messages: List[Dict[str, Any]], tools: Optional[List[D
 # Media Agent (host-implemented functions)
 # =====================================
 
-def media_search_candidates(query: str) -> List[Dict[str, str]]:
-    """Use LLM-guided search (no external web APIs here) to output up to 3 formatted candidates."""
-    txt = chat_once(MEDIA_MODEL, [
-        {"role": "system", "content": SEARCHER_SYSTEM},
-        {"role": "user", "content": f"Query: {query}"}
-    ]).choices[0].message.content or ""
-
+def _parse_candidates_from_text(txt: str) -> List[Dict[str, str]]:
     out: List[Dict[str, str]] = []
-    for ln in txt.splitlines():
+    for ln in (txt or "").splitlines():
         s = ln.strip()
         if not s or not s.upper().startswith("IMAGE:"):
             continue
@@ -303,10 +329,81 @@ def media_search_candidates(query: str) -> List[Dict[str, str]]:
         if len(parts) > 1 and parts[1].lower().startswith("source:"):
             page_url = parts[1].split(":", 1)[1].strip()
         if is_http_url(image_url):
-            out.append({"image_url": image_url, "page_url": page_url, "title": query})
-        if len(out) >= MAX_CANDIDATES:
+            out.append({"image_url": image_url, "page_url": page_url, "title": ""})
+    return out
+
+
+def _propose_query_variants(raw_query: str, intent: str, prefer_domains: Optional[List[str]] = None) -> List[str]:
+    dom_hint = ""
+    if prefer_domains:
+        # Give a gentle nudge; the normalizer may incorporate site:domain
+        dom_hint = "\nprefer domains: " + ", ".join(prefer_domains[:5])
+    prompt = f"intent: {intent}\nraw query: {raw_query}{dom_hint}\nReturn up to 3 improved queries, one per line."
+    r = chat_once(
+        MEDIA_MODEL,
+        [
+            {"role": "system", "content": NORMALIZER_SYSTEM},
+            {"role": "user", "content": prompt}
+        ]
+    )
+    lines = [l.strip() for l in (r.choices[0].message.content or "").splitlines() if l.strip()]
+    # Deduplicate while preserving order
+    seen = set()
+    out = []
+    for q in lines:
+        if q not in seen:
+            out.append(q)
+            seen.add(q)
+        if len(out) >= 3:
             break
     return out
+
+
+def media_search_candidates(query: str, intent: str, prefer_domains: Optional[List[str]] = None) -> List[Dict[str, str]]:
+    """
+    Autonomous search:
+    1) Try raw query once.
+    2) If no IMAGE-lines or the model asked a question, generate up to 3 normalized variants and retry.
+    3) Return first non-empty candidate set (max 3).
+    """
+    # Helper to call the LLM searcher with optional domain hints
+    def _call_searcher(q: str) -> List[Dict[str, str]]:
+        extra = ""
+        if prefer_domains:
+            extra = "\nPrefer domains: " + ", ".join(prefer_domains[:6])
+        txt = chat_once(
+            MEDIA_MODEL,
+            [
+                {"role": "system", "content": SEARCHER_SYSTEM},
+                {"role": "user", "content": f"Query: {q}{extra}"}
+            ]
+        ).choices[0].message.content or ""
+        # If it tried to ask a question, treat as failure and return empty
+        if "?" in txt and "IMAGE:" not in txt:
+            return []
+        cands = _parse_candidates_from_text(txt)
+        # Limit to MAX_CANDIDATES
+        return cands[:MAX_CANDIDATES]
+
+    # 1) Raw query
+    candidates = _call_searcher(query)
+    if candidates:
+        for c in candidates:
+            c["title"] = query
+        return candidates
+
+    # 2) Normalized variants
+    variants = _propose_query_variants(query, intent, prefer_domains)
+    for v in variants:
+        cands = _call_searcher(v)
+        if cands:
+            for c in cands:
+                c["title"] = v
+            return cands
+
+    # 3) Nothing found
+    return []
+
 
 
 def media_pick_best(item_desc: str, candidates: List[Dict[str, str]]) -> str:
