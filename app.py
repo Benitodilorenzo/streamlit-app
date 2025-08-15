@@ -9,14 +9,23 @@ import streamlit as st
 from openai import OpenAI
 
 # =====================================
+# STREAMLIT OPTIONS (avoid inotify issues in web UIs)
+# =====================================
+# Use polling-based file watcher to prevent inotify EMFILE errors in hosted environments
+st.set_option("server.fileWatcherType", "poll")
+st.set_option("server.folderWatchBlacklist", [
+    "/.git/", "/.venv/", "/venv/", "/node_modules/", "/__pycache__/", "/.mypy_cache/"
+])
+
+# =====================================
 # CONFIGURATION
 # =====================================
 APP_TITLE = "🟡 Expert Card Creator — Two-Agent Architecture"
 
 # Environment
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "")
-CHAT_MODEL = os.getenv("OPENAI_CHAT_MODEL", "gpt-5")           # main interview/orchestration agent
-MEDIA_MODEL = os.getenv("OPENAI_MEDIA_MODEL", CHAT_MODEL)         # media agent (can be same)
+CHAT_MODEL = os.getenv("OPENAI_CHAT_MODEL", "gpt-5")             # main interview/orchestration agent
+MEDIA_MODEL = os.getenv("OPENAI_MEDIA_MODEL", CHAT_MODEL)        # media agent (can be same)
 IMAGE_MODEL = os.getenv("OPENAI_IMAGE_MODEL", "gpt-image-1")     # image generation
 
 # Limits & Defaults
@@ -188,7 +197,7 @@ def get_client() -> OpenAI:
         raise RuntimeError("OPENAI_API_KEY is not set. Add it in Streamlit → Settings → Secrets.")
     return OpenAI(api_key=OPENAI_API_KEY)
 
-client = None  # will be set in main
+client: Optional[OpenAI] = None  # will be set in main
 
 # =====================================
 # Tools (Function-Calling) for Chat Agent
@@ -263,7 +272,7 @@ def is_http_url(s: str) -> bool:
 
 def enforce_single_question(text: str) -> str:
     if not text:
-        return text
+        return ""
     parts = re.split(r"[\n\r]|[?]|(?<=\.)\s", text.strip(), maxsplit=1)
     out = parts[0].strip()
     if "?" in text and not out.endswith("?"):
@@ -286,8 +295,11 @@ def chat_once(model: str, messages: List[Dict[str, Any]], tools: Optional[List[D
 
 def media_search_candidates(query: str) -> List[Dict[str, str]]:
     """Use LLM-guided search (no external web APIs here) to output up to 3 formatted candidates."""
-    txt = chat_once(MEDIA_MODEL, [{"role": "system", "content": SEARCHER_SYSTEM},
-                                  {"role": "user", "content": f"Query: {query}"}]).choices[0].message.content or ""
+    txt = chat_once(MEDIA_MODEL, [
+        {"role": "system", "content": SEARCHER_SYSTEM},
+        {"role": "user", "content": f"Query: {query}"}
+    ]).choices[0].message.content or ""
+
     out: List[Dict[str, str]] = []
     for ln in txt.splitlines():
         s = ln.strip()
@@ -312,12 +324,13 @@ def media_pick_best(item_desc: str, candidates: List[Dict[str, str]]) -> str:
     cand_lines = [f"IMAGE: {c['image_url']} | SOURCE: {c.get('page_url','')}" for c in candidates if is_http_url(c["image_url"])]
     if not cand_lines:
         return ""
-    txt = chat_once(MEDIA_MODEL, [{"role": "system", "content": VISION_PICKER_PROMPT},
-                                  {"role": "user", "content": f"ITEM:\n{item_desc}\n\nCANDIDATES:\n" + "\n".join(cand_lines)}]).choices[0].message.content or ""
+    txt = chat_once(MEDIA_MODEL, [
+        {"role": "system", "content": VISION_PICKER_PROMPT},
+        {"role": "user", "content": f"ITEM:\n{item_desc}\n\nCANDIDATES:\n" + "\n".join(cand_lines)}
+    ]).choices[0].message.content or ""
     chosen = txt.strip()
     if chosen.upper() == "NONE":
         return ""
-    # Extract first URL
     m = re.search(r"https?://\S+", chosen)
     return m.group(0) if m and is_http_url(m.group(0)) else ""
 
@@ -332,8 +345,7 @@ def media_generate_image(prompt: str) -> str:
 
 
 def media_agent_handle(payload: Dict[str, Any]) -> Dict[str, Any]:
-    """Implements the Media Agent policy synchronously in host code, guided by MEDIA_AGENT_SYSTEM_PROMPT."""
-    # We will still consult the MEDIA_AGENT_SYSTEM_PROMPT to build a short strategy message for transparency/debug (not sent to LLM here).
+    """Implements the Media Agent policy synchronously in host code."""
     slot_id = payload.get("slot_id", "")
     intent = payload.get("intent", "generic")
     query = payload.get("query", "").strip()
@@ -351,11 +363,9 @@ def media_agent_handle(payload: Dict[str, Any]) -> Dict[str, Any]:
         result["notes"] = "Empty query."
         return result
 
-    # 1) Search up to MAX_CANDIDATES candidates
     candidates = media_search_candidates(query)
     result["candidates"] = candidates
 
-    # 2) Pick best if we have candidates
     if candidates:
         item_desc = f"{intent.title()}: {query}"
         best = media_pick_best(item_desc, candidates)
@@ -365,7 +375,6 @@ def media_agent_handle(payload: Dict[str, Any]) -> Dict[str, Any]:
             result["notes"] = "Picked validated candidate."
             return result
 
-    # 3) If no suitable candidate and intent is generic OR search failed → generate
     if intent == "generic" or not candidates:
         gen_prompt = (
             "Create a clean, stylized icon representing: "
@@ -379,7 +388,6 @@ def media_agent_handle(payload: Dict[str, Any]) -> Dict[str, Any]:
             result["notes"] = "Generated fallback icon."
             return result
 
-    # 4) None
     result["notes"] = "No valid candidate and generation not applied."
     return result
 
@@ -432,157 +440,155 @@ def get_slot(slot_id: str) -> Optional[Dict[str, Any]]:
 
 
 # =====================================
-# Chat Loop Handling (with Function Calling)
+# Chat Loop Handling (Function Calling with correct ordering)
 # =====================================
+
+def append_assistant_with_tool_calls(message_obj) -> List[Dict[str, Any]]:
+    """Append assistant message preserving tool_calls for API pairing. Returns normalized tool_calls list."""
+    content = (message_obj.content or "").strip()
+    tool_calls = getattr(message_obj, "tool_calls", None) or []
+
+    assistant_msg: Dict[str, Any] = {
+        "role": "assistant",
+        "content": enforce_single_question(content) if content else ""
+    }
+    if tool_calls:
+        assistant_msg["tool_calls"] = [
+            {
+                "id": tc.id,
+                "type": "function",
+                "function": {
+                    "name": tc.function.name,
+                    "arguments": tc.function.arguments or "{}"
+                }
+            }
+            for tc in tool_calls
+        ]
+    st.session_state.history.append(assistant_msg)
+
+    if assistant_msg["content"].endswith("?"):
+        st.session_state.agent_budget = max(0, st.session_state.agent_budget - 1)
+
+    # Return simple list for iteration
+    return [
+        {
+            "id": tc.id,
+            "name": tc.function.name,
+            "arguments": tc.function.arguments or "{}"
+        }
+        for tc in tool_calls
+    ]
+
+
+def handle_tool_call(tc_dict: Dict[str, Any]):
+    name = tc_dict["name"]
+    args = json.loads(tc_dict["arguments"]) if tc_dict.get("arguments") else {}
+
+    if name == "MEDIA_REQUEST":
+        slot_id = args.get("slot_id") or str(uuid.uuid4())[:8]
+        intent = args.get("intent", "generic")
+        query = args.get("query", "")
+        constraints = args.get("constraints", {})
+
+        slot = get_slot(slot_id)
+        if slot is None:
+            slot = {
+                "slot_id": slot_id,
+                "label": "",
+                "bullets": [],
+                "media": {"status": "pending", "best_image_url": "", "candidates": []},
+                "done": False
+            }
+            st.session_state.slots.append(slot)
+
+        media_payload = {
+            "slot_id": slot_id,
+            "intent": intent,
+            "query": query,
+            "constraints": constraints
+        }
+        media_result = media_agent_handle(media_payload)
+
+        # Persist into slot
+        slot["media"]["status"] = media_result.get("status", "none")
+        slot["media"]["best_image_url"] = media_result.get("best_image_url", "")
+        slot["media"]["candidates"] = media_result.get("candidates", [])
+
+        # Post tool result message immediately after assistant(with tool_calls)
+        st.session_state.history.append({
+            "role": "tool",
+            "tool_call_id": tc_dict["id"],
+            "name": "MEDIA_REQUEST",
+            "content": json.dumps(media_result)
+        })
+
+    elif name == "FINALIZE_CARD":
+        notes = args.get("notes", [])
+        # Map notes into slots (create if missing)
+        for note in notes:
+            label = (note.get("label") or "").strip()
+            bullets = [b.strip() for b in note.get("bullets", []) if b and b.strip()]
+            matched = None
+            for s in st.session_state.slots:
+                if not s.get("label"):
+                    matched = s
+                    break
+            if matched is None:
+                matched = {
+                    "slot_id": str(uuid.uuid4())[:8],
+                    "label": "",
+                    "bullets": [],
+                    "media": {"status": "pending", "best_image_url": "", "candidates": []},
+                    "done": False
+                }
+                st.session_state.slots.append(matched)
+            matched["label"] = label
+            matched["bullets"] = bullets
+            matched["done"] = True
+
+        final_lines = finalize_card_from_notes(notes)
+        st.session_state.final_lines = final_lines
+        st.session_state.finalized = True
+
+        st.session_state.history.append({
+            "role": "tool",
+            "tool_call_id": tc_dict["id"],
+            "name": "FINALIZE_CARD",
+            "content": json.dumps({"ok": True, "labels": list(final_lines.keys())})
+        })
+
 
 def run_chat_turn(user_text: Optional[str] = None):
     # Append user message if present
     if user_text:
         st.session_state.history.append({"role": "user", "content": user_text})
 
-    # Make a model call with tools enabled
+    # FIRST CALL
     res = chat_once(
         CHAT_MODEL,
-        [m for m in st.session_state.history if m["role"] != "system" or m is st.session_state.history[0]],
+        st.session_state.history,  # includes single system at index 0
         tools=CHAT_TOOLS,
         tool_choice="auto"
     )
-
     msg = res.choices[0].message
-    content = msg.content or ""
-    tool_calls = getattr(msg, "tool_calls", None) or []
+    pending = append_assistant_with_tool_calls(msg)  # append assistant (with tool_calls)
 
-    # If the assistant wrote something, enforce single question line
-    if content and content.strip():
-        enforced = enforce_single_question(content)
-        st.session_state.history.append({"role": "assistant", "content": enforced})
-        # Decrement budget if it's a question turn
-        if enforced.endswith("?"):
-            st.session_state.agent_budget = max(0, st.session_state.agent_budget - 1)
-
-    # Handle tool calls (MEDIA_REQUEST, FINALIZE_CARD)
-    for tc in tool_calls:
-        fname = tc.function.name
-        fargs = json.loads(tc.function.arguments or "{}")
-
-        if fname == "MEDIA_REQUEST":
-            # Ensure slot exists
-            slot_id = fargs.get("slot_id") or str(uuid.uuid4())[:8]
-            intent = fargs.get("intent", "generic")
-            query = fargs.get("query", "")
-            constraints = fargs.get("constraints", {})
-            # Create slot if missing
-            slot = get_slot(slot_id)
-            if slot is None:
-                slot = {
-                    "slot_id": slot_id,
-                    "label": "",  # set by agent via later notes/finalize
-                    "bullets": [],
-                    "media": {"status": "pending", "best_image_url": "", "candidates": []},
-                    "done": False
-                }
-                st.session_state.slots.append(slot)
-
-            # Dispatch synchronously to media agent
-            media_payload = {
-                "slot_id": slot_id,
-                "intent": intent,
-                "query": query,
-                "constraints": constraints
-            }
-            media_result = media_agent_handle(media_payload)
-
-            # Persist result into slot
-            slot["media"]["status"] = media_result.get("status", "none")
-            slot["media"]["best_image_url"] = media_result.get("best_image_url", "")
-            slot["media"]["candidates"] = media_result.get("candidates", [])
-
-            # Post tool result back to the chat (so the agent can proceed)
-            st.session_state.history.append({
-                "role": "tool",
-                "tool_call_id": tc.id,
-                "name": "MEDIA_REQUEST",
-                "content": json.dumps(media_result)
-            })
-
-            # Follow-up model call so the agent can continue after tool
-            res2 = chat_once(
-                CHAT_MODEL,
-                [m for m in st.session_state.history if m["role"] != "system" or m is st.session_state.history[0]],
-                tools=CHAT_TOOLS,
-                tool_choice="auto"
-            )
-            msg2 = res2.choices[0].message
-            content2 = msg2.content or ""
-            tcs2 = getattr(msg2, "tool_calls", None) or []
-            if content2.strip():
-                enforced2 = enforce_single_question(content2)
-                st.session_state.history.append({"role": "assistant", "content": enforced2})
-                if enforced2.endswith("?"):
-                    st.session_state.agent_budget = max(0, st.session_state.agent_budget - 1)
-            # handle cascaded tool calls (rare but possible)
-            for tc2 in tcs2:
-                if tc2.function.name == "FINALIZE_CARD":
-                    # handled below in unified code path; we just attach and handle after loop
-                    pass
-                elif tc2.function.name == "MEDIA_REQUEST":
-                    # Re-dispatch immediately (recursive handling). To avoid deep nesting, handle one level only here.
-                    args2 = json.loads(tc2.function.arguments or "{}")
-                    media_result2 = media_agent_handle(args2)
-                    st.session_state.history.append({
-                        "role": "tool",
-                        "tool_call_id": tc2.id,
-                        "name": "MEDIA_REQUEST",
-                        "content": json.dumps(media_result2)
-                    })
-                    # final follow-up after the second media call
-                    res3 = chat_once(
-                        CHAT_MODEL,
-                        [m for m in st.session_state.history if m["role"] != "system" or m is st.session_state.history[0]],
-                        tools=CHAT_TOOLS,
-                        tool_choice="auto"
-                    )
-                    msg3 = res3.choices[0].message
-                    content3 = msg3.content or ""
-                    if content3.strip():
-                        enforced3 = enforce_single_question(content3)
-                        st.session_state.history.append({"role": "assistant", "content": enforced3})
-                        if enforced3.endswith("?"):
-                            st.session_state.agent_budget = max(0, st.session_state.agent_budget - 1)
-
-        if fname == "FINALIZE_CARD":
-            notes = fargs.get("notes", [])
-            # Store labels into slots where possible
-            for note in notes:
-                label = note.get("label", "").strip()
-                bullets = [b.strip() for b in note.get("bullets", []) if b.strip()]
-                # map by order; if label exists, update; otherwise append a new slot
-                matched = None
-                for s in st.session_state.slots:
-                    if not s.get("label"):
-                        matched = s
-                        break
-                if matched is None:
-                    matched = {"slot_id": str(uuid.uuid4())[:8], "label": "", "bullets": [], "media": {"status": "pending", "best_image_url": "", "candidates": []}, "done": False}
-                    st.session_state.slots.append(matched)
-                matched["label"] = label
-                matched["bullets"] = bullets
-                matched["done"] = True
-
-            # Host finalization (text lines)
-            final_lines = finalize_card_from_notes(notes)
-            st.session_state.final_lines = final_lines
-            st.session_state.finalized = True
-
-            # Reply back to tool call
-            st.session_state.history.append({
-                "role": "tool",
-                "tool_call_id": tc.id,
-                "name": "FINALIZE_CARD",
-                "content": json.dumps({"ok": True, "labels": list(final_lines.keys())})
-            })
-
-    # Stop if budget exhausted (agent will likely have called FINALIZE_CARD itself; otherwise we could force it here)
+    # Loop through tool-calls until none remain
+    # Each iteration: handle all tool calls → follow-up model call → append assistant w/ tool_calls
+    loop_guard = 0
+    while pending and loop_guard < 5:  # safety guard against runaway loops
+        for tc in pending:
+            handle_tool_call(tc)
+        # Follow-up call so the agent can continue after tools
+        res_next = chat_once(
+            CHAT_MODEL,
+            st.session_state.history,
+            tools=CHAT_TOOLS,
+            tool_choice="auto"
+        )
+        msg_next = res_next.choices[0].message
+        pending = append_assistant_with_tool_calls(msg_next)
+        loop_guard += 1
 
 # =====================================
 # UI RENDERING
@@ -614,9 +620,8 @@ def render_chat():
     for m in st.session_state.history:
         if m["role"] == "system":
             continue
-        # hide backend tool noise from user; only show assistant/user text
-        if m["role"] in ("tool",):
-            continue
+        if m["role"] == "tool":
+            continue  # hide backend tool messages
         with st.chat_message(m["role"]):
             st.markdown(m["content"]) 
 
@@ -627,7 +632,6 @@ def render_final_card():
     if not st.session_state.final_lines:
         return
     st.subheader("Your Expert Card")
-    # Render in the order of slots when possible
     for s in st.session_state.slots[:MAX_SLOTS]:
         label = s.get("label", "").strip()
         if not label:
