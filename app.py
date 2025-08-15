@@ -131,56 +131,76 @@ def mark_slot_done_and_advance():
         st.session_state.phase = "discovery"
 
 # =========================================================
-# TOOLS (Function Calls)
+# TOOLS (Function Calls)  — CORRECT SCHEMA
 # =========================================================
 TOOLS = [
     {
-        "name": "save_slot",
-        "description": "Create or update a slot with a label and 2–4 concise bullets.",
-        "parameters": {
-            "type":"object",
-            "properties":{
-                "slot_id":{"type":"string","description":"S1..S4"},
-                "label":{"type":"string"},
-                "bullets":{"type":"array","items":{"type":"string"},"minItems":2,"maxItems":4}
-            },
-            "required":["slot_id","label","bullets"]
+        "type": "function",
+        "function": {
+            "name": "save_slot",
+            "description": "Create or update a slot with a label and 2–4 concise bullets.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "slot_id": {"type": "string", "description": "S1..S4"},
+                    "label": {"type": "string"},
+                    "bullets": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                        "minItems": 2,
+                        "maxItems": 4
+                    }
+                },
+                "required": ["slot_id", "label", "bullets"]
+            }
         }
     },
     {
-        "name": "schedule_media_search",
-        "description": "Schedule async image search for a public item (book/podcast/person/tool/film). Returns a job_id immediately.",
-        "parameters": {
-            "type":"object",
-            "properties":{
-                "slot_id":{"type":"string"},
-                "entity_type":{"type":"string","enum":["book","podcast","person","tool","film"]},
-                "entity_name":{"type":"string","description":"Title + optional author/brand/year"},
-                "prefer_domains":{"type":"array","items":{"type":"string"}}
-            },
-            "required":["slot_id","entity_type","entity_name"]
+        "type": "function",
+        "function": {
+            "name": "schedule_media_search",
+            "description": "Schedule async image search for a public item (book/podcast/person/tool/film). Returns a job_id immediately.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "slot_id": {"type": "string"},
+                    "entity_type": {"type": "string", "enum": ["book","podcast","person","tool","film"]},
+                    "entity_name": {"type": "string", "description": "Title + optional author/brand/year"},
+                    "prefer_domains": {"type": "array", "items": {"type": "string"}}
+                },
+                "required": ["slot_id", "entity_type", "entity_name"]
+            }
         }
     },
     {
-        "name": "finalize_card",
-        "description": "Produce the 4 final labeled lines (1–2 sentences each) from collected notes.",
-        "parameters": {
-            "type":"object",
-            "properties":{
-                "notes":{
-                    "type":"array",
-                    "items":{
-                        "type":"object",
-                        "properties":{
-                            "label":{"type":"string"},
-                            "bullets":{"type":"array","items":{"type":"string"},"minItems":2,"maxItems":4}
+        "type": "function",
+        "function": {
+            "name": "finalize_card",
+            "description": "Produce the 4 final labeled lines (1–2 sentences each) from collected notes.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "notes": {
+                        "type": "array",
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "label": {"type": "string"},
+                                "bullets": {
+                                    "type": "array",
+                                    "items": {"type": "string"},
+                                    "minItems": 2,
+                                    "maxItems": 4
+                                }
+                            },
+                            "required": ["label", "bullets"]
                         },
-                        "required":["label","bullets"]
-                    },
-                    "minItems":4,"maxItems":4
-                }
-            },
-            "required":["notes"]
+                        "minItems": 4,
+                        "maxItems": 4
+                    }
+                },
+                "required": ["notes"]
+            }
         }
     }
 ]
