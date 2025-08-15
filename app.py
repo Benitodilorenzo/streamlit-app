@@ -1,5 +1,9 @@
 # app_expert_card_gpt5.py
 # Single-file Streamlit Demo (GPT-5, Async Media, Function Calls, Streaming)
+# Fixes:
+# - Orchestrator is created AFTER init_state() (no session_state KeyError)
+# - No reasoning parameters (no "nachdenken"): we do NOT send reasoning_effort/verbosity
+# - Clean streaming fallback
 
 import os, re, uuid, urllib.parse, requests
 from typing import List, Dict, Any, Optional, Tuple
@@ -30,10 +34,6 @@ PREFER = {
 
 MEDIA_DIR = os.path.join(os.getcwd(), "media")
 os.makedirs(MEDIA_DIR, exist_ok=True)
-
-# GPT-5 optionale Regler (standardmäßig AUS – wir stabilisieren NICHT)
-REASONING_EFFORT = os.getenv("OPENAI_REASONING_EFFORT")  # "low"|"medium"|"high" oder None
-VERBOSITY        = os.getenv("OPENAI_VERBOSITY")         # "low"|"default"|"high" oder None
 
 # =========================================================
 # OPENAI CLIENT
@@ -408,7 +408,7 @@ def rank_candidates(entity_name: str, entity_type: str, cands: List[Dict[str,Any
     return sorted(cands, key=score, reverse=True)
 
 def vision_validate_if_needed(entity_name: str, entity_type: str, ranked: List[Dict[str,Any]]) -> List[Dict[str,Any]]:
-    # Optionaler Hook: Vision-LLM für Top-2 (z. B. Titelerkennung). Standard: aus.
+    # Optionaler Hook: Vision-LLM für Top-2 (Titelerkennung etc.). Standard: aus.
     return ranked
 
 def resolve_media(entity_type: str, entity_name: str, prefer_domains: Optional[List[str]] = None) -> Dict[str,Any]:
@@ -473,6 +473,7 @@ def save_uploaded_image(file, slot_id: str) -> str:
 # =========================================================
 class Orchestrator:
     def __init__(self):
+        # Access AFTER init_state()
         self.slots: Dict[str, Dict[str,Any]] = st.session_state.slots
         self.media_jobs: Dict[str, Tuple[str, Future]] = st.session_state.media_jobs
         self.executor: ThreadPoolExecutor = st.session_state.executor
@@ -532,8 +533,6 @@ class Orchestrator:
             del self.media_jobs[job_id]
         return ready_slots
 
-orchestrator = Orchestrator()
-
 # =========================================================
 # CHAT (Streaming + Function Calls)
 # =========================================================
@@ -546,7 +545,7 @@ def build_messages(user_text: Optional[str]) -> List[Dict[str,Any]]:
         msgs.append({"role":"user","content": user_text})
     return msgs
 
-def handle_tool_calls(tool_calls: List[Any]):
+def handle_tool_calls(tool_calls: List[Any], orchestrator: Orchestrator):
     for tc in tool_calls:
         name = tc.get("name") or tc.get("function",{}).get("name")
         args_str = tc.get("arguments") or tc.get("function",{}).get("arguments") or "{}"
@@ -567,14 +566,7 @@ def handle_tool_calls(tool_calls: List[Any]):
         elif name == "finalize_card":
             orchestrator.finalize_card(args.get("notes",[]))
 
-def _add_gpt5_overrides(kwargs: Dict[str,Any]) -> Dict[str,Any]:
-    extra = {}
-    if REASONING_EFFORT: extra["reasoning_effort"] = REASONING_EFFORT
-    if VERBOSITY:        extra["verbosity"] = VERBOSITY
-    if extra: kwargs.update(extra)
-    return kwargs
-
-def chat_once_stream(user_text: Optional[str]) -> str:
+def chat_once_stream(user_text: Optional[str], orchestrator: Orchestrator) -> str:
     msgs = build_messages(user_text)
     model = os.getenv("OPENAI_CHAT_MODEL","gpt-5")
 
@@ -583,13 +575,12 @@ def chat_once_stream(user_text: Optional[str]) -> str:
         stream_area = container.empty()
         acc = ""
         try:
-            kwargs = _add_gpt5_overrides({
-                "model": model,
-                "messages": msgs,
-                "tools": TOOLS,
-                "tool_choice": "auto"
-            })
-            with client.chat.completions.stream(**kwargs) as stream:
+            with client.chat.completions.stream(
+                model=model,
+                messages=msgs,
+                tools=TOOLS,
+                tool_choice="auto"
+            ) as stream:
                 for event in stream:
                     if event.type == "token":
                         acc += event.token
@@ -602,18 +593,17 @@ def chat_once_stream(user_text: Optional[str]) -> str:
                 handle_tool_calls([{
                     "name": tc.function.name,
                     "arguments": tc.function.arguments
-                } for tc in tool_calls])
+                } for tc in tool_calls], orchestrator)
                 return acc or (msg.content or "")
         except Exception:
             pass  # Fallback unten
 
-    kwargs = _add_gpt5_overrides({
-        "model": model,
-        "messages": msgs,
-        "tools": TOOLS,
-        "tool_choice": "auto"
-    })
-    res = client.chat.completions.create(**kwargs)
+    res = client.chat.completions.create(
+        model=model,
+        messages=msgs,
+        tools=TOOLS,
+        tool_choice="auto"
+    )
     msg = res.choices[0].message
     content = msg.content or ""
     with st.chat_message("assistant"):
@@ -622,7 +612,7 @@ def chat_once_stream(user_text: Optional[str]) -> str:
     handle_tool_calls([{
         "name": tc.function.name,
         "arguments": tc.function.arguments
-    } for tc in tool_calls])
+    } for tc in tool_calls], orchestrator)
     return content
 
 # =========================================================
@@ -703,7 +693,8 @@ st.title(APP_TITLE)
 st.caption("GPT-5 • Streaming Chat • Async Media Search (Books/OpenLibrary/Wikipedia/iTunes; Google CSE fallback)")
 
 client = get_client()
-init_state()
+init_state()                    # <-- ensure session_state keys exist
+orchestrator = Orchestrator()   # <-- create AFTER init_state()
 
 # Poll Media Jobs (nicht-blockierend)
 ready = orchestrator.poll_media_jobs()
@@ -724,7 +715,7 @@ if not any(m["role"] == "assistant" for m in st.session_state.history):
 user_text = st.chat_input("Deine Antwort…")
 if user_text:
     st.session_state.history.append({"role":"user","content": user_text})
-    reply = chat_once_stream(None)  # user_text ist bereits in build_messages enthalten
+    reply = chat_once_stream(None, orchestrator)  # user_text ist bereits in history
     if reply:
         st.session_state.history.append({"role":"assistant","content": reply})
     st.rerun()
