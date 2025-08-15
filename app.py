@@ -451,7 +451,11 @@ def media_agent_handle(payload: Dict[str, Any]) -> Dict[str, Any]:
         result["notes"] = "Empty query."
         return result
 
-    candidates = media_search_candidates(query)
+    prefer_domains = []
+    cons = payload.get("constraints") or {}
+    if isinstance(cons, dict) and cons.get("prefer_domains"):
+        prefer_domains = [d for d in cons["prefer_domains"] if isinstance(d, str)]
+    candidates = media_search_candidates(query, intent, prefer_domains)
     result["candidates"] = candidates
 
     if candidates:
