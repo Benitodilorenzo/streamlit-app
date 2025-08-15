@@ -1,9 +1,9 @@
 # app_expert_card_gpt5.py
 # Single-file Streamlit Demo (GPT-5, Async Media, Function Calls, Streaming)
 # Fixes:
-# - Orchestrator is created AFTER init_state() (no session_state KeyError)
-# - No reasoning parameters (no "nachdenken"): we do NOT send reasoning_effort/verbosity
-# - Clean streaming fallback
+# - Remove tool_calls from few-shot examples (the API error 400 came from that)
+# - Orchestrator created AFTER init_state()
+# - No GPT-5 reasoning params (no "Nachdenken"): we do NOT send reasoning_effort/verbosity
 
 import os, re, uuid, urllib.parse, requests
 from typing import List, Dict, Any, Optional, Tuple
@@ -67,11 +67,13 @@ def push_core_policy():
     core_policy = (
         "ROLE\n"
         "You are the Interview & Orchestration agent. Your job is to craft a 4-item Expert Card.\n\n"
+        "TOOLS\n"
+        "- Tools available: save_slot, schedule_media_search, finalize_card.\n"
+        "- If the item is public (book/podcast/person/tool/film), call schedule_media_search.\n"
+        "- If the item is conceptual/private (practice/principle/contrarian), do NOT call media search.\n\n"
         "RULES\n"
         "- Ask exactly ONE short question per turn.\n"
         "- Do not ask for confirmations the user already gave; assume and proceed.\n"
-        "- If the item is public (book, podcast, person, tool, film), call schedule_media_search.\n"
-        "- If the item is conceptual or private (practice, principle, contrarian view), do NOT call media search.\n"
         "- When a slot is ready, call save_slot(slot_id, label, bullets = 2–4 concise facts).\n"
         "- Stop at 4 slots; then call finalize_card(notes).\n\n"
         "TONE\n"
@@ -90,74 +92,26 @@ def phase_prompt() -> str:
     return "GOAL (Finalize)\nThere are 4 slots. Produce 4 labeled lines (1–2 sentences each), specific and grounded in the notes. Call finalize_card(notes)."
 
 def few_shots_for_phase() -> List[Dict[str,Any]]:
+    """Few-shots WITHOUT tool_calls. We keep them linguistic only;
+       the model will decide to call tools based on the system prompt + tools schema."""
     ph = st.session_state.phase
     shots: List[Dict[str,Any]] = []
     if ph == "discovery":
         # Buch
         shots.append({"role":"user","content":"Data-Inspired von Sebastian Wernicke."})
-        shots.append({
-            "role":"assistant",
-            "content":"Welcher Aspekt daraus hat deine Praxis am stärksten verändert?",
-            "tool_calls":[{"name":"schedule_media_search","arguments":{
-                "slot_id":"S1",
-                "entity_type":"book",
-                "entity_name":"Data-Inspired — Sebastian Wernicke",
-                "prefer_domains":PREFER["book"]
-            }}]
-        })
+        shots.append({"role":"assistant","content":"Welcher Aspekt daraus hat deine Praxis am stärksten verändert?"})
         # Podcast
         shots.append({"role":"user","content":"Ich höre Hard Fork am meisten."})
-        shots.append({
-            "role":"assistant",
-            "content":"Welche Folge würdest du Einsteiger*innen zuerst empfehlen – und warum?",
-            "tool_calls":[{"name":"schedule_media_search","arguments":{
-                "slot_id":"S1",
-                "entity_type":"podcast",
-                "entity_name":"Hard Fork — The New York Times",
-                "prefer_domains":PREFER["podcast"]
-            }}]
-        })
+        shots.append({"role":"assistant","content":"Welche Folge würdest du Einsteiger*innen zuerst empfehlen – und warum?"})
     elif ph == "deepening":
         shots.append({"role":"user","content":"Ich bin geduldiger in AI-Trainings geworden."})
         shots.append({"role":"assistant","content":"An welcher Stelle im Training sparst du dadurch heute am meisten Friktion?"})
         shots.append({"role":"user","content":"Lieblingsfilm: Arrival."})
-        shots.append({
-            "role":"assistant",
-            "content":"Was nimmst du aus Arrival mit, das sich in deiner Arbeit tatsächlich zeigt?",
-            "tool_calls":[{"name":"schedule_media_search","arguments":{
-                "slot_id":"S2",
-                "entity_type":"film",
-                "entity_name":"Arrival (2016)",
-                "prefer_domains":PREFER["film"]
-            }}]
-        })
+        shots.append({"role":"assistant","content":"Was nimmst du aus Arrival mit, das sich in deiner Arbeit tatsächlich zeigt?"})
     elif ph == "consolidation":
-        shots.append({
-            "role":"assistant",
-            "content":"Wen folgst du aktuell, um bei Datenstrategie frisch zu bleiben? Nur ein Name.",
-            "tool_calls":[{"name":"save_slot","arguments":{
-                "slot_id":"S1",
-                "label":"Must-Read",
-                "bullets":[
-                    "Data-Inspired — Sebastian Wernicke",
-                    "Daten leiten, Kontext entscheidet; keine Kennzahlen-Folklore",
-                    "Kürzere Hypothesen-Loops in Workshops"
-                ]
-            }}]
-        })
+        shots.append({"role":"assistant","content":"Wem folgst du aktuell, um bei Datenstrategie frisch zu bleiben? Nur ein Name."})
     else:  # finalize
-        shots.append({
-            "role":"assistant",
-            "content":"Danke — ich habe genug Notizen.",
-            "tool_calls":[{"name":"finalize_card","arguments":{
-                "notes":[
-                    {"label":"Must-Read","bullets":["..."]},
-                    {"label":"Podcast","bullets":["..."]},
-                    {"label":"Practice","bullets":["..."]},
-                    {"label":"Contrarian View","bullets":["..."]}
-                ]
-            }}]
-        })
+        shots.append({"role":"assistant","content":"Danke — ich habe genug Notizen."})
     return shots
 
 def current_slot_id() -> str:
@@ -473,7 +427,6 @@ def save_uploaded_image(file, slot_id: str) -> str:
 # =========================================================
 class Orchestrator:
     def __init__(self):
-        # Access AFTER init_state()
         self.slots: Dict[str, Dict[str,Any]] = st.session_state.slots
         self.media_jobs: Dict[str, Tuple[str, Future]] = st.session_state.media_jobs
         self.executor: ThreadPoolExecutor = st.session_state.executor
@@ -500,7 +453,7 @@ class Orchestrator:
         return {"job_id": job_id}
 
     def finalize_card(self, notes: List[Dict[str,Any]]) -> Dict[str,Any]:
-        # Minimaler Finalizer (du kannst hier gpt-5 responses nutzen)
+        # Minimaler Finalizer
         out = {}
         for n in notes[:4]:
             out[n["label"]] = " ".join(n["bullets"])[:220]
@@ -693,8 +646,8 @@ st.title(APP_TITLE)
 st.caption("GPT-5 • Streaming Chat • Async Media Search (Books/OpenLibrary/Wikipedia/iTunes; Google CSE fallback)")
 
 client = get_client()
-init_state()                    # <-- ensure session_state keys exist
-orchestrator = Orchestrator()   # <-- create AFTER init_state()
+init_state()                    # ensure session_state keys exist
+orchestrator = Orchestrator()   # create AFTER init_state()
 
 # Poll Media Jobs (nicht-blockierend)
 ready = orchestrator.poll_media_jobs()
