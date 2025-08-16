@@ -1,7 +1,7 @@
 # app_expert_card_gpt5_3agents_clean.py
 # 3 Agents: Chat (Agent 1) · Search (Agent 2) · Finalize (Agent 3)
 # Debug sichtbar im Frontend: Agent-2 Steps + Google Image Search
-# Nur Debug-/SAFE-Patches; Agent 1 & Agent 2 Prompts wie besprochen.
+# Nur gezielte Fixes: (1) fields für CSE, (2) kurzer Cooldown bei Fehlversuchen
 
 import os, json, time, uuid, random, traceback, requests
 from typing import List, Dict, Any, Optional, Callable
@@ -51,7 +51,7 @@ def call_with_retry(fn: Callable, *args, **kwargs):
         except Exception as e:
             msg = str(e).lower()
             if "rate limit" in msg or "429" in msg:
-                delay = OPENAI_BACKOFF_BASE ** attempt + random.uniform(0, 0.3)
+                delay = OPENAI_MAX_RETRIES ** attempt + random.uniform(0, 0.3)
                 time.sleep(delay)
                 continue
             raise
@@ -73,6 +73,8 @@ def init_state():
     # Debugging
     st.session_state.setdefault("debug_agent2", [])
     st.session_state.setdefault("debug_limit", 80)
+    # Anti-loop cooldown (key -> unix_ts_until_retry)
+    st.session_state.setdefault("cooldown_entities", {})
 
 # ---------- Debug helpers (thread-safe via buffer)
 def debug_emit(event: Dict[str, Any], buffer: Optional[list] = None):
@@ -135,7 +137,7 @@ def next_free_slot() -> Optional[str]:
             return sid
     return None
 
-# ---------- Agent 1 (Interview) — ORIGINAL PROMPT
+# ---------- Agent 1 (Interview) — ORIGINAL PROMPT (nur zuvor vereinbarte Zusatzzeile enthalten)
 AGENT1_SYSTEM = """You are Agent 1 — a warm, incisive interviewer.
 
 ## Identity & Scope
@@ -258,7 +260,7 @@ def agent2_extract_items(last_q: str, user_reply: str, seen_entities: List[str],
         debug_emit({"ev":"extract_error", "error": str(e)}, dbg)
         return {"detected": False, "reason": f"error: {e}", "trace": traceback.format_exc()[:600]}
 
-# ---------- Google CSE: Image Search (SAFE param aus secrets)
+# ---------- Google CSE: Image Search (fields-Fix + image.contextLink Support)
 def google_image_search(query: str, num: int = 4, dbg: Optional[list] = None) -> List[Dict[str, str]]:
     if not GOOGLE_CSE_KEY or not GOOGLE_CSE_CX:
         debug_emit({"ev":"cse_keys_missing", "query": query, "key_set": bool(GOOGLE_CSE_KEY), "cx_set": bool(GOOGLE_CSE_CX)}, dbg)
@@ -268,8 +270,9 @@ def google_image_search(query: str, num: int = 4, dbg: Optional[list] = None) ->
             "q": query,
             "searchType": "image",
             "num": max(1, min(num, 10)),
-            "safe": GOOGLE_CSE_SAFE,  # <- dynamisch aus secrets.toml ("off"/"active")
-            "fields": "items(link,contextLink),error",
+            "safe": GOOGLE_CSE_SAFE,
+            # Wichtig: contextLink ist bei Image-Search unter image.contextLink
+            "fields": "items(link,image/contextLink),error",
             "key": GOOGLE_CSE_KEY,
             "cx": GOOGLE_CSE_CX,
         }
@@ -278,7 +281,6 @@ def google_image_search(query: str, num: int = 4, dbg: Optional[list] = None) ->
         try:
             r.raise_for_status()
         except HTTPError as he:
-            # Debug: HTTP-Fehler + Body (JSON oder Text)
             try:
                 err_json = r.json()
             except Exception:
@@ -293,9 +295,14 @@ def google_image_search(query: str, num: int = 4, dbg: Optional[list] = None) ->
         out = []
         for it in items:
             link = (it.get("link") or "").strip()
-            ctx  = (it.get("contextLink") or "").strip()
-            if link and any(link.lower().endswith(ext) for ext in (".jpg",".jpeg",".png",".webp")):
-                out.append({"url": link, "page_url": ctx})
+            # image.contextLink optional
+            img_ctx = ""
+            try:
+                img_ctx = (it.get("image", {}).get("contextLink") or "").strip()
+            except Exception:
+                img_ctx = ""
+            if link:
+                out.append({"url": link, "page_url": img_ctx})
         debug_emit({"ev":"cse_done", "query": query, "returned": len(out)}, dbg)
         return out
     except Exception as e:
@@ -380,6 +387,8 @@ def agent3_finalize(history: List[Dict[str, str]], slots: Dict[str, Dict[str, An
     return (resp.choices[0].message.content or "").strip()
 
 # ---------- Orchestrator
+COOLDOWN_SECONDS = 600  # 10 Minuten
+
 class Orchestrator:
     def __init__(self):
         if "seen_entities" not in st.session_state:
@@ -388,6 +397,7 @@ class Orchestrator:
         self.jobs = st.session_state.jobs
         self.exec = st.session_state.executor
         self.seen = st.session_state.seen_entities
+        self.cooldown = st.session_state.cooldown_entities  # dict key->ts
 
     def upsert(self, sid: str, label: str, media: Dict[str, Any]):
         s = self.slots.get(sid, {"slot_id": sid, "label": "", "media": {"status": "pending", "best_image_url": "", "candidates": [], "notes": ""}})
@@ -420,6 +430,8 @@ class Orchestrator:
             processed = 0
             results: List[Dict[str, Any]] = []
 
+            now = time.time()
+
             for item in items:
                 if processed >= MAX_SEARCHES_PER_RUN:
                     debug_emit({"ev":"job_cap_reached", "max": MAX_SEARCHES_PER_RUN}, dbg)
@@ -429,6 +441,13 @@ class Orchestrator:
                 if not etype or not ename:
                     continue
                 key = f"{etype}|{ename.lower()}"
+
+                # Cooldown skip
+                retry_after = self.cooldown.get(key, 0)
+                if retry_after and now < retry_after:
+                    debug_emit({"ev":"item_cooldown_skip", "key": key, "retry_after": int(retry_after - now)}, dbg)
+                    continue
+
                 if key in self.seen:
                     debug_emit({"ev":"item_dedupe_skip", "key": key}, dbg)
                     continue
@@ -438,6 +457,9 @@ class Orchestrator:
                 debug_emit({"ev":"item_search_results", "key": key, "n": len(imgs)}, dbg)
 
                 if not imgs:
+                    # set cooldown if no results/error to avoid hammering
+                    self.cooldown[key] = now + COOLDOWN_SECONDS
+                    debug_emit({"ev":"item_set_cooldown", "key": key, "cooldown_s": COOLDOWN_SECONDS}, dbg)
                     continue
 
                 ok_url = ""
@@ -455,8 +477,15 @@ class Orchestrator:
                         debug_emit({"ev":"item_validate_ko", "key": key, "tries": tries, "reason": v.get("reason","")[:160]}, dbg)
 
                 if not ok_url:
+                    # also set cooldown on validation failure
+                    self.cooldown[key] = now + COOLDOWN_SECONDS
                     debug_emit({"ev":"item_no_valid_image", "key": key}, dbg)
+                    debug_emit({"ev":"item_set_cooldown", "key": key, "cooldown_s": COOLDOWN_SECONDS}, dbg)
                     continue
+
+                # success: clear cooldown
+                if key in self.cooldown:
+                    del self.cooldown[key]
 
                 self.seen.append(key)
                 label_hint = {
