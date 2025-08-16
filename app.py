@@ -2,7 +2,7 @@
 # 3 Agents: Chat (Agent 1) · Search (Agent 2) · Finalize (Agent 3)
 # GPT-5 (Responses API) with hosted web_search_preview; async Agent 2 jobs.
 
-import os, json, time, uuid, math, random, traceback
+import os, json, time, uuid, random, traceback
 from typing import List, Dict, Any, Optional, Tuple, Callable
 from concurrent.futures import ThreadPoolExecutor, Future
 
@@ -13,12 +13,12 @@ from openai import APIStatusError
 
 APP_TITLE = "🟡 Expert Card — GPT-5 (3 Agents · Hosted Web Search · Async)"
 MODEL = os.getenv("OPENAI_GPT5_SNAPSHOT", "gpt-5-2025-08-07")
+AGENT2_MODEL = os.getenv("OPENAI_AGENT2_MODEL", "gpt-4o-mini")  # schlank für Agent 2
 MEDIA_DIR = os.path.join(os.getcwd(), "media")
 os.makedirs(MEDIA_DIR, exist_ok=True)
 
 # ---- Token/Cost controls
 MAX_SEARCHES_PER_RUN = 1         # Agent 2: cap per turn
-AGENT2_MODEL = os.getenv("OPENAI_AGENT2_MODEL", "gpt-4o-mini")  # cheaper/smaller model for Agent 2
 OPENAI_MAX_RETRIES = 3           # Retry count for rate limits / 5xx
 OPENAI_BACKOFF_BASE = 1.8        # Exponential backoff base
 
@@ -65,13 +65,6 @@ def init_state():
     st.session_state.setdefault("web_search_err", "")
     st.session_state.setdefault("used_openers", set())
     st.session_state.setdefault("auto_finalized", False)
-    st.session_state.setdefault("debug_agent2", [])           # store last N debug entries
-
-def debug_log_agent2(entry: Dict[str, Any]):
-    # Keep last 15 entries
-    st.session_state.debug_agent2.append(entry)
-    if len(st.session_state.debug_agent2) > 15:
-        st.session_state.debug_agent2 = st.session_state.debug_agent2[-15:]
 
 # ---------- Utils
 def parse_json_loose(text: str) -> Optional[dict]:
@@ -93,6 +86,7 @@ def parse_json_loose(text: str) -> Optional[dict]:
     return None
 
 def placeholder_image(text: str, name: str) -> str:
+    # (Nur noch optional in Overrides genutzt; Agent 2 legt keine Placeholder mehr an)
     img = Image.new("RGB", (640, 640), (24, 31, 55))
     d = ImageDraw.Draw(img)
     for r, c in [(260, (57, 96, 199)), (200, (73, 199, 142)), (140, (255, 205, 86))]:
@@ -125,7 +119,7 @@ def preflight():
     try:
         _ = call_with_retry(
             client().responses.create,
-            model=AGENT2_MODEL,  # cheaper preflight
+            model=AGENT2_MODEL,  # günstiger Preflight
             input=[{"role": "user", "content": "Return JSON: {\"ok\":true}"}],
             tools=[{"type": "web_search_preview"}],
             parallel_tool_calls=False,
@@ -258,29 +252,13 @@ def agent2_detect_and_search_multi(last_q: str, user_reply: str, seen_entities: 
             parallel_tool_calls=False,
             store=False
         )
-
         raw_text = getattr(resp, "output_text", "") or ""
         data = parse_json_loose(raw_text)
-        # Debug to sidebar
-        dbg = {
-            "status": "raw",
-            "assistant_question": last_q[:120],
-            "user_reply": user_reply[:120],
-            "seen_entities": seen_entities,
-            "raw_len": len(raw_text),
-            "raw_preview": raw_text[:500],
-        }
-        debug_log_agent2(dbg)
-
         if isinstance(data, dict):
-            debug_log_agent2({"status":"parsed", "json": data})
             return data
-
-        debug_log_agent2({"status":"no-parse"})
         return {"detected": False, "reason": "no-parse"}
     except Exception as e:
-        debug_log_agent2({"status":"error", "error": str(e), "trace": traceback.format_exc()[:800]})
-        return {"detected": False, "reason": f"error: {e}"}
+        return {"detected": False, "reason": f"error: {e}", "trace": traceback.format_exc()[:600]}
 
 # ---------- Agent 3 (Finalizer)
 FINALIZER_SYSTEM = """You are Agent 3 — Finalizer.
@@ -361,12 +339,20 @@ class Orchestrator:
                 etype = (item.get("entity_type") or "").lower().strip()
                 ename = (item.get("entity_name") or "").strip()
                 action = (item.get("action") or "").strip()
-                if not etype or not ename:
+                url = (item.get("url") or "").strip()
+                page = (item.get("page_url") or "").strip()
+                src = (item.get("source") or "").strip()
+                conf = float(item.get("confidence") or 0.0) if "confidence" in item else 0.0
+                rsn = (item.get("reason") or "").strip()
+
+                # STRICT: Only create a slot if a REAL SEARCH happened AND we have a direct image URL
+                if action != "searched" or not url:
                     continue
 
                 key = f"{etype}|{ename.lower()}"
                 if key in self.seen:
                     continue
+                # Mark seen ONLY when we actually create a slot (prevents "invisible" dedupe)
                 self.seen.append(key)
 
                 label_hint = {
@@ -378,18 +364,11 @@ class Orchestrator:
                 }.get(etype, "Item")
                 label = f"{label_hint} — {ename}"
 
-                url = (item.get("url") or "").strip()
-                page = (item.get("page_url") or "").strip()
-                src = (item.get("source") or "").strip()
-                conf = float(item.get("confidence") or 0.0) if "confidence" in item else 0.0
-                rsn = (item.get("reason") or "").strip()
-
-                # IMPORTANT: Even if no image (detected_no_search), we still create the slot with a placeholder.
                 media = {
-                    "status": "found" if (action == "searched" and url) else ("pending" if action == "detected_no_search" else "skipped"),
-                    "best_image_url": url or (placeholder_image(ename or etype, "tmp") if action != "skipped_duplicate" else ""),
-                    "candidates": ([{"url": url, "page_url": page, "source": src, "confidence": conf, "reason": rsn}] if url else []),
-                    "notes": rsn or (action if action else "")
+                    "status": "found",
+                    "best_image_url": url,
+                    "candidates": [{"url": url, "page_url": page, "source": src, "confidence": conf, "reason": rsn}],
+                    "notes": rsn
                 }
 
                 sid = next_free_slot()
@@ -409,21 +388,12 @@ class Orchestrator:
                 try:
                     res = fut.result()
                 except Exception as e:
-                    debug_log_agent2({"status":"poll-exception", "error": str(e)})
                     continue
-
-                debug_log_agent2({"status":"poll-result", "result": res})
-
                 if res.get("status") == "batch":
                     for it in res.get("items", []):
                         if it.get("status") == "ok":
                             self.upsert(it["sid"], it["label"], it["media"])
                             updated.append(it["sid"])
-                elif res.get("status") in ("skip", "full"):
-                    # Show in sidebar for transparency
-                    debug_log_agent2({"status":"poll-info", "info": res.get("status")})
-                elif res.get("status") == "error":
-                    debug_log_agent2({"status":"poll-error", "error": res.get("error"), "trace": res.get("trace")})
         for jid in rm:
             del self.jobs[jid]
         return updated
@@ -485,23 +455,21 @@ def render_overrides():
                     except Exception:
                         st.error("Could not read image.")
 
-def render_debug_sidebar():
-    st.sidebar.header("🔍 Agent 2 Debug")
-    if st.session_state.debug_agent2:
-        for entry in reversed(st.session_state.debug_agent2):
-            st.sidebar.json(entry, expanded=False)
-    else:
-        st.sidebar.caption("No Agent-2 events yet.")
-
 # ---------- Main
 st.set_page_config(page_title=APP_TITLE, page_icon="🟡", layout="wide")
 st.title(APP_TITLE)
-st.caption("Pure prompt orchestration • Hosted Web Search via Responses API • Agent 2: JSON-only, 1 search max, de-dupe")
+st.caption("Pure prompt orchestration • Hosted Web Search via Responses API • Agent 2: strict slots only on real search hits")
 
 init_state()
 preflight()
 if st.session_state.web_search_ok is False:
     st.error(f"Hosted web_search not available: {st.session_state.web_search_err}")
+
+# --- FIRST OPENER (moved up & rerun so it appears immediately)
+if not st.session_state.history:
+    opener = agent1_next_question([])
+    st.session_state.history.append({"role": "assistant", "content": opener})
+    st.rerun()
 
 orch = Orchestrator()
 
@@ -512,19 +480,13 @@ for sid in orch.poll():
 # Render UI
 render_slots()
 render_history()
-render_debug_sidebar()
 
-# Auto-finalize fallback: if 4 slots filled and not yet finalized, run Agent 3
+# Auto-finalize fallback: finalize automatically when 4 slots are filled (optional)
 if not st.session_state.auto_finalized:
     if all(sid in st.session_state.slots and (st.session_state.slots[sid].get("label") or "").strip() for sid in st.session_state.order):
         st.session_state.final_text = agent3_finalize(st.session_state.history, st.session_state.slots)
         st.session_state.auto_finalized = True
         st.toast("✅ Auto-finalized your Expert Card.", icon="✨")
-
-# First opener from Agent 1
-if not st.session_state.history:
-    opener = agent1_next_question([])
-    st.session_state.history.append({"role": "assistant", "content": opener})
 
 # Input handling
 user_text = st.chat_input("Your turn…")
@@ -545,7 +507,7 @@ if user_text:
     nxt = agent1_next_question(st.session_state.history)
     st.session_state.history.append({"role": "assistant", "content": nxt})
 
-    # Optional: handoff phrase trigger if Agent 1 ever uses it
+    # Optional handoff-phrase trigger (falls Agent 1 es mal sagt)
     if "assemble your 4-point card now" in nxt.lower() or "assemble your 4-point" in nxt.lower():
         st.session_state.final_text = agent3_finalize(st.session_state.history, st.session_state.slots)
         st.session_state.auto_finalized = True
