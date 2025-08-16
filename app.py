@@ -1,12 +1,12 @@
 # app_expert_card_gpt5_3agents_clean.py
 # 3 Agents: Chat (Agent 1) · Search (Agent 2) · Finalize (Agent 3)
-# Änderungen:
-# - Debug-Funktionen vorhanden, aber deaktiviert (kein Aufruf ins UI)
-# - Media Overrides entfernt
-# - Kein Auto-Finalize; Finalize nur bei expliziter Handoff-Phrase von Agent 1
-# - Agent-3-Text etwas ausführlicher (2–3 Sätze möglich)
-# - Finale Darstellung: 2 Spalten pro Item (links Text ~60%, rechts rundes Bild ~40%)
-# - Keine Validierungs-/Status-Texte mehr in der UI
+# Änderungen in diesem Commit:
+# - Pivot-basierte Fertig-Logik:
+#   * Ein Item wird erst 'done', wenn zu einem NEUEN Item gewechselt wird (Pivot).
+#   * Bei geplantem Pivot auf das 5. Item -> stop_signal=True; Agent 1 gibt Handoff-Phrase aus.
+# - Debug-Funktionen weiterhin vorhanden, aber deaktiviert (kein UI-Logging).
+# - Media Overrides weiterhin entfernt.
+# - Finale Darstellung & Person-Policy bleiben wie zuvor implementiert.
 
 import os, json, time, uuid, random, traceback, requests, re
 from typing import List, Dict, Any, Optional, Callable
@@ -94,6 +94,12 @@ def init_state():
     st.session_state.setdefault("used_openers", set())
     st.session_state.setdefault("auto_finalized", False)  # bleibt ungenutzt (kein Auto-Finalize)
     st.session_state.setdefault("cooldown_entities", {})  # anti-loop cooldown
+    # Flow-Tracking für Pivot-basierte Done-Logik
+    st.session_state.setdefault("flow", {
+        "current_item_key": None,   # z.B. "podcast|machine learning street talk"
+        "done_keys": []             # Liste in Reihenfolge der Fertigstellung
+    })
+    st.session_state.setdefault("stop_signal", False)
 
 # ---------- Debug helpers (deaktiviert)
 def debug_emit(event: Dict[str, Any], buffer: Optional[list] = None):
@@ -157,7 +163,35 @@ def next_free_slot() -> Optional[str]:
             return sid
     return None
 
-# ---------- Agent 1 (Interview) — (mit vereinbarter Zusatzzeile, Rest unverändert)
+def normalize_key(etype: str, ename: str) -> str:
+    return f"{(etype or '').lower().strip()}|{(ename or '').lower().strip()}"
+
+def update_flow_with_detected(detected_key: Optional[str]):
+    """Pivot-Logik: Wenn detected_key != current -> markiere current als done und setze current=detected_key.
+       Setze stop_signal, wenn 4 Items abgeschlossen wären (bevor ein 5. begonnen wird)."""
+    if not detected_key:
+        return
+    flow = st.session_state.flow
+    current = flow.get("current_item_key")
+    done_keys: List[str] = flow.get("done_keys", [])
+    # Kein Wechsel
+    if current is None:
+        flow["current_item_key"] = detected_key
+        st.session_state.flow = flow
+        return
+    if detected_key == current:
+        return
+    # Pivot: current wird abgeschlossen
+    if current not in done_keys:
+        done_keys.append(current)
+    flow["done_keys"] = done_keys
+    flow["current_item_key"] = detected_key
+    st.session_state.flow = flow
+    # Stop-Signal setzen, wenn mit diesem Pivot bereits 4 abgeschlossen wären
+    if len(done_keys) >= 4:
+        st.session_state.stop_signal = True
+
+# ---------- Agent 1 (Interview) — inkl. Profil-/Tiefe-Guard
 AGENT1_SYSTEM = """You are Agent 1 — a warm, incisive interviewer.
 
 ## Identity & Scope
@@ -217,6 +251,10 @@ Don’t reveal internal agents/tools. Keep it professional. Mirror language swit
 """
 
 def agent1_next_question(history: List[Dict[str, str]]) -> str:
+    # Wenn Stop-Signal gesetzt: direkt Handoff-Phrase ausgeben
+    if st.session_state.get("stop_signal"):
+        # Wähle eine der Phrasen aus HANDOFF_PHRASES (erste englische)
+        return "Got it — I’ll assemble your 4-point card now."
     msgs = [{"role": "system", "content": AGENT1_SYSTEM}]
     if st.session_state.get("used_openers"):
         avoid = "Avoid these phrasings this session: " + "; ".join(list(st.session_state.used_openers))[:600]
@@ -232,7 +270,7 @@ def agent1_next_question(history: List[Dict[str, str]]) -> str:
     st.session_state.setdefault("used_openers", set()).add(q.lower()[:72])
     return q
 
-# ---------- Agent 2 (Extractor ONLY; keine Tools) — ORIGINAL
+# ---------- Agent 2 (Extractor ONLY; keine Tools)
 AGENT2_SYSTEM = """You are Agent 2.
 
 Task:
@@ -277,7 +315,7 @@ def agent2_extract_items(last_q: str, user_reply: str, seen_entities: List[str],
         debug_emit({"ev":"extract_error", "error": str(e)}, dbg)
         return {"detected": False, "reason": f"error: {e}", "trace": traceback.format_exc()[:600]}
 
-# ---------- Google CSE: Image Search (mit SAFE toggle; ohne fields)
+# ---------- Google CSE: Image Search
 def google_image_search(query: str, num: int = 4, dbg: Optional[list] = None) -> List[Dict[str, str]]:
     if not GOOGLE_CSE_KEY or not GOOGLE_CSE_CX:
         debug_emit({"ev":"cse_keys_missing", "query": query}, dbg)
@@ -447,11 +485,12 @@ class Orchestrator:
 
     def _job(self, last_q: str, reply: str, seen_snapshot: List[str]) -> Dict[str, Any]:
         dbg = []  # lokaler Buffer (Worker) — bleibt ungenutzt, da DEBUG off
+        first_key_detected: Optional[str] = None
         try:
             data = agent2_extract_items(last_q, reply, seen_snapshot, dbg=dbg)
             if not data.get("detected"):
                 debug_emit({"ev":"job_skip_no_items"}, dbg)
-                return {"status": "skip", "debug": dbg}
+                return {"status": "skip", "debug": dbg, "first_key_detected": None}
 
             items = data.get("items") or []
             debug_emit({"ev":"job_items", "count": len(items)}, dbg)
@@ -459,6 +498,13 @@ class Orchestrator:
             results: List[Dict[str, Any]] = []
 
             now = time.time()
+
+            # Merke die erste erkannte Item-Key für Flow/Pivot (auch wenn später kein Bild validiert)
+            if items:
+                etype0 = (items[0].get("entity_type") or "").lower().strip()
+                ename0 = (items[0].get("entity_name") or "").strip()
+                if etype0 and ename0:
+                    first_key_detected = normalize_key(etype0, ename0)
 
             for item in items:
                 if processed >= MAX_SEARCHES_PER_RUN:
@@ -468,7 +514,7 @@ class Orchestrator:
                 ename = (item.get("entity_name") or "").strip()
                 if not etype or not ename:
                     continue
-                key = f"{etype}|{ename.lower()}"
+                key = normalize_key(etype, ename)
 
                 retry_after = self.cooldown.get(key, 0)
                 if retry_after and now < retry_after:
@@ -527,10 +573,10 @@ class Orchestrator:
                 debug_emit({"ev":"item_ready_for_slot", "key": key}, dbg)
                 processed += 1
 
-            return {"status": "batch", "items": results, "debug": dbg}
+            return {"status": "batch", "items": results, "debug": dbg, "first_key_detected": first_key_detected}
         except Exception as e:
             debug_emit({"ev":"job_error", "error": str(e)}, dbg)
-            return {"status": "error", "error": str(e), "trace": traceback.format_exc()[:1200], "debug": dbg}
+            return {"status": "error", "error": str(e), "trace": traceback.format_exc()[:1200], "debug": dbg, "first_key_detected": first_key_detected}
 
     def poll(self) -> List[str]:
         updated, rm = [], []
@@ -543,7 +589,12 @@ class Orchestrator:
                     debug_emit({"ev":"poll_exception", "error": str(e)})
                     continue
 
-                # (DEBUG disabled) — kein Push ins UI
+                # 1) Flow-Update anhand der ersten erkannten Item-Key (Pivot-Erkennung)
+                first_key = res.get("first_key_detected")
+                if first_key:
+                    update_flow_with_detected(first_key)
+
+                # 2) Slots updaten, Seen markieren
                 if res.get("status") == "batch":
                     for it in res.get("items", []):
                         if it.get("status") == "ok":
@@ -583,23 +634,19 @@ def parse_final_lines(text: str) -> List[str]:
     return lines[:4]
 
 def render_final_card(final_text: str, slots: Dict[str, Dict[str, Any]]):
-    # parse up to 4 lines from Agent 3
     lines = parse_final_lines(final_text)
-    # maintain slot order S1..S4
     for idx, sid in enumerate(["S1", "S2", "S3", "S4"]):
         if idx >= len(lines):
             break
         s = slots.get(sid)
         txt = lines[idx]
         img = (s.get("media", {}).get("best_image_url") or "") if s else ""
-        # layout: left (text) 60%, right (image) 40% with round image
         col_text, col_img = st.columns([3, 2], vertical_alignment="center")
         with col_text:
             st.markdown(f"**{s.get('label','').split('—')[-1].strip() if s else 'Item'}**")
             st.write(txt)
         with col_img:
             if img:
-                # round image via HTML
                 st.markdown(
                     f"""
                     <div style="display:flex;justify-content:center;">
@@ -625,10 +672,8 @@ if not st.session_state.history:
     st.session_state.history.append({"role": "assistant", "content": opener})
     st.rerun()
 
-# Poll Agent 2 async jobs
-for sid in orch.poll():
-    # keine Status-/Validierungstexte anzeigen
-    pass
+# Poll Agent 2 async jobs (silent; kein Debug/Toast)
+orch.poll()
 
 # UI
 render_slots_summary()
@@ -654,11 +699,11 @@ if user_text:
     # Agent 2: extract → google image → vision
     orch.schedule_watch(last_q, user_text)
 
-    # Agent 1: next question
+    # Agent 1: next question (respektiert stop_signal -> Handoff)
     nxt = agent1_next_question(st.session_state.history)
     st.session_state.history.append({"role": "assistant", "content": nxt})
 
-    # Finalize ONLY when Agent 1 explicitly signals (allowing follow-up after item 4)
+    # Finalize ONLY when Agent 1 explicitly signals (Stop-Signal wählt Handoff-Phrase)
     low = nxt.lower()
     if any(phrase in low for phrase in HANDOFF_PHRASES):
         st.session_state.final_text = agent3_finalize(st.session_state.history, st.session_state.slots)
