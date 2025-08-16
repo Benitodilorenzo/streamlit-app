@@ -1,11 +1,14 @@
 # app_expert_card_gpt5_3agents_clean.py
 # 3 Agents: Chat (Agent 1) · Search (Agent 2) · Finalize (Agent 3)
-# Debug sichtbar im Frontend: Agent-2 Steps + Google Image Search
-# Fixes:
-#  - Person-safe vision policy (no identity confirmation; portrait-only check)
-#  - Move slot assignment to main thread (poll), not in worker
+# Änderungen:
+# - Debug-Funktionen vorhanden, aber deaktiviert (kein Aufruf ins UI)
+# - Media Overrides entfernt
+# - Kein Auto-Finalize; Finalize nur bei expliziter Handoff-Phrase von Agent 1
+# - Agent-3-Text etwas ausführlicher (2–3 Sätze möglich)
+# - Finale Darstellung: 2 Spalten pro Item (links Text ~60%, rechts rundes Bild ~40%)
+# - Keine Validierungs-/Status-Texte mehr in der UI
 
-import os, json, time, uuid, random, traceback, requests
+import os, json, time, uuid, random, traceback, requests, re
 from typing import List, Dict, Any, Optional, Callable
 from concurrent.futures import ThreadPoolExecutor
 
@@ -22,14 +25,32 @@ MEDIA_DIR = os.path.join(os.getcwd(), "media")
 os.makedirs(MEDIA_DIR, exist_ok=True)
 
 # ---- Google Programmable Search (CSE)
-GOOGLE_CSE_KEY = os.getenv("GOOGLE_CSE_KEY", "").strip()
-GOOGLE_CSE_CX  = os.getenv("GOOGLE_CSE_CX", "").strip()
+GOOGLE_CSE_KEY  = os.getenv("GOOGLE_CSE_KEY", "").strip()
+GOOGLE_CSE_CX   = os.getenv("GOOGLE_CSE_CX", "").strip()
 GOOGLE_CSE_SAFE = os.getenv("GOOGLE_CSE_SAFE", "off").strip().lower()  # "off" oder "active"
+
+# ---- Debug Toggle (deaktiviert)
+DEBUG_ENABLED = False
 
 # ---- Token/Cost controls
 MAX_SEARCHES_PER_RUN = 1
 OPENAI_MAX_RETRIES = 3
 OPENAI_BACKOFF_BASE = 1.8
+
+# ---- Finalize trigger phrases (nur bei diesen Phrasen wird Agent 3 gerufen)
+HANDOFF_PHRASES = [
+    # Englisch
+    "i’ll assemble your 4-point card now",
+    "i'll assemble your 4-point card now",
+    "we have 4 aspects we can turn into a profile",
+    "we have four aspects we can turn into a profile",
+    # Deutsch
+    "wir haben nun 4 aspekte",
+    "wir haben jetzt 4 aspekte",
+    "wir haben vier aspekte",
+    "ich stelle jetzt deinen steckbrief zusammen",
+    "ich assemble jetzt deinen 4-punkte-steckbrief",
+]
 
 # ---------- OpenAI client
 def client() -> OpenAI:
@@ -46,7 +67,7 @@ def call_with_retry(fn: Callable, *args, **kwargs):
         except APIStatusError as e:
             status = getattr(e, "status_code", None)
             if status in (429, 500, 502, 503, 504):
-                delay = OPENAI_MAX_RETRIES ** attempt + random.uniform(0, 0.3)
+                delay = OPENAI_BACKOFF_BASE ** attempt + random.uniform(0, 0.3)
                 time.sleep(delay)
                 continue
             raise
@@ -71,16 +92,13 @@ def init_state():
     st.session_state.setdefault("seen_entities", [])
     st.session_state.setdefault("final_text", "")
     st.session_state.setdefault("used_openers", set())
-    st.session_state.setdefault("auto_finalized", False)
-    # Debugging
-    st.session_state.setdefault("debug_agent2", [])
-    st.session_state.setdefault("debug_limit", 80)
-    # Anti-loop cooldown
-    st.session_state.setdefault("cooldown_entities", {})
+    st.session_state.setdefault("auto_finalized", False)  # bleibt ungenutzt (kein Auto-Finalize)
+    st.session_state.setdefault("cooldown_entities", {})  # anti-loop cooldown
 
-# ---------- Debug helpers (thread-safe via buffer)
+# ---------- Debug helpers (deaktiviert)
 def debug_emit(event: Dict[str, Any], buffer: Optional[list] = None):
-    """In Worker-Threads: in lokalen Buffer; im Main-Thread: direkt in session_state."""
+    if not DEBUG_ENABLED:
+        return
     e = dict(event)
     e["ts"] = time.strftime("%H:%M:%S")
     if buffer is not None:
@@ -89,7 +107,7 @@ def debug_emit(event: Dict[str, Any], buffer: Optional[list] = None):
     if "debug_agent2" not in st.session_state:
         st.session_state["debug_agent2"] = []
     st.session_state.debug_agent2.append(e)
-    limit = st.session_state.get("debug_limit", 80)
+    limit = 80
     if len(st.session_state.debug_agent2) > limit:
         st.session_state.debug_agent2 = st.session_state.debug_agent2[-limit:]
 
@@ -134,13 +152,12 @@ def placeholder_image(text: str, name: str) -> str:
     return path
 
 def next_free_slot() -> Optional[str]:
-    order = st.session_state.get("order", ["S1","S2","S3","S4"])
-    for sid in order:
+    for sid in st.session_state.get("order", ["S1","S2","S3","S4"]):
         if sid not in st.session_state.slots:
             return sid
     return None
 
-# ---------- Agent 1 (Interview) — ORIGINAL PROMPT (mit vereinbarter Zusatzzeile)
+# ---------- Agent 1 (Interview) — (mit vereinbarter Zusatzzeile, Rest unverändert)
 AGENT1_SYSTEM = """You are Agent 1 — a warm, incisive interviewer.
 
 ## Identity & Scope
@@ -236,11 +253,7 @@ Rules:
 """
 
 def agent2_extract_items(last_q: str, user_reply: str, seen_entities: List[str], dbg: Optional[list] = None) -> Dict[str, Any]:
-    payload = {
-        "assistant_question": last_q or "",
-        "user_reply": user_reply or "",
-        "seen_entities": list(seen_entities or [])
-    }
+    payload = {"assistant_question": last_q or "", "user_reply": user_reply or "", "seen_entities": list(seen_entities or [])}
     try:
         debug_emit({"ev":"extract_start", "q_len": len(last_q), "a_len": len(user_reply)}, dbg)
         resp = call_with_retry(
@@ -263,10 +276,10 @@ def agent2_extract_items(last_q: str, user_reply: str, seen_entities: List[str],
         debug_emit({"ev":"extract_error", "error": str(e)}, dbg)
         return {"detected": False, "reason": f"error: {e}", "trace": traceback.format_exc()[:600]}
 
-# ---------- Google CSE: Image Search (remove 'fields'; parse image.contextLink)
+# ---------- Google CSE: Image Search (mit SAFE toggle; ohne fields)
 def google_image_search(query: str, num: int = 4, dbg: Optional[list] = None) -> List[Dict[str, str]]:
     if not GOOGLE_CSE_KEY or not GOOGLE_CSE_CX:
-        debug_emit({"ev":"cse_keys_missing", "query": query, "key_set": bool(GOOGLE_CSE_KEY), "cx_set": bool(GOOGLE_CSE_CX)}, dbg)
+        debug_emit({"ev":"cse_keys_missing", "query": query}, dbg)
         return []
     try:
         params = {
@@ -274,7 +287,6 @@ def google_image_search(query: str, num: int = 4, dbg: Optional[list] = None) ->
             "searchType": "image",
             "num": max(1, min(num, 10)),
             "safe": GOOGLE_CSE_SAFE,
-            # NOTE: no 'fields' filter to avoid INVALID_ARGUMENT
             "key": GOOGLE_CSE_KEY,
             "cx": GOOGLE_CSE_CX,
         }
@@ -297,13 +309,13 @@ def google_image_search(query: str, num: int = 4, dbg: Optional[list] = None) ->
         out = []
         for it in items:
             link = (it.get("link") or "").strip()
-            img_ctx = ""
+            ctx = ""
             try:
-                img_ctx = (it.get("image", {}).get("contextLink") or "").strip()
+                ctx = (it.get("image", {}).get("contextLink") or "").strip()
             except Exception:
-                img_ctx = ""
+                ctx = ""
             if link:
-                out.append({"url": link, "page_url": img_ctx})
+                out.append({"url": link, "page_url": ctx})
         debug_emit({"ev":"cse_done", "query": query, "returned": len(out)}, dbg)
         return out
     except Exception as e:
@@ -325,8 +337,8 @@ def validate_image_with_context(image_url: str, entity_type: str, entity_name: s
         )
         user_text = (
             "Item type: person\n"
-            f"Item name (for context only, DO NOT IDENTIFY): {entity_name}\n"
-            "Context is irrelevant to identity. Only check portrait criteria above."
+            f"Item name (context only, DO NOT IDENTIFY): {entity_name}\n"
+            "Only check portrait criteria."
         )
     else:
         sys = (
@@ -358,28 +370,20 @@ def validate_image_with_context(image_url: str, entity_type: str, entity_name: s
         txt = (resp.choices[0].message.content or "").strip()
         data = parse_json_loose(txt)
         ok = bool(data.get("ok")) if isinstance(data, dict) else False
-        reason = (data.get("reason") if isinstance(data, dict) else "") or ""
-        debug_emit(
-            {"ev":"vision_check", "item": f"{entity_type}|{entity_name}", "ok": ok,
-             "reason": reason[:160], "img": image_url[:140],
-             "mode": "person-portrait" if (entity_type or "").lower() == "person" else "exact-match"},
-            dbg
-        )
-        if isinstance(data, dict) and "ok" in data:
-            return {"ok": ok, "reason": reason[:200]}
-    except Exception as e:
-        debug_emit({"ev":"vision_error", "item": f"{entity_type}|{entity_name}", "error": str(e)}, dbg)
-    return {"ok": False, "reason": "unverifiable"}
+        return {"ok": ok, "reason": (data.get("reason") if isinstance(data, dict) else "")[:200]}
+    except Exception:
+        return {"ok": False, "reason": "unverifiable"}
 
-# ---------- Agent 3 (Finalizer)
+# ---------- Agent 3 (Finalizer) — etwas ausführlicher
 FINALIZER_SYSTEM = """You are Agent 3 — Finalizer.
 Create an Expert Card with exactly 4 items from:
 - The conversation (assistant questions + user answers).
 - The current slots (labels + image URLs if any).
 Rules:
-- Each line: '- Label: 1–2 short sentences' grounded in THIS user.
+- Each line begins with '- Label:' followed by 1–3 concise sentences grounded in THIS user's words.
 - Prefer PUBLIC items; if fewer than 4, fill with the user's stated practices/principles.
-- No fluff, no generic Wikipedia facts, no references to these instructions.
+- No fluff, no generic encyclopedia facts, no references to these instructions.
+- If the user provided richer detail for an item, lean toward 2–3 sentences; otherwise keep it tight.
 """
 
 def agent3_finalize(history: List[Dict[str, str]], slots: Dict[str, Dict[str, Any]]) -> str:
@@ -441,7 +445,7 @@ class Orchestrator:
         debug_emit({"ev":"job_scheduled", "jid": jid})
 
     def _job(self, last_q: str, reply: str, seen_snapshot: List[str]) -> Dict[str, Any]:
-        dbg = []  # lokaler Buffer (Worker)
+        dbg = []  # lokaler Buffer (Worker) — bleibt ungenutzt, da DEBUG off
         try:
             data = agent2_extract_items(last_q, reply, seen_snapshot, dbg=dbg)
             if not data.get("detected"):
@@ -483,15 +487,14 @@ class Orchestrator:
                     debug_emit({"ev":"item_set_cooldown", "key": key, "cooldown_s": COOLDOWN_SECONDS}, dbg)
                     continue
 
-                ok_url = ""
-                note = ""
+                ok_url, note = "", ""
                 tries = 0
                 for cand in imgs[:2]:
                     tries += 1
                     v = validate_image_with_context(cand["url"], etype, ename, last_q, reply, dbg=dbg)
                     if v.get("ok"):
                         ok_url = cand["url"]
-                        note = v.get("reason","")
+                        note = v.get("reason", "")
                         debug_emit({"ev":"item_validate_ok", "key": key, "tries": tries}, dbg)
                         break
                     else:
@@ -503,7 +506,6 @@ class Orchestrator:
                     debug_emit({"ev":"item_set_cooldown", "key": key, "cooldown_s": COOLDOWN_SECONDS}, dbg)
                     continue
 
-                # ⚠️ No slot assignment or seen-mutation here (worker thread).
                 label_hint = {
                     "book": "Must-Read",
                     "podcast": "Podcast",
@@ -520,7 +522,6 @@ class Orchestrator:
                     "notes": note or "validated"
                 }
 
-                # Return prepared item; main thread will pick a free slot & mark seen
                 results.append({"status": "ok", "key": key, "label": label, "media": media})
                 debug_emit({"ev":"item_ready_for_slot", "key": key}, dbg)
                 processed += 1
@@ -541,108 +542,80 @@ class Orchestrator:
                     debug_emit({"ev":"poll_exception", "error": str(e)})
                     continue
 
-                # Worker-Debug in Main-Thread-Log pushen
-                for ev in res.get("debug", []) or []:
-                    debug_emit(ev, buffer=None)
-
+                # (DEBUG disabled) — kein Push ins UI
                 if res.get("status") == "batch":
                     for it in res.get("items", []):
                         if it.get("status") == "ok":
                             sid = next_free_slot()
                             if sid:
                                 self.upsert(sid, it["label"], it["media"])
-                                # Mark seen only after successful slot set
                                 key = it.get("key")
                                 if key and key not in self.seen:
                                     self.seen.append(key)
                                 updated.append(sid)
-                                debug_emit({"ev":"slot_created_main", "sid": sid, "key": key})
                             else:
                                 debug_emit({"ev":"slots_full"})
-                elif res.get("status") == "skip":
-                    debug_emit({"ev":"poll_skip"})
-                elif res.get("status") == "error":
-                    debug_emit({"ev":"poll_error", "error": res.get("error")})
+                # skip/err werden still gehandhabt
         for jid in rm:
             del self.jobs[jid]
         return updated
 
 # ---------- Render
-def render_slots():
+def render_slots_summary():
     slots = st.session_state.slots
     filled = len([s for s in slots.values() if (s.get("label") or "").strip()])
     st.progress(min(1.0, filled / 4), text=f"Progress: {filled}/4")
-    cols = st.columns(4)
-    for i, sid in enumerate(st.session_state.order):
-        s = slots.get(sid)
-        with cols[i]:
-            st.markdown(f"**{(s or {}).get('label') or sid}**")
-            if not s:
-                st.caption("(empty)")
-                continue
-            m = s.get("media", {})
-            st.caption(f"status: {m.get('status', 'pending')}")
-            best = (m.get("best_image_url") or "").strip()
-            if best:
-                try:
-                    st.image(best, use_container_width=True)
-                except Exception:
-                    st.caption("(image unavailable)")
-            else:
-                st.caption("(image pending)")
-            notes = (m.get("notes") or "").strip()
-            if notes:
-                st.code(notes, language="text")
 
 def render_history():
     for m in st.session_state.history:
         with st.chat_message(m["role"]):
             st.markdown(m["content"])
 
-def render_overrides():
-    st.subheader("Media Overrides (optional)")
-    for sid, s in st.session_state.slots.items():
-        with st.expander(f"Override for {s.get('label') or sid}"):
-            c1, c2 = st.columns(2)
-            with c1:
-                url = st.text_input("Image URL (http/https)", key=f"url_{sid}")
-                if url.startswith("http"):
-                    s["media"]["status"] = "found"
-                    s["media"]["best_image_url"] = url
-                    s["media"]["notes"] = "override url"
-                    st.success("Using URL override.")
-            with c2:
-                up = st.file_uploader("Upload image", type=["png", "jpg", "jpeg", "webp"], key=f"up_{sid}")
-                if up:
-                    try:
-                        path = os.path.join(MEDIA_DIR, f"{sid}_upload.png")
-                        Image.open(up).save(path, "PNG")
-                        s["media"]["status"] = "uploaded"
-                        s["media"]["best_image_url"] = path
-                        s["media"]["notes"] = "uploaded file"
-                        st.success("Using uploaded image.")
-                    except Exception:
-                        st.error("Could not read image.")
+def parse_final_lines(text: str) -> List[str]:
+    lines = []
+    for ln in text.splitlines():
+        ln = ln.strip()
+        if ln.startswith("- "):
+            lines.append(ln[2:].strip())
+        elif ln.lower().startswith("- label:"):
+            lines.append(ln.split(":", 1)[-1].strip())
+    return lines[:4]
 
-def render_debug_sidebar():
-    st.sidebar.header("🔍 Agent 2 Debug")
-    st.sidebar.caption("Extraktion → Google CSE → Vision → Slots")
-    st.sidebar.write(f"Google CSE key: {'✅ set' if bool(GOOGLE_CSE_KEY) else '❌ MISSING'}")
-    st.sidebar.write(f"Google CSE cx : {'✅ set' if bool(GOOGLE_CSE_CX)  else '❌ MISSING'}")
-    st.sidebar.write(f"Seen entities: {len(st.session_state.seen_entities)}")
-    if st.session_state.debug_agent2:
-        for entry in reversed(st.session_state.debug_agent2):
-            st.sidebar.json(entry, expanded=False)
-    else:
-        st.sidebar.caption("No Agent-2 events yet.")
+def render_final_card(final_text: str, slots: Dict[str, Dict[str, Any]]):
+    # parse up to 4 lines from Agent 3
+    lines = parse_final_lines(final_text)
+    # maintain slot order S1..S4
+    for idx, sid in enumerate(["S1", "S2", "S3", "S4"]):
+        if idx >= len(lines):
+            break
+        s = slots.get(sid)
+        txt = lines[idx]
+        img = (s.get("media", {}).get("best_image_url") or "") if s else ""
+        # layout: left (text) 60%, right (image) 40% with round image
+        col_text, col_img = st.columns([3, 2], vertical_alignment="center")
+        with col_text:
+            st.markdown(f"**{s.get('label','').split('—')[-1].strip() if s else 'Item'}**")
+            st.write(txt)
+        with col_img:
+            if img:
+                # round image via HTML
+                st.markdown(
+                    f"""
+                    <div style="display:flex;justify-content:center;">
+                      <img src="{img}" style="width:100%;max-width:280px;aspect-ratio:1/1;border-radius:9999px;object-fit:cover;border:1px solid rgba(0,0,0,0.05);" />
+                    </div>
+                    """,
+                    unsafe_allow_html=True
+                )
+            else:
+                st.caption("(no image)")
 
 # ---------- Main
 st.set_page_config(page_title=APP_TITLE, page_icon="🟡", layout="wide")
 st.title(APP_TITLE)
-st.caption("Agent 2: Google Image API (+Vision-Check) • Sichtbares Debug • Slots nur bei validem Bild")
+st.caption("Agent 2: Google Image API (+Vision-Check) • Slots only with valid image")
 
 init_state()
-
 orch = Orchestrator()
 
 # First opener from Agent 1
@@ -653,26 +626,24 @@ if not st.session_state.history:
 
 # Poll Agent 2 async jobs
 for sid in orch.poll():
-    st.toast(f"🖼️ Media updated: {sid}", icon="🖼️")
+    # keine Status-/Validierungstexte anzeigen
+    pass
 
-# Render UI
-render_slots()
+# UI
+render_slots_summary()
 render_history()
-render_debug_sidebar()
 
-# Auto-finalize fallback
-if not st.session_state.auto_finalized:
-    if all(sid in st.session_state.slots and (st.session_state.slots[sid].get("label") or "").strip() for sid in st.session_state.order):
-        st.session_state.final_text = agent3_finalize(st.session_state.history, st.session_state.slots)
-        st.session_state.auto_finalized = True
-        st.toast("✅ Auto-finalized your Expert Card.", icon="✨")
+# FINAL CARD (if present)
+if st.session_state.final_text:
+    st.subheader("Your Expert Card")
+    render_final_card(st.session_state.final_text, st.session_state.slots)
 
 # Input handling
 user_text = st.chat_input("Your turn…")
 if user_text:
     st.session_state.history.append({"role": "user", "content": user_text})
 
-    # Find last Agent 1 question
+    # Let Agent 2 watch last Q/A for public items
     last_q = ""
     for m in reversed(st.session_state.history[:-1]):
         if m["role"] == "assistant":
@@ -686,19 +657,18 @@ if user_text:
     nxt = agent1_next_question(st.session_state.history)
     st.session_state.history.append({"role": "assistant", "content": nxt})
 
-    # Optional Handoff Phrase
-    if "assemble your 4-point card now" in nxt.lower() or "assemble your 4-point" in nxt.lower():
+    # Finalize ONLY when Agent 1 explicitly signals (allowing follow-up after item 4)
+    low = nxt.lower()
+    if any(phrase in low for phrase in HANDOFF_PHRASES):
         st.session_state.final_text = agent3_finalize(st.session_state.history, st.session_state.slots)
-        st.session_state.auto_finalized = True
 
     st.rerun()
 
 # Actions
-c1, c2, c3 = st.columns(3)
+c1, c2 = st.columns(2)
 with c1:
-    if st.button("✨ Finalize"):
+    if st.button("✨ Finalize (manual)"):
         st.session_state.final_text = agent3_finalize(st.session_state.history, st.session_state.slots)
-        st.session_state.auto_finalized = True
         st.success("Finalized.")
         st.rerun()
 with c2:
@@ -710,15 +680,3 @@ with c2:
         for k in list(st.session_state.keys()):
             del st.session_state[k]
         st.rerun()
-with c3:
-    if st.button("🧹 Clear Final"):
-        st.session_state.final_text = ""
-        st.session_state.auto_finalized = False
-        st.rerun()
-
-# Final card
-if st.session_state.final_text:
-    st.subheader("Your Expert Card")
-    st.write(st.session_state.final_text)
-
-render_overrides()
