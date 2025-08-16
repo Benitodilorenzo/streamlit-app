@@ -1,33 +1,32 @@
 # app_expert_card_gpt5_3agents_clean.py
 # 3 Agents: Chat (Agent 1) · Search (Agent 2) · Finalize (Agent 3)
-# Image pipeline: Google Custom Search (Image) + Vision validation (OpenAI) · Async Agent-2 jobs
-# Cost controls: Agent-2 uses a small model, 1 image search/turn, 2 validations max
+# Debug sichtbar im Frontend: Agent-2 Steps + Google Image Search
+# Nur Debug-Patches; Agent 1 & Agent 2 Prompts wie besprochen.
 
 import os, json, time, uuid, random, traceback, requests
-from typing import List, Dict, Any, Optional, Tuple, Callable
-from concurrent.futures import ThreadPoolExecutor, Future
+from typing import List, Dict, Any, Optional, Callable
+from concurrent.futures import ThreadPoolExecutor
 
 import streamlit as st
 from PIL import Image, ImageDraw, ImageFont
 from openai import OpenAI
 from openai import APIStatusError
+from requests.exceptions import HTTPError
 
 APP_TITLE = "🟡 Expert Card — GPT-5 (3 Agents · Google Image API · Async)"
-MODEL = os.getenv("OPENAI_GPT5_SNAPSHOT", "gpt-5-2025-08-07")       # Agent 1 & 3
-AGENT2_MODEL = os.getenv("OPENAI_AGENT2_MODEL", "gpt-4o-mini")      # Agent 2 (cheaper, vision-capable)
-
-# Google Custom Search (Image)
-GOOGLE_CSE_KEY = os.getenv("GOOGLE_CSE_KEY", "").strip()
-GOOGLE_CSE_CX  = os.getenv("GOOGLE_CSE_CX", "").strip()
-
+MODEL = os.getenv("OPENAI_GPT5_SNAPSHOT", "gpt-5-2025-08-07")
+AGENT2_MODEL = os.getenv("OPENAI_AGENT2_MODEL", "gpt-4o-mini")  # günstig für Extraktion + Vision
 MEDIA_DIR = os.path.join(os.getcwd(), "media")
 os.makedirs(MEDIA_DIR, exist_ok=True)
 
+# ---- Google Programmable Search (CSE)
+GOOGLE_CSE_KEY = os.getenv("GOOGLE_CSE_KEY", "").strip()
+GOOGLE_CSE_CX  = os.getenv("GOOGLE_CSE_CX", "").strip()
+
 # ---- Token/Cost controls
-MAX_SEARCHES_PER_RUN = 1         # Agent 2: cap image search per turn
-MAX_VALIDATIONS = 2              # Vision checks per item (try top-N images)
-OPENAI_MAX_RETRIES = 3           # Retry count for rate limits / 5xx
-OPENAI_BACKOFF_BASE = 1.8        # Exponential backoff base
+MAX_SEARCHES_PER_RUN = 1
+OPENAI_MAX_RETRIES = 3
+OPENAI_BACKOFF_BASE = 1.8
 
 # ---------- OpenAI client
 def client() -> OpenAI:
@@ -36,7 +35,7 @@ def client() -> OpenAI:
         raise RuntimeError("OPENAI_API_KEY missing")
     return OpenAI(api_key=key)
 
-# ---------- Simple retry wrapper for OpenAI calls
+# ---------- Retry wrapper
 def call_with_retry(fn: Callable, *args, **kwargs):
     for attempt in range(OPENAI_MAX_RETRIES):
         try:
@@ -57,25 +56,26 @@ def call_with_retry(fn: Callable, *args, **kwargs):
             raise
     return fn(*args, **kwargs)
 
-# ---------- Session state (idempotent)
+# ---------- Session state
 def init_state():
     st.session_state.setdefault("init", True)
-    st.session_state.setdefault("history", [])                # Agent1 ↔ User
-    st.session_state.setdefault("slots", {})                  # S1..S4
+    st.session_state.setdefault("history", [])
+    st.session_state.setdefault("slots", {})
     st.session_state.setdefault("order", ["S1","S2","S3","S4"])
-    st.session_state.setdefault("jobs", {})                   # id -> (sid, Future)
+    st.session_state.setdefault("jobs", {})
     if "executor" not in st.session_state or st.session_state.get("executor") is None:
         st.session_state.executor = ThreadPoolExecutor(max_workers=4)
-    st.session_state.setdefault("seen_entities", [])          # e.g., "book|the little prince"
+    st.session_state.setdefault("seen_entities", [])
     st.session_state.setdefault("final_text", "")
     st.session_state.setdefault("used_openers", set())
     st.session_state.setdefault("auto_finalized", False)
-    st.session_state.setdefault("debug_agent2", [])           # sidebar debug log
-    st.session_state.setdefault("debug_limit", 80)            # keep last N debug rows
+    # Debugging
+    st.session_state.setdefault("debug_agent2", [])
+    st.session_state.setdefault("debug_limit", 80)
 
 # ---------- Debug helpers (thread-safe via buffer)
 def debug_emit(event: Dict[str, Any], buffer: Optional[list] = None):
-    """Thread-safe debug logger: in worker -> buffer; in main -> session_state list."""
+    """In Worker-Threads: in lokalen Buffer; im Main-Thread: direkt in session_state."""
     e = dict(event)
     e["ts"] = time.strftime("%H:%M:%S")
     if buffer is not None:
@@ -95,12 +95,10 @@ def debug_log_agent2(event: Dict[str, Any]):
 def parse_json_loose(text: str) -> Optional[dict]:
     if not text:
         return None
-    # strict first
     try:
         return json.loads(text)
     except Exception:
         pass
-    # loose extract first {...}
     a, b = text.find("{"), text.rfind("}")
     if a != -1 and b != -1 and b > a:
         frag = text[a:b+1]
@@ -136,11 +134,11 @@ def next_free_slot() -> Optional[str]:
             return sid
     return None
 
-# ---------- Agent 1 (Interview)
+# ---------- Agent 1 (Interview) — ORIGINAL PROMPT
 AGENT1_SYSTEM = """You are Agent 1 — a warm, incisive interviewer.
 
 ## Identity & Scope
-You are Agent 1. You5 run the conversation and never call tools.
+You are Agent 1. You run the conversation and never call tools.
 - Agent 2 observes each turn and handles web images for PUBLIC items (book/podcast/person/tool/film).
 - Agent 3 will finalize the 4-point card when you signal the handoff.
 
@@ -161,9 +159,9 @@ Favor variety across types.
 
 ## Handling inputs
 - PUBLIC item present → proceed; Agent 2 will search on its own. Don’t re-confirm what the user already gave unless ambiguity blocks a meaningful question.
-- Unusual/private/non-technical item → briefly acknowledge positively and clarify if it’s a public reference (e.g., “Is this someone others could look up, or more of a personal figure?”).
-  - If public → one micro-clarifier (name/title/host) if needed, then continue as usual.
-  - If private → ask for a PUBLIC stand-in (book/person/tool/podcast/film) that best represents that influence, then pivot.
+- Unusual/private/non-technical item → briefly acknowledge positively and clarify if it’s a public reference (e.g., “Is this someone others could look up, or more of a personal figure?”).  
+  - If public → one micro-clarifier (name/title/host) if needed, then continue as usual.  
+  - If private → ask for a PUBLIC stand-in (book/person/tool/podcast/film) that best represents that influence, then pivot.  
 - Meta/process-only → ask for one PUBLIC stand-in (book/person/tool/podcast/film).
 - Multiple items in one reply → pick one now; you may revisit others later.
 - Sensitive/emotional → acknowledge briefly; steer back to practice and PUBLIC anchors.
@@ -195,7 +193,7 @@ Don’t reveal internal agents/tools. Keep it professional. Mirror language swit
 
 def agent1_next_question(history: List[Dict[str, str]]) -> str:
     msgs = [{"role": "system", "content": AGENT1_SYSTEM}]
-    if st.session_state.used_openers:
+    if st.session_state.get("used_openers"):
         avoid = "Avoid these phrasings this session: " + "; ".join(list(st.session_state.used_openers))[:600]
         msgs.append({"role": "system", "content": avoid})
     short = history[-6:] if len(history) > 6 else history
@@ -206,31 +204,28 @@ def agent1_next_question(history: List[Dict[str, str]]) -> str:
         q = q.split("\n")[0].strip()
     if not q.endswith("?"):
         q = q.rstrip(".! ") + "?"
-    st.session_state.used_openers.add(q.lower()[:72])
+    st.session_state.setdefault("used_openers", set()).add(q.lower()[:72])
     return q
 
-# ---------- Agent 2 (Extractor prompt ONLY — no web tool here)
-AGENT2_SYSTEM = """You are Agent 2 — extractor.
+# ---------- Agent 2 (Extractor ONLY; keine Tools) — ORIGINAL
+AGENT2_SYSTEM = """You are Agent 2.
 
 Task:
-- From 'assistant_question' + 'user_reply' extract 0..N PUBLIC items that are **searchable**:
-  Types: book | podcast | person | tool | film.
-- For each detected item return:
-  - entity_type
-  - entity_name (canonical; include author for books if present)
-- Build keys "type|normalized_name" (lowercase, trim). If key is in seen_entities → mark it as duplicate in the items (field "dup": true).
+- From assistant_question + user_reply extract 0..N PUBLIC items (book|podcast|person|tool|film).
+- For each item, return {entity_type, entity_name}. Do NOT search the web. Do NOT invent.
+- Dedupe by normalized lowercase name per type.
 
-Output strict JSON:
+Output ONLY strict JSON:
 {
   "detected": true|false,
   "items": [
-    {"entity_type":"book|podcast|person|tool|film","entity_name":"...","dup":false}
+    {"entity_type":"book|podcast|person|tool|film","entity_name":"..."}
   ]
 }
 
 Rules:
 - If no item present → {"detected": false}
-- No commentary outside JSON.
+- Return ONLY JSON.
 """
 
 def agent2_extract_items(last_q: str, user_reply: str, seen_entities: List[str], dbg: Optional[list] = None) -> Dict[str, Any]:
@@ -253,16 +248,7 @@ def agent2_extract_items(last_q: str, user_reply: str, seen_entities: List[str],
         debug_emit({"ev":"extract_raw", "preview": raw[:240]}, dbg)
         data = parse_json_loose(raw)
         if isinstance(data, dict):
-            # Mark dup using provided seen_entities if model didn't
-            enriched = []
-            for it in (data.get("items") or []):
-                etype = (it.get("entity_type") or "").lower().strip()
-                ename = (it.get("entity_name") or "").strip()
-                key = f"{etype}|{ename.lower()}" if etype and ename else ""
-                it["dup"] = it.get("dup", False) or (key in (seen_entities or []))
-                enriched.append(it)
-            data["items"] = enriched
-            debug_emit({"ev":"extract_parsed", "detected": bool(data.get("detected")), "count": len(enriched)}, dbg)
+            debug_emit({"ev":"extract_parsed", "detected": bool(data.get("detected")), "count": len(data.get("items") or [])}, dbg)
             return data
         debug_emit({"ev":"extract_noparse"}, dbg)
         return {"detected": False, "reason": "no-parse"}
@@ -270,7 +256,7 @@ def agent2_extract_items(last_q: str, user_reply: str, seen_entities: List[str],
         debug_emit({"ev":"extract_error", "error": str(e)}, dbg)
         return {"detected": False, "reason": f"error: {e}", "trace": traceback.format_exc()[:600]}
 
-# ---------- Google Image Search (CSE)
+# ---------- Google CSE: Image Search (nur Debug erweitert)
 def google_image_search(query: str, num: int = 4, dbg: Optional[list] = None) -> List[Dict[str, str]]:
     if not GOOGLE_CSE_KEY or not GOOGLE_CSE_CX:
         debug_emit({"ev":"cse_keys_missing", "query": query, "key_set": bool(GOOGLE_CSE_KEY), "cx_set": bool(GOOGLE_CSE_CX)}, dbg)
@@ -281,39 +267,47 @@ def google_image_search(query: str, num: int = 4, dbg: Optional[list] = None) ->
             "searchType": "image",
             "num": max(1, min(num, 10)),
             "safe": "active",
-            "fields": "items(link,contextLink)",
+            "fields": "items(link,contextLink),error",
             "key": GOOGLE_CSE_KEY,
             "cx": GOOGLE_CSE_CX,
         }
         debug_emit({"ev":"cse_start", "query": query, "params": {"num": params["num"], "safe": "active"}}, dbg)
         r = requests.get("https://www.googleapis.com/customsearch/v1", params=params, timeout=12)
-        r.raise_for_status()
+        try:
+            r.raise_for_status()
+        except HTTPError as he:
+            # Debug: HTTP-Fehler + Body (JSON oder Text)
+            try:
+                err_json = r.json()
+            except Exception:
+                err_json = {"text": r.text[:400]}
+            debug_emit({"ev":"cse_http_error", "status": r.status_code, "error": str(he), "body": err_json}, dbg)
+            return []
         data = r.json()
+        if "error" in data:
+            debug_emit({"ev":"cse_api_error", "query": query, "api_error": data.get("error")}, dbg)
+            return []
         items = data.get("items", []) or []
         out = []
         for it in items:
             link = (it.get("link") or "").strip()
             ctx  = (it.get("contextLink") or "").strip()
-            if not link:
-                continue
-            # Prefer direct image extensions; still accept others (some hosts omit extension).
-            if not any(link.lower().endswith(ext) for ext in (".jpg",".jpeg",".png",".webp",".gif")):
-                # keep but mark as maybe-non-direct (we'll still try to render)
-                out.append({"url": link, "page_url": ctx, "direct_ext": False})
-            else:
-                out.append({"url": link, "page_url": ctx, "direct_ext": True})
+            if link and any(link.lower().endswith(ext) for ext in (".jpg",".jpeg",".png",".webp")):
+                out.append({"url": link, "page_url": ctx})
         debug_emit({"ev":"cse_done", "query": query, "returned": len(out)}, dbg)
         return out
     except Exception as e:
         debug_emit({"ev":"cse_error", "query": query, "error": str(e)}, dbg)
         return []
 
-# ---------- Vision validation for candidate image
+# ---------- Vision: Validate image vs. context
 def validate_image_with_context(image_url: str, entity_type: str, entity_name: str, q_text: str, a_text: str, dbg: Optional[list] = None) -> Dict[str, Any]:
     sys = (
         "You are an image verifier. Respond with STRICT JSON like "
-        "{\"ok\":true/false,\"reason\":\"...\"}. Check if the image plausibly "
-        "depicts the requested item (book/podcast/person/tool/film). Reject logos/memes/wrong items."
+        "{\"ok\":true/false,\"reason\":\"...\"}. "
+        "Check if the image plausibly depicts the requested public item "
+        "(book/podcast/person/tool/film) given the context. "
+        "Be strict about wrong people/logos, but flexible with cover art variants."
     )
     user_text = (
         f"Item type: {entity_type}\n"
@@ -412,7 +406,7 @@ class Orchestrator:
         debug_emit({"ev":"job_scheduled", "jid": jid})
 
     def _job(self, last_q: str, reply: str, seen_snapshot: List[str]) -> Dict[str, Any]:
-        dbg = []  # local buffer for worker
+        dbg = []  # lokaler Buffer (Worker)
         try:
             data = agent2_extract_items(last_q, reply, seen_snapshot, dbg=dbg)
             if not data.get("detected"):
@@ -428,34 +422,30 @@ class Orchestrator:
                 if processed >= MAX_SEARCHES_PER_RUN:
                     debug_emit({"ev":"job_cap_reached", "max": MAX_SEARCHES_PER_RUN}, dbg)
                     break
-
                 etype = (item.get("entity_type") or "").lower().strip()
                 ename = (item.get("entity_name") or "").strip()
                 if not etype or not ename:
                     continue
                 key = f"{etype}|{ename.lower()}"
-                if key in self.seen or item.get("dup"):
+                if key in self.seen:
                     debug_emit({"ev":"item_dedupe_skip", "key": key}, dbg)
                     continue
 
                 debug_emit({"ev":"item_consider", "key": key}, dbg)
-                # Google image search
-                imgs = google_image_search(ename, num=6, dbg=dbg)
+                imgs = google_image_search(ename, num=4, dbg=dbg)
                 debug_emit({"ev":"item_search_results", "key": key, "n": len(imgs)}, dbg)
+
                 if not imgs:
                     continue
 
-                # Validate top-N images via vision
-                ok_url, note, ctx_page = "", "", ""
+                ok_url = ""
+                note = ""
                 tries = 0
-                for cand in imgs:
-                    if tries >= MAX_VALIDATIONS:
-                        break
+                for cand in imgs[:2]:
                     tries += 1
                     v = validate_image_with_context(cand["url"], etype, ename, last_q, reply, dbg=dbg)
                     if v.get("ok"):
                         ok_url = cand["url"]
-                        ctx_page = cand.get("page_url", "")
                         note = v.get("reason","")
                         debug_emit({"ev":"item_validate_ok", "key": key, "tries": tries}, dbg)
                         break
@@ -466,9 +456,7 @@ class Orchestrator:
                     debug_emit({"ev":"item_no_valid_image", "key": key}, dbg)
                     continue
 
-                # Mark seen only when slot created
                 self.seen.append(key)
-
                 label_hint = {
                     "book": "Must-Read",
                     "podcast": "Podcast",
@@ -481,7 +469,7 @@ class Orchestrator:
                 media = {
                     "status": "found",
                     "best_image_url": ok_url,
-                    "candidates": [{"url": ok_url, "page_url": ctx_page, "source": "google-cse", "confidence": 0.9, "reason": note}],
+                    "candidates": [{"url": ok_url, "page_url": imgs[0].get("page_url",""), "source": "google-cse", "confidence": 0.9, "reason": note}],
                     "notes": note or "validated"
                 }
 
@@ -510,7 +498,7 @@ class Orchestrator:
                     debug_emit({"ev":"poll_exception", "error": str(e)})
                     continue
 
-                # Push worker debug into main thread log
+                # Worker-Debug in Main-Thread-Log pushen
                 for ev in res.get("debug", []) or []:
                     debug_emit(ev, buffer=None)
 
@@ -587,11 +575,9 @@ def render_overrides():
 def render_debug_sidebar():
     st.sidebar.header("🔍 Agent 2 Debug")
     st.sidebar.caption("Extraktion → Google CSE → Vision → Slots")
-    st.sidebar.write(
-        f"Google CSE key: {'✅ set' if bool(GOOGLE_CSE_KEY) else '❌ missing'}  \n"
-        f"Google CSE cx : {'✅ set' if bool(GOOGLE_CSE_CX)  else '❌ missing'}  \n"
-        f"Seen entities: {len(st.session_state.seen_entities)}"
-    )
+    st.sidebar.write(f"Google CSE key: {'✅ set' if bool(GOOGLE_CSE_KEY) else '❌ MISSING'}")
+    st.sidebar.write(f"Google CSE cx : {'✅ set' if bool(GOOGLE_CSE_CX)  else '❌ MISSING'}")
+    st.sidebar.write(f"Seen entities: {len(st.session_state.seen_entities)}")
     if st.session_state.debug_agent2:
         for entry in reversed(st.session_state.debug_agent2):
             st.sidebar.json(entry, expanded=False)
@@ -605,15 +591,15 @@ st.caption("Agent 2: Google Image API (+Vision-Check) • Sichtbares Debug • S
 
 init_state()
 
-# First opener from Agent 1 (run early so it shows immediately)
+orch = Orchestrator()
+
+# First opener from Agent 1
 if not st.session_state.history:
     opener = agent1_next_question([])
     st.session_state.history.append({"role": "assistant", "content": opener})
     st.rerun()
 
-orch = Orchestrator()
-
-# Poll Agent 2 async jobs (push worker debug → sidebar; update slots)
+# Poll Agent 2 async jobs
 for sid in orch.poll():
     st.toast(f"🖼️ Media updated: {sid}", icon="🖼️")
 
@@ -622,7 +608,7 @@ render_slots()
 render_history()
 render_debug_sidebar()
 
-# Auto-finalize fallback: finalize automatically when 4 slots are filled
+# Auto-finalize fallback
 if not st.session_state.auto_finalized:
     if all(sid in st.session_state.slots and (st.session_state.slots[sid].get("label") or "").strip() for sid in st.session_state.order):
         st.session_state.final_text = agent3_finalize(st.session_state.history, st.session_state.slots)
@@ -641,14 +627,14 @@ if user_text:
             last_q = m["content"]
             break
 
-    # Agent 2: extract → google image → vision validate (only last Q↔A)
+    # Agent 2: extract → google image → vision
     orch.schedule_watch(last_q, user_text)
 
     # Agent 1: next question
     nxt = agent1_next_question(st.session_state.history)
     st.session_state.history.append({"role": "assistant", "content": nxt})
 
-    # Optional handoff phrase trigger (if Agent 1 ever says it explicitly)
+    # Optional Handoff Phrase
     if "assemble your 4-point card now" in nxt.lower() or "assemble your 4-point" in nxt.lower():
         st.session_state.final_text = agent3_finalize(st.session_state.history, st.session_state.slots)
         st.session_state.auto_finalized = True
