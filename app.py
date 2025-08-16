@@ -1,6 +1,6 @@
 # app_expert_card_gpt5.py
 # Single-file Streamlit app — GPT-5 only, Hosted Web Search (Responses API),
-# async media, minimal prompting — NO response_format / NO reasoning params.
+# async media, context-sensitive interview, four-slot Expert Card.
 #
 # Requirements:
 #   pip install streamlit openai pillow requests
@@ -74,6 +74,9 @@ def init_state():
     st.session_state.web_search_ok = None
     st.session_state.web_search_err = ""
 
+    # Erwarteter Entitätstyp für die nächste User-Antwort (steuert Erkennung)
+    st.session_state.expected_type: Optional[str] = None  # "book" | "podcast" | "person" | "tool" | "film" | None
+
 def current_slot_id() -> str:
     ix = st.session_state.current_slot_ix
     return st.session_state.slot_order[min(ix, 3)]
@@ -124,20 +127,6 @@ def save_uploaded_image(file, slot_id: str) -> str:
     except Exception:
         return ""
 
-def normalize_entity(raw: str) -> Tuple[Optional[str], Optional[str]]:
-    s = (raw or "").strip()
-    if not s: return (None, None)
-    m = re.search(r'["“]?([^"\n]+?)["”]?\s+(?:by|von|from)\s+([A-Za-zÀ-ÖØ-öø-ÿ\.\-\s]+)$', s, re.I)
-    if m:
-        title = m.group(1).strip()
-        author = m.group(2).strip()
-        return ("book", f"{title} — {author}")
-    if re.search(r'\bmovie|film|poster\b', s, re.I):
-        return ("film", s.replace("poster", "").strip(' "'))
-    if len(s.split()) in (2, 3) and s[0].isupper():
-        return (None, None)
-    return (None, None)
-
 def parse_json_loose(text: str) -> Optional[dict]:
     if not text:
         return None
@@ -156,20 +145,84 @@ def parse_json_loose(text: str) -> Optional[dict]:
     return None
 
 # =========================
+# ENTITY DETECTION (Heuristik + LLM-Router mit Bias)
+# =========================
+def normalize_entity(raw: str, expected_type: Optional[str] = None) -> Tuple[Optional[str], Optional[str]]:
+    """Wenn ein Typ erwartet wird, vertraue auf diesen—sonst einfache Muster."""
+    s = (raw or "").strip()
+    if not s:
+        return (None, None)
+
+    if expected_type in {"book", "podcast", "person", "tool", "film"}:
+        name = s.strip(' "“”')
+        # Spezialfall Buch mit "by/von/from": Titel — Autor (wir nutzen hier nur den Titel als Suchschlüssel)
+        m = re.search(r'["“]?([^"\n]+?)["”]?\s+(?:by|von|from)\s+([A-Za-zÀ-ÖØ-öø-ÿ\.\-\s]+)$', s, re.I)
+        if expected_type == "book" and m:
+            title = m.group(1).strip()
+            return ("book", title)
+        return (expected_type, name)
+
+    # Fallback ohne Kontext: „Titel by/von Autor“
+    m = re.search(r'["“]?([^"\n]+?)["”]?\s+(?:by|von|from)\s+([A-Za-zÀ-ÖØ-öø-ÿ\.\-\s]+)$', s, re.I)
+    if m:
+        title = m.group(1).strip()
+        return ("book", title)
+
+    # Kurzer Titel → weiche Buch-Heuristik
+    words = s.split()
+    if 1 <= len(words) <= 6 and any(w[0:1].isupper() for w in words):
+        return ("book", s.strip(' "“”'))
+
+    return (None, None)
+
+def route_entity_with_gpt(text: str, expected_type: Optional[str] = None) -> Tuple[Optional[str], Optional[str]]:
+    sys = (
+        "You extract ONE public entity if present. Types: book|podcast|person|tool|film|none.\n"
+        "Return ONLY JSON: {\"detected\":true|false,\"entity_type\":\"book|podcast|person|tool|film|none\",\"entity_name\":\"...\"}.\n"
+    )
+    if expected_type:
+        sys += f"Strong prior: The user was just asked for a {expected_type}. Prefer that type if plausible.\n"
+        sys += "If it looks like a short titled phrase, choose the expected type.\n"
+
+    fewshot = [
+        {"role":"user","content":"Data Inspired"},
+        {"role":"assistant","content":'{"detected":true,"entity_type":"book","entity_name":"Data Inspired"}'},
+        {"role":"user","content":"Lex Fridman podcast"},
+        {"role":"assistant","content":'{"detected":true,"entity_type":"podcast","entity_name":"Lex Fridman Podcast"}'},
+        {"role":"user","content":"Demis Hassabis"},
+        {"role":"assistant","content":'{"detected":true,"entity_type":"person","entity_name":"Demis Hassabis"}'},
+        {"role":"user","content":"The Neverending Story"},
+        {"role":"assistant","content":'{"detected":true,"entity_type":"book","entity_name":"The Neverending Story"}'},
+    ]
+
+    try:
+        msgs = [{"role":"system","content": sys}]
+        msgs.extend(fewshot)
+        msgs.append({"role":"user","content": text})
+        resp = client.chat.completions.create(model=OPENAI_MODEL, messages=msgs)
+        data = parse_json_loose(resp.choices[0].message.content or "")
+        if data and data.get("detected") and data.get("entity_type") != "none":
+            return (data.get("entity_type"), data.get("entity_name"))
+    except Exception:
+        pass
+    return (None, None)
+
+# =========================
 # GPT-5 HELPERS (Hosted Web Search)
 # =========================
 def hosted_search_best_image(entity_type: str, entity_name: str) -> Dict[str, Any]:
     """
-    Hosted Web Search via Responses API — NO response_format / NO reasoning.
-    Model instructed to return JSON only:
-      { "url": "...jpg|png", "page_url":"...", "source":"...", "confidence":0-1, "reason":"..." }
+    Hosted Web Search via Responses API — Tool-Call wird NUR hier erzwungen.
+    Erwartetes JSON:
+      { "url":"...jpg|png", "page_url":"...", "source":"...", "confidence":0-1, "reason":"..." }
     """
     prefer = PREFERRED_DOMAINS.get(entity_type, [])
     instruction = (
-        "Task: Find ONE authoritative image for the given public item.\n"
+        "Task: Use the web_search tool to find ONE authoritative image for the given public item.\n"
         f"- Item type: {entity_type}\n"
         f"- Prefer domains: {', '.join(prefer) if prefer else 'none'}\n"
-        "- MUST return a direct image URL (.jpg or .png), not an HTML page.\n"
+        "- You MUST call the web_search tool (do not answer from memory).\n"
+        "- Return a direct image URL (.jpg or .png), not an HTML page.\n"
         "- Avoid thumbnails, memes, watermarks, or wrong items.\n"
         "- OUTPUT: a single JSON object with keys: url, page_url, source, confidence, reason. No extra text."
     )
@@ -177,16 +230,14 @@ def hosted_search_best_image(entity_type: str, entity_name: str) -> Dict[str, An
         resp = client.responses.create(
             model=OPENAI_MODEL,
             tools=[{"type": "web_search"}],
-            tool_choice="auto",
-            input=[
-                {
-                    "role": "user",
-                    "content": [
-                        {"type": "input_text", "text": instruction},
-                        {"type": "input_text", "text": f"Item: {entity_name}"}
-                    ]
-                }
-            ]
+            tool_choice={"type": "tool", "name": "web_search"},  # ERZWINGEN
+            input=[{
+                "role":"user",
+                "content":[
+                    {"type":"input_text","text": instruction},
+                    {"type":"input_text","text": f"Item: {entity_name}"}
+                ]
+            }]
         )
         out_text = getattr(resp, "output_text", None)
         if not out_text and hasattr(resp, "output"):
@@ -202,12 +253,12 @@ def hosted_search_best_image(entity_type: str, entity_name: str) -> Dict[str, An
         return {"status":"error","best_image_url":"","candidates":[],"notes": f"web_search error: {e}"}
 
 def preflight_web_search():
-    """Probe hosted web_search using only input_text blocks."""
+    """Probe hosted web_search; reine input_text-Blöcke; keine Structured Outputs-Parameter."""
     try:
         _ = client.responses.create(
             model=OPENAI_MODEL,
             tools=[{"type":"web_search"}],
-            tool_choice="auto",
+            tool_choice={"type":"tool","name":"web_search"},
             input=[{
                 "role":"user",
                 "content":[
@@ -221,29 +272,9 @@ def preflight_web_search():
         st.session_state.web_search_err = str(e)
 
 # =========================
-# GPT-5 HELPERS (Chat: Routing / Insights / Finalize)
+# GPT-5 HELPERS (Insights + Finalize)
 # =========================
-def route_entity_with_gpt(text: str) -> Tuple[Optional[str], Optional[str]]:
-    """Chat Completions — ask for JSON ONLY; parse loosely."""
-    sys = (
-        "Extract one PUBLIC entity if present. Types: book|podcast|person|tool|film|none.\n"
-        "If found, return ONLY JSON: {\"detected\":true,\"entity_type\":\"book|...\",\"entity_name\":\"...\"}\n"
-        "Else return: {\"detected\":false,\"entity_type\":\"none\",\"entity_name\":\"\"}"
-    )
-    try:
-        resp = client.chat.completions.create(
-            model=OPENAI_MODEL,
-            messages=[{"role":"system","content": sys},{"role":"user","content": text}]
-        )
-        data = parse_json_loose(resp.choices[0].message.content or "")
-        if data and data.get("detected") and data.get("entity_type") != "none":
-            return (data.get("entity_type"), data.get("entity_name"))
-    except Exception:
-        pass
-    return (None, None)
-
 def distill_insights_with_gpt(text: str, context_hint: str = "") -> Tuple[Optional[str], List[str]]:
-    """Chat Completions — extract label + 2–4 bullets; return JSON-only & parse."""
     sys = (
         "From the user's message, extract one concise 'label' and 2–4 crisp 'bullets'. "
         "Return ONLY JSON: {\"label\":\"...\",\"bullets\":[\"...\",\"...\"]}"
@@ -286,39 +317,50 @@ def finalize_card_with_gpt(notes: List[Dict[str, Any]]) -> Dict[str, str]:
         return {}
 
 # =========================
-# CHAT AGENT
+# CHAT AGENT (kontextsensitiv)
 # =========================
-CHAT_POLICY = (
-    "ROLE\nYou are a concise interviewer.\n"
-    "GOALS\n1) Identify PUBLIC items (book, podcast, person, tool, film).\n"
-    "2) Get the user's personal insight/practice about them.\n"
-    "RULES\n- Exactly ONE short question per turn.\n- If a PUBLIC item was mentioned, do not ask for confirmation.\n"
-    "TONE\nWarm, specific, professional; no fluff."
-)
-
-def state_summary() -> str:
-    parts = []
-    for sid in st.session_state.slot_order:
+def _slot_context() -> Tuple[Optional[str], Optional[str], List[str]]:
+    """Hole den letzten gefüllten Slot: (entity_type_guess, label, bullets). Einfache Heuristik."""
+    for sid in reversed(st.session_state.slot_order):
         s = st.session_state.slots.get(sid)
-        if not s:
-            parts.append(f"{sid}: (empty)")
-        else:
-            done = "done" if s.get("done") else "open"
-            parts.append(f"{sid}: {s.get('label','(pending)')} [{done}]")
-    return "STATE\n" + " | ".join(parts) + f"\nCURRENT_SLOT_ID={current_slot_id()}"
+        if s and s.get("bullets"):
+            label = s.get("label", "")
+            bullets = s.get("bullets", [])
+            # Type-Guesstimate aus Label
+            lt = label.lower()
+            if "podcast" in lt:
+                t = "podcast"
+            elif "must-read" in lt or "book" in lt or " — " in label:
+                t = "book"
+            elif "role model" in lt or "person" in lt:
+                t = "person"
+            elif "tool" in lt:
+                t = "tool"
+            elif "influence" in lt or "film" in lt:
+                t = "film"
+            else:
+                t = None
+            return (t, label, bullets)
+    return (None, None, [])
 
 def chat_reply() -> str:
-    msgs = [
-        {"role":"system","content": CHAT_POLICY},
-        {"role":"system","content": state_summary()}
-    ]
-    tail = [m for m in st.session_state.history if m["role"] in ("user","assistant")]
-    msgs.extend(tail[-6:])
-    res = client.chat.completions.create(model=OPENAI_MODEL, messages=msgs)
-    text = (res.choices[0].message.content or "").strip()
-    if not text or not text.endswith("?"):
-        text = "What changed in your practice after this?"
-    return text
+    etype, label, bullets = _slot_context()
+    if etype == "book":
+        joined = " ".join(bullets).lower()
+        is_non_tech = any(k in joined for k in ["novel", "fantasy", "film", "story", "empress", "luckdragon", "imagination"])
+        if is_non_tech:
+            return "That’s an unusual pick for Data & AI. What’s the bridge between this book and your professional practice?"
+        else:
+            return "What is one specific habit or decision-making change you kept from that book?"
+    elif etype == "podcast":
+        return "Which single episode would you recommend first — and why?"
+    elif etype == "person":
+        return "What concrete practice from them have you actually adopted?"
+    elif etype == "film":
+        return "Which theme from the film do you carry into your day-to-day decisions?"
+    elif etype == "tool":
+        return "In what recurring situation is this tool your default choice — and what does it replace?"
+    return "What changed in your practice after this?"
 
 # =========================
 # ORCHESTRATOR
@@ -339,7 +381,7 @@ class Orchestrator:
             "done": False,
             "media": {"status":"pending","best_image_url":"","candidates":[],"notes":""}
         })
-        if label is not None: s["label"] = label[:120]
+        if label is not None: s["label"] = label[:160]
         if bullets is not None: s["bullets"] = [b.strip() for b in bullets][:4]
         if done is not None: s["done"] = bool(done)
         self.slots[slot_id] = s
@@ -363,35 +405,46 @@ class Orchestrator:
         st.toast("🔎 Image search started…", icon="🖼️")
 
     def _media_job(self, slot_id: str, entity_type: str, entity_name: str) -> Dict[str, Any]:
-        res = hosted_search_best_image(entity_type, entity_name)
-        if res.get("status") in ("found","error"):
-            res["slot_id"] = slot_id
-            return res
-        return {
-            "slot_id": slot_id,
-            "status":"generated",
-            "best_image_url": generate_placeholder_icon(entity_name or entity_type, slot_id),
-            "candidates": [],
-            "notes": "placeholder"
-        }
+        try:
+            res = hosted_search_best_image(entity_type, entity_name)
+            if res.get("status") in ("found","error"):
+                res["slot_id"] = slot_id
+                return res
+            # kein parsebares Ergebnis → Placeholder
+            return {
+                "slot_id": slot_id,
+                "status":"generated",
+                "best_image_url": generate_placeholder_icon(entity_name or entity_type, slot_id),
+                "candidates": [],
+                "notes": "placeholder"
+            }
+        except Exception as e:
+            return {
+                "slot_id": slot_id,
+                "status":"error",
+                "best_image_url":"",
+                "candidates":[],
+                "notes": f"job error: {e}"
+            }
 
     def poll_media(self) -> List[str]:
-        updated = []
-        to_delete = []
+        updated, to_delete = [], []
         for job_id, (slot_id, fut) in list(self.media_jobs.items()):
             if fut.done():
+                res = {"status":"error","best_image_url":"","candidates":[],"notes":"unknown"}
                 try:
                     res = fut.result()
-                    s = self.slots.get(slot_id)
-                    if s:
-                        m = s["media"]
-                        m["status"] = res.get("status","none")
-                        m["best_image_url"] = res.get("best_image_url","")
-                        m["candidates"] = res.get("candidates",[])
-                        m["notes"] = res.get("notes","")
-                        updated.append(slot_id)
-                finally:
-                    to_delete.append(job_id)
+                except Exception as e:
+                    res["notes"] = f"future error: {e}"
+                s = self.slots.get(slot_id)
+                if s:
+                    m = s["media"]
+                    m["status"] = res.get("status","error")
+                    m["best_image_url"] = res.get("best_image_url","")
+                    m["candidates"] = res.get("candidates",[])
+                    m["notes"] = res.get("notes","")
+                    updated.append(slot_id)
+                to_delete.append(job_id)
         for j in to_delete:
             del self.media_jobs[j]
         return updated
@@ -413,12 +466,12 @@ class Orchestrator:
 # FLOW
 # =========================
 def process_user_message(text: str, orch: Orchestrator):
-    # 1) Entity detect (heuristic + GPT)
-    e_type, e_name = normalize_entity(text)
+    # 1) Entität ermitteln: harte Heuristik (mit expected_type) → LLM-Router (mit Bias)
+    e_type, e_name = normalize_entity(text, expected_type=st.session_state.expected_type)
     if not e_type:
-        e_type, e_name = route_entity_with_gpt(text)
+        e_type, e_name = route_entity_with_gpt(text, expected_type=st.session_state.expected_type)
 
-    # If public entity → schedule media
+    # 2) Wenn Item erkannt → Slot + Media-Suche
     if e_type and e_type != "none" and e_name:
         sid = current_slot_id()
         label_hint = {
@@ -428,23 +481,18 @@ def process_user_message(text: str, orch: Orchestrator):
         orch.upsert_slot(sid, label=f"{label_hint} — {e_name}", bullets=None, done=False)
         orch.schedule_media_search(sid, e_type, e_name)
 
-    # 2) Insights
+    # 3) Insights extrahieren (immer erlaubt)
     sid2 = current_slot_id()
-    hint = e_name or ""
-    lab, bullets = distill_insights_with_gpt(text, context_hint=hint)
+    lab, bullets = distill_insights_with_gpt(text, context_hint=e_name or "")
     if bullets:
-        target_sid = sid2
-        s_cur = st.session_state.slots.get(sid2)
-        if s_cur and s_cur.get("media",{}).get("status") in ("searching","found","generated") and s_cur.get("bullets"):
-            if st.session_state.current_slot_ix < 3:
-                st.session_state.current_slot_ix += 1
-                target_sid = current_slot_id()
-        orch.upsert_slot(target_sid, label=lab or (hint if hint else "Practice"), bullets=bullets, done=True)
+        orch.upsert_slot(sid2, label=lab or (e_name or "Practice"), bullets=bullets, done=True)
         advance_slot()
 
-    # 3) Next question
-    reply = chat_reply()
-    st.session_state.history.append({"role":"assistant","content": reply})
+    # 4) Nächste Frage + expected_type setzen (hier: neutral, kann man steuern)
+    q = chat_reply()
+    st.session_state.history.append({"role":"assistant","content": q})
+    # Beispiel-Strategie: nach Buch → keine feste Erwartung; für Folgefragen könntest du hier "person"/"podcast" setzen
+    st.session_state.expected_type = None
 
 # =========================
 # UI
@@ -524,8 +572,9 @@ def render_final_card():
             st.markdown(f"**{label}**")
             st.write(line)
 
-# --- MAIN (Patch) ---
-
+# =========================
+# MAIN
+# =========================
 st.set_page_config(page_title=APP_TITLE, page_icon="🟡", layout="wide")
 st.title(APP_TITLE)
 st.caption("GPT-5 only • Hosted Web Search • Async media • One short question per turn")
@@ -533,47 +582,40 @@ st.caption("GPT-5 only • Hosted Web Search • Async media • One short quest
 client = get_client()
 init_state()
 
-# 1) Preflight hosted web_search once (vor UI-Render, aber nach State-Init)
+# Preflight hosted web_search einmalig (vor UI)
 if st.session_state.web_search_ok is None:
     preflight_web_search()
-
 if st.session_state.web_search_ok is False:
     st.error(f"Hosted web_search not available: {st.session_state.web_search_err}")
 
 orch = Orchestrator()
 
-# 2) **Seed**: Erste Assistentenfrage früh setzen (VOR jeglichem Render!)
-def ensure_seed_question():
-    # Falls noch kein Assistant-Post im Verlauf ist, jetzt hinzufügen
-    if not any(m["role"] == "assistant" for m in st.session_state.history):
-        st.session_state.history.append({
-            "role": "assistant",
-            "content": "Hi! Which single book most changed how you think about building data-driven products? Title only."
-        })
+# Seed-Frage VOR erstem Render und Erwartung setzen
+if not any(m["role"] == "assistant" for m in st.session_state.history):
+    st.session_state.history.append({
+        "role":"assistant",
+        "content":"Hi! Which single book most changed how you think about building data-driven products? Title only."
+    })
+    st.session_state.expected_type = "book"
 
-ensure_seed_question()
-
-# 3) Poll Media-Jobs (kann Toasts erzeugen)
+# Media-Jobs poll’en
 updated_slots = orch.poll_media()
 if updated_slots:
     for sid in updated_slots:
         st.toast(f"Media updated: {sid}", icon="🖼️")
 
-# 4) Jetzt ERST rendern (Timeline/Chat)
+# Render
 render_progress_and_timeline()
 render_chat_history()
 
-# 5) Eingabe
+# Input
 user_text = st.chat_input("Your turn…")
-
 if user_text:
-    # Alles stateful erledigen VOR UI-Render
     st.session_state.history.append({"role":"user","content": user_text})
     process_user_message(user_text, orch)
-    # Sofort rerun, damit die eben hinzugefügte Assistant-Nachricht sichtbar wird
     st.rerun()
 
-# 6) Actions & Final Card (rendern zum Schluss)
+# Actions
 c1, c2, c3 = st.columns(3)
 with c1:
     if st.button("✨ Finalize (needs 4 slots)"):
