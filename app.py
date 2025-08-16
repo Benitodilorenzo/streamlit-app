@@ -2,13 +2,11 @@
 # Single-file Streamlit app — GPT-5 only, Hosted Web Search (Responses API),
 # async media, context-sensitive interview, four-slot Expert Card.
 #
-# Requirements:
-#   pip install streamlit openai pillow requests
-#
-# Environment:
-#   OPENAI_API_KEY                (required)
-#   OPENAI_GPT5_SNAPSHOT          (optional, default: gpt-5-2025-08-07)
-#   OPENAI_CHAT_MODEL             (optional, default: snapshot)
+# pip install streamlit openai pillow requests
+# ENV:
+#   OPENAI_API_KEY (required)
+#   OPENAI_GPT5_SNAPSHOT (optional, default: gpt-5-2025-08-07)
+#   OPENAI_CHAT_MODEL    (optional, default: same as snapshot)
 
 import os, re, uuid, json
 from typing import List, Dict, Any, Optional, Tuple
@@ -73,9 +71,9 @@ def init_state():
     st.session_state.final_lines: Dict[str, str] = {}
     st.session_state.web_search_ok = None
     st.session_state.web_search_err = ""
-    st.session_state.web_tool = "web_search"  # will be set by preflight
+    st.session_state.web_tool = "web_search"  # set by preflight when verified
 
-    # Erwarteter Entitätstyp für die nächste User-Antwort (steuert Erkennung)
+    # Erwarteter Entitätstyp für die nächste Nutzerantwort (Lenkung der Heuristik)
     st.session_state.expected_type: Optional[str] = None  # "book" | "podcast" | "person" | "tool" | "film" | None
 
 def current_slot_id() -> str:
@@ -94,7 +92,6 @@ def _get(url, params=None, headers=None, timeout=HTTP_TIMEOUT):
     return requests.get(url, params=params, headers=h, timeout=timeout)
 
 def _measure_text(draw: ImageDraw.ImageDraw, font: ImageFont.FreeTypeFont, txt: str) -> Tuple[int,int]:
-    # Robust gegen verschiedene Pillow-Versionen (ohne draw.textsize)
     try:
         bbox = draw.textbbox((0, 0), txt, font=font)
         return bbox[2] - bbox[0], bbox[3] - bbox[1]
@@ -105,7 +102,6 @@ def _measure_text(draw: ImageDraw.ImageDraw, font: ImageFont.FreeTypeFont, txt: 
         return bbox[2] - bbox[0], bbox[3] - bbox[1]
     except Exception:
         pass
-    # crude fallback
     w = int(font.getlength(txt)) if hasattr(font, "getlength") else 12 * len(txt)
     ascent, descent = font.getmetrics() if hasattr(font, "getmetrics") else (10, 4)
     return w, ascent + descent
@@ -148,8 +144,7 @@ def parse_json_loose(text: str) -> Optional[dict]:
         return json.loads(text)
     except Exception:
         pass
-    start = text.find("{")
-    end = text.rfind("}")
+    start = text.find("{"); end = text.rfind("}")
     if start != -1 and end != -1 and end > start:
         snippet = text[start:end+1]
         try:
@@ -180,7 +175,7 @@ def normalize_entity(raw: str, expected_type: Optional[str] = None) -> Tuple[Opt
         return ("book", title)
 
     words = s.split()
-    if 1 <= len(words) <= 6 and any(w[0:1].isupper() for w in words):
+    if 1 <= len(words) <= 6 and any(w[:1].isupper() for w in words):
         return ("book", s.strip(' "“”'))
 
     return (None, None)
@@ -218,14 +213,12 @@ def route_entity_with_gpt(text: str, expected_type: Optional[str] = None) -> Tup
     return (None, None)
 
 # =========================
-# GPT-5 HELPERS (Hosted Web Search)
+# HOSTED WEB SEARCH HELPERS
 # =========================
 def _extract_output_text(resp) -> Optional[str]:
-    # Prefer resp.output_text; if absent, try to gather text from any output items.
     txt = getattr(resp, "output_text", None)
     if txt:
         return txt
-    # Some SDKs expose .output as list/obj; try best-effort flatten
     out = getattr(resp, "output", None)
     if isinstance(out, str):
         return out
@@ -233,7 +226,6 @@ def _extract_output_text(resp) -> Optional[str]:
         parts = []
         for item in out:
             if isinstance(item, dict):
-                # responses-style content may live under item.get("content")
                 c = item.get("content")
                 if isinstance(c, list):
                     for piece in c:
@@ -246,86 +238,112 @@ def _extract_output_text(resp) -> Optional[str]:
             return "\n".join(parts)
     return None
 
+def _response_contains_tool_call(resp) -> bool:
+    # Robust (SDKs variieren): alles in JSON-String wandeln und nach Mustern suchen
+    try:
+        blob = resp.model_dump_json()  # pydantic style in neueren SDKs
+    except Exception:
+        try:
+            blob = json.dumps(resp.__dict__, default=str)
+        except Exception:
+            blob = str(resp)
+    blob_low = blob.lower()
+    # typische Marker
+    markers = ["tool_call", "tool_use", '"tool":', '"web_search"', '"web_search_preview"']
+    return any(m in blob_low for m in markers)
+
 def hosted_search_best_image(entity_type: str, entity_name: str) -> Dict[str, Any]:
     prefer = PREFERRED_DOMAINS.get(entity_type, [])
-    instruction = (
-        "Use the web_search tool to find ONE authoritative image for the item. "
-        "Prefer domains: " + (", ".join(prefer) if prefer else "none") + ". "
-        "Return ONLY JSON with keys: url, page_url, source, confidence, reason. "
-        "If you cannot call the tool, return exactly: {\"error\":\"no_tool\"}."
-    )
-    try:
+    def attempt(hard: bool) -> Tuple[Optional[dict], str, bool]:
         tool = st.session_state.get("web_tool", "web_search")
-        resp = client.responses.create(
-            model=OPENAI_MODEL,
-            tools=[{"type": tool}],         # web_search or web_search_preview
-            tool_choice="auto",             # <-- snapshot requires auto for hosted web search
-            input=[{
-                "role": "user",
-                "content": [
-                    {"type": "input_text", "text": f"Item type: {entity_type}"},
-                    {"type": "input_text", "text": f"Item: {entity_name}"},
-                    {"type": "input_text", "text": instruction}
-                ]
-            }]
+        prefer_txt = ", ".join(prefer) if prefer else "none"
+        instruction = (
+            "Use the web_search tool to find ONE authoritative image for the item. "
+            f"Prefer domains: {prefer_txt}. "
+            "Return ONLY JSON with keys: url, page_url, source, confidence, reason."
         )
-        out_text = _extract_output_text(resp)
-        data = parse_json_loose(out_text or "")
-        if isinstance(data, dict):
-            if data.get("error") == "no_tool":
-                return {"status":"error","best_image_url":"","candidates":[],"notes":"model did not invoke web_search"}
-            if data.get("url") and data.get("page_url"):
-                return {
-                    "status": "found",
-                    "best_image_url": data["url"],
-                    "candidates": [data],
-                    "notes": data.get("reason", "")
-                }
-        return {
-            "status": "error",
-            "best_image_url": "",
-            "candidates": [],
-            "notes": "web_search returned no parseable JSON"
-        }
-    except Exception as e:
-        return {
-            "status": "error",
-            "best_image_url": "",
-            "candidates": [],
-            "notes": f"web_search error: {e}"
-        }
-
-def preflight_web_search():
-    last_err = "no web_search tool available"
-    for tool in ("web_search", "web_search_preview"):
+        if hard:
+            instruction = (
+                "You MUST CALL the web_search tool. Do not fabricate answers. "
+                "Find ONE authoritative direct image URL (.jpg|.png), prefer domains above. "
+                "Return ONLY JSON: {\"url\":\"...\",\"page_url\":\"...\",\"source\":\"...\",\"confidence\":0-1,\"reason\":\"...\"}"
+            )
         try:
-            _ = client.responses.create(
+            resp = client.responses.create(
                 model=OPENAI_MODEL,
                 tools=[{"type": tool}],
-                tool_choice="auto",   # <-- allow only auto
+                tool_choice="auto",   # snapshot erlaubt nur auto
                 input=[{
                     "role":"user",
                     "content":[
-                        {"type":"input_text","text":
-                         "Return JSON: {\"url\":\"https://example.com/a.jpg\","
-                         "\"page_url\":\"https://example.com\",\"source\":\"example.com\","
-                         "\"confidence\":0.1,\"reason\":\"test\"}"}]}]
+                        {"type":"input_text","text": f"Item type: {entity_type}"},
+                        {"type":"input_text","text": f"Item: {entity_name}"},
+                        {"type":"input_text","text": instruction},
+                    ]
+                }]
             )
-            st.session_state.web_search_ok = True
-            st.session_state.web_tool = tool
-            return
+            txt = _extract_output_text(resp)
+            data = parse_json_loose(txt or "")
+            called = _response_contains_tool_call(resp)
+            return (data, txt or "", called)
+        except Exception as e:
+            return (None, f"error: {e}", False)
+
+    # Pass 1 (weich), Pass 2 (hart)
+    data, raw, called = attempt(hard=False)
+    if not called:
+        data2, raw2, called2 = attempt(hard=True)
+        data, raw, called = (data2, raw2, called2)
+
+    if isinstance(data, dict) and data.get("url") and data.get("page_url"):
+        return {
+            "status":"found",
+            "best_image_url": data["url"],
+            "candidates":[data],
+            "notes": f"{'tool_called' if called else 'no_tool_detected'}"
+        }
+
+    # Kein parsebares Ergebnis → Placeholder
+    return {
+        "status":"error",
+        "best_image_url":"",
+        "candidates":[],
+        "notes": f"{'tool_not_called' if not called else 'no_parseable_json'}"
+    }
+
+def preflight_web_search():
+    last_err = "no hosted tool"
+    for tool in ("web_search", "web_search_preview"):
+        try:
+            resp = client.responses.create(
+                model=OPENAI_MODEL,
+                tools=[{"type": tool}],
+                tool_choice="auto",
+                input=[{
+                    "role":"user",
+                    "content":[
+                        {"type":"input_text","text":"Find any image of 'OpenAI logo'. Return ONLY JSON {\"url\":\"https://example.com/a.jpg\",\"page_url\":\"https://example.com\",\"source\":\"example.com\",\"confidence\":0.1,\"reason\":\"test\"}."}
+                    ]
+                }]
+            )
+            if _response_contains_tool_call(resp):
+                st.session_state.web_search_ok = True
+                st.session_state.web_tool = tool
+                return
+            else:
+                last_err = "model did not call the tool during preflight (auto)"
         except Exception as e:
             last_err = str(e)
     st.session_state.web_search_ok = False
     st.session_state.web_search_err = last_err
 
 # =========================
-# GPT-5 HELPERS (Insights + Finalize)
+# INSIGHTS + FINALIZE (GPT-5)
 # =========================
 def distill_insights_with_gpt(text: str, context_hint: str = "") -> Tuple[Optional[str], List[str]]:
     sys = (
         "Extract ONE short 'label' and 2–4 bullets that capture the user's personal angle or practice "
-        "about the mentioned item (not general Wikipedia facts). "
+        "about the mentioned item (not general facts). "
         "Return ONLY JSON: {\"label\":\"...\",\"bullets\":[\"...\",\"...\"]}"
     )
     if context_hint:
@@ -366,8 +384,10 @@ def finalize_card_with_gpt(notes: List[Dict[str, Any]]) -> Dict[str, str]:
         return {}
 
 # =========================
-# CHAT AGENT (kontextsensitiv)
+# CHAT AGENT — bessere Folgefrage
 # =========================
+NONTECH_TOKENS = {"novel","fantasy","story","empress","luckdragon","imagination","myth","poem","allegory"}
+
 def _slot_context() -> Tuple[Optional[str], Optional[str], List[str]]:
     for sid in reversed(st.session_state.slot_order):
         s = st.session_state.slots.get(sid)
@@ -391,21 +411,19 @@ def _slot_context() -> Tuple[Optional[str], Optional[str], List[str]]:
     return (None, None, [])
 
 def chat_reply() -> str:
-    etype, _, bullets = _slot_context()
+    etype, label, bullets = _slot_context()
     if etype == "book":
         joined = " ".join(bullets).lower()
-        is_non_tech = any(k in joined for k in ["novel", "fantasy", "film", "story", "empress", "luckdragon", "imagination"])
-        if is_non_tech:
-            return "That’s an unusual pick for Data & AI. What’s the bridge between this book and your professional practice?"
-        else:
-            return "What is one specific habit or decision-making change you kept from that book?"
-    elif etype == "podcast":
+        if any(tok in joined for tok in NONTECH_TOKENS):
+            return "Interesting pick. What’s the bridge between this book and your day-to-day Data & AI work?"
+        return "What is one specific habit or decision-making change you kept from that book?"
+    if etype == "podcast":
         return "Which single episode would you recommend first — and why?"
-    elif etype == "person":
+    if etype == "person":
         return "What concrete practice from them have you actually adopted?"
-    elif etype == "film":
+    if etype == "film":
         return "Which theme from the film do you carry into your day-to-day decisions?"
-    elif etype == "tool":
+    if etype == "tool":
         return "In what recurring situation is this tool your default choice — and what does it replace?"
     return "What changed in your practice after this?"
 
@@ -512,12 +530,12 @@ class Orchestrator:
 # FLOW
 # =========================
 def process_user_message(text: str, orch: Orchestrator):
-    # 1) Entität ermitteln: Heuristik (mit expected_type) → LLM-Router (mit Bias)
+    # 1) Entität erkennen
     e_type, e_name = normalize_entity(text, expected_type=st.session_state.expected_type)
     if not e_type:
         e_type, e_name = route_entity_with_gpt(text, expected_type=st.session_state.expected_type)
 
-    # 2) Wenn Item erkannt → Slot + ggf. Media-Suche
+    # 2) Wenn Item erkannt → Slot + (ggf.) Media-Suche
     if e_type and e_type != "none" and e_name:
         sid = current_slot_id()
         label_hint = {
@@ -529,19 +547,18 @@ def process_user_message(text: str, orch: Orchestrator):
         if st.session_state.get("web_search_ok", False):
             orch.schedule_media_search(sid, e_type, e_name)
         else:
-            # sofortiger, sichtbarer Fallback → keine „searching“-Hänge
             path = generate_placeholder_icon(e_name or e_type, sid)
             s = orch.slots[sid]
-            s["media"] = {"status":"generated","best_image_url":path,"candidates":[],"notes":"web_search not available"}
+            s["media"] = {"status":"generated","best_image_url":path,"candidates":[],"notes":"web_search not available or not verified"}
 
-    # 3) Insights extrahieren (persönlicher Fokus)
+    # 3) Persönliche Insights (keine Wikipedia-Fakten)
     sid2 = current_slot_id()
     lab, bullets = distill_insights_with_gpt(text, context_hint=e_name or "")
     if bullets:
         orch.upsert_slot(sid2, label=lab or (e_name or "Practice"), bullets=bullets, done=True)
         advance_slot()
 
-    # 4) Nächste Frage (kontextsensitiv) + Erwartung neutralisieren
+    # 4) Nächste Frage
     q = chat_reply()
     st.session_state.history.append({"role":"assistant","content": q})
     st.session_state.expected_type = None
@@ -634,11 +651,11 @@ st.caption("GPT-5 only • Hosted Web Search • Async media • One short quest
 client = get_client()
 init_state()
 
-# Preflight hosted web_search einmalig (vor UI)
+# Preflight hosted web_search einmalig (und VERIFIZIEREN, dass Tool wirklich gerufen wurde)
 if st.session_state.web_search_ok is None:
     preflight_web_search()
 if st.session_state.web_search_ok is False:
-    st.error(f"Hosted web_search not available: {st.session_state.web_search_err}")
+    st.error(f"Hosted web_search not available or not verified: {st.session_state.web_search_err}")
 
 orch = Orchestrator()
 
