@@ -112,7 +112,7 @@ def next_free_slot() -> Optional[str]:
             return sid
     return None
 
-# ---------- Preflight hosted web_search_preview (now using Agent 2 model + JSON-only)
+# ---------- Preflight hosted web_search_preview  (FIX: remove response_format)
 def preflight():
     if st.session_state.web_search_ok is not None:
         return
@@ -123,9 +123,7 @@ def preflight():
             input=[{"role": "user", "content": "Return JSON: {\"ok\":true}"}],
             tools=[{"type": "web_search_preview"}],
             parallel_tool_calls=False,
-            response_format={"type": "json_object"},
-            store=False,
-            max_output_tokens=60
+            store=False
         )
         st.session_state.web_search_ok = True
     except Exception as e:
@@ -205,7 +203,7 @@ def agent1_next_question(history: List[Dict[str, str]]) -> str:
     st.session_state.used_openers.add(q.lower()[:72])
     return q
 
-# ---------- Agent 2 (Observer + Web Image Finder) — ultra-lean; JSON-only; 1 search; de-dupe
+# ---------- Agent 2 (Observer + Web Image Finder) — ultra-lean; JSON-only via prompt; 1 search; de-dupe
 AGENT2_SYSTEM = """You are Agent 2.
 
 Task:
@@ -252,9 +250,7 @@ def agent2_detect_and_search_multi(last_q: str, user_reply: str, seen_entities: 
             ],
             tools=[{"type": "web_search_preview"}],
             parallel_tool_calls=False,                 # no multi-source cascades
-            response_format={"type": "json_object"},   # JSON-only
-            store=False,                               # no hidden session state reuse
-            max_output_tokens=600                      # hard cap for output
+            store=False                                # no hidden session state reuse
         )
 
         # Optional: display token usage for Agent 2 (helps debugging)
@@ -464,7 +460,7 @@ def render_overrides():
 # ---------- Main
 st.set_page_config(page_title=APP_TITLE, page_icon="🟡", layout="wide")
 st.title(APP_TITLE)
-st.caption("Pure prompt orchestration • Hosted Web Search via Responses API • Agent 2: JSON-only, 1 search max, de-dupe")
+st.caption("Pure prompt orchestration • Hosted Web Search via Responses API • Agent 2: JSON-only via prompt, 1 search max, de-dupe")
 
 init_state()
 preflight()
