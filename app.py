@@ -253,7 +253,7 @@ def preflight_web_search():
         _ = client.responses.create(
             model=OPENAI_MODEL,
             tools=[{"type": "web_search"}],
-            tool_choice={"type":"tool","name":"web_search"},
+            tool_choice="web_search",
             input=[{
                 "role":"user",
                 "content":[
