@@ -1,6 +1,6 @@
 # app_expert_card_gpt5_3agents_clean.py
 # 3 Agents: Chat (Agent 1) · Search (Agent 2) · Finalize (Agent 3)
-# Agent 2: Google CSE Image API + Vision-Validierung; keine teuren Tool-Simulationen.
+# Agent 2: Google CSE Image API + Vision-Validierung; Debug-Sidebar sichtbar.
 
 import os, json, time, uuid, random, traceback, requests
 from typing import List, Dict, Any, Optional, Callable
@@ -67,6 +67,17 @@ def init_state():
     st.session_state.setdefault("final_text", "")
     st.session_state.setdefault("used_openers", set())
     st.session_state.setdefault("auto_finalized", False)
+    # Debugging
+    st.session_state.setdefault("debug_agent2", [])
+    st.session_state.setdefault("debug_limit", 60)
+
+def debug_log_agent2(event: Dict[str, Any]):
+    """Append debug events to sidebar log (keep last N)."""
+    event = dict(event)
+    event["ts"] = time.strftime("%H:%M:%S")
+    st.session_state.debug_agent2.append(event)
+    if len(st.session_state.debug_agent2) > st.session_state.debug_limit:
+        st.session_state.debug_agent2 = st.session_state.debug_agent2[-st.session_state.debug_limit:]
 
 # ---------- Utils
 def parse_json_loose(text: str) -> Optional[dict]:
@@ -117,6 +128,7 @@ def google_image_search(query: str, num: int = 4) -> List[Dict[str, str]]:
     searchType=image → liefert direkte Bild-Links in items[].link
     """
     if not GOOGLE_CSE_KEY or not GOOGLE_CSE_CX:
+        debug_log_agent2({"ev":"cse_keys_missing", "query": query, "key_set": bool(GOOGLE_CSE_KEY), "cx_set": bool(GOOGLE_CSE_CX)})
         return []
     try:
         params = {
@@ -128,6 +140,7 @@ def google_image_search(query: str, num: int = 4) -> List[Dict[str, str]]:
             "key": GOOGLE_CSE_KEY,
             "cx": GOOGLE_CSE_CX,
         }
+        debug_log_agent2({"ev":"cse_start", "query": query, "params": {"num": params["num"], "safe": "active"}})
         r = requests.get("https://www.googleapis.com/customsearch/v1", params=params, timeout=12)
         r.raise_for_status()
         data = r.json()
@@ -138,16 +151,14 @@ def google_image_search(query: str, num: int = 4) -> List[Dict[str, str]]:
             ctx  = (it.get("contextLink") or "").strip()
             if link and any(link.lower().endswith(ext) for ext in (".jpg",".jpeg",".png",".webp")):
                 out.append({"url": link, "page_url": ctx})
+        debug_log_agent2({"ev":"cse_done", "query": query, "returned": len(out)})
         return out
-    except Exception:
+    except Exception as e:
+        debug_log_agent2({"ev":"cse_error", "query": query, "error": str(e)})
         return []
 
 # ---------- Vision: Validate image vs. context
 def validate_image_with_context(image_url: str, entity_type: str, entity_name: str, q_text: str, a_text: str) -> Dict[str, Any]:
-    """
-    Fragt das Modell, ob das Bild plausibel zu (entity_type, entity_name) passt.
-    Ausgabe: {"ok": bool, "reason": "..."}
-    """
     sys = (
         "You are an image verifier. Respond with STRICT JSON like "
         "{\"ok\":true/false,\"reason\":\"...\"}. "
@@ -168,25 +179,24 @@ def validate_image_with_context(image_url: str, entity_type: str, entity_name: s
             model=AGENT2_MODEL,
             messages=[
                 {"role": "system", "content": sys},
-                {
-                    "role": "user",
-                    "content": [
-                        {"type": "text", "text": user_text},
-                        {"type": "image_url", "image_url": {"url": image_url}}
-                    ]
-                }
+                {"role": "user", "content": [
+                    {"type": "text", "text": user_text},
+                    {"type": "image_url", "image_url": {"url": image_url}}
+                ]}
             ]
         )
         txt = (resp.choices[0].message.content or "").strip()
         data = parse_json_loose(txt)
+        ok = bool(data.get("ok")) if isinstance(data, dict) else False
+        reason = (data.get("reason") if isinstance(data, dict) else "") or ""
+        debug_log_agent2({"ev":"vision_check", "item": f"{entity_type}|{entity_name}", "ok": ok, "reason": reason[:160], "img": image_url[:120]})
         if isinstance(data, dict) and "ok" in data:
-            return {"ok": bool(data.get("ok")), "reason": str(data.get("reason") or "")[:200]}
-    except Exception:
-        pass
-    # Fallback: wenn nicht parsebar, lieber ablehnen (konservativ)
+            return {"ok": ok, "reason": reason[:200]}
+    except Exception as e:
+        debug_log_agent2({"ev":"vision_error", "item": f"{entity_type}|{entity_name}", "error": str(e)})
     return {"ok": False, "reason": "unverifiable"}
 
-# ---------- Agent 1 (Interview) — unverändert
+# ---------- Agent 1 (Interview)
 AGENT1_SYSTEM = """You are Agent 1 — a warm, incisive interviewer.
 
 ## Identity & Scope
@@ -287,6 +297,7 @@ def agent2_extract_items(last_q: str, user_reply: str, seen_entities: List[str])
         "seen_entities": list(seen_entities or [])
     }
     try:
+        debug_log_agent2({"ev":"extract_start", "q_len": len(last_q), "a_len": len(user_reply)})
         resp = call_with_retry(
             client().chat.completions.create,
             model=AGENT2_MODEL,
@@ -296,14 +307,18 @@ def agent2_extract_items(last_q: str, user_reply: str, seen_entities: List[str])
             ]
         )
         raw = (resp.choices[0].message.content or "").strip()
+        debug_log_agent2({"ev":"extract_raw", "preview": raw[:240]})
         data = parse_json_loose(raw)
         if isinstance(data, dict):
+            debug_log_agent2({"ev":"extract_parsed", "detected": bool(data.get("detected")), "count": len(data.get("items") or [])})
             return data
+        debug_log_agent2({"ev":"extract_noparse"})
         return {"detected": False, "reason": "no-parse"}
     except Exception as e:
+        debug_log_agent2({"ev":"extract_error", "error": str(e)})
         return {"detected": False, "reason": f"error: {e}", "trace": traceback.format_exc()[:600]}
 
-# ---------- Agent 3 (Finalizer) — unverändert
+# ---------- Agent 3 (Finalizer)
 FINALIZER_SYSTEM = """You are Agent 3 — Finalizer.
 Create an Expert Card with exactly 4 items from:
 - The conversation (assistant questions + user answers).
@@ -367,21 +382,24 @@ class Orchestrator:
         jid = str(uuid.uuid4())[:8]
         fut = self.exec.submit(self._job, last_q, reply, list(self.seen))
         self.jobs[jid] = ("TBD", fut)
+        debug_log_agent2({"ev":"job_scheduled", "jid": jid})
         st.toast("🛰️ Agent 2 is extracting items + fetching images…", icon="🛰️")
 
     def _job(self, last_q: str, reply: str, seen_snapshot: List[str]) -> Dict[str, Any]:
         try:
             data = agent2_extract_items(last_q, reply, seen_snapshot)
             if not data.get("detected"):
+                debug_log_agent2({"ev":"job_skip_no_items"})
                 return {"status": "skip"}
 
             items = data.get("items") or []
-            # Dedupe & cap processing per run
+            debug_log_agent2({"ev":"job_items", "count": len(items)})
             processed = 0
             results: List[Dict[str, Any]] = []
 
             for item in items:
                 if processed >= MAX_SEARCHES_PER_RUN:
+                    debug_log_agent2({"ev":"job_cap_reached", "max": MAX_SEARCHES_PER_RUN})
                     break
                 etype = (item.get("entity_type") or "").lower().strip()
                 ename = (item.get("entity_name") or "").strip()
@@ -389,30 +407,34 @@ class Orchestrator:
                     continue
                 key = f"{etype}|{ename.lower()}"
                 if key in self.seen:
+                    debug_log_agent2({"ev":"item_dedupe_skip", "key": key})
                     continue
 
-                # Bildsuche über Google CSE
+                debug_log_agent2({"ev":"item_consider", "key": key})
                 imgs = google_image_search(ename, num=4)
+                debug_log_agent2({"ev":"item_search_results", "key": key, "n": len(imgs)})
+
                 if not imgs:
                     continue
 
-                # Vision-Validierung (max. 2 Versuche)
                 ok_url = ""
                 note = ""
+                tries = 0
                 for cand in imgs[:2]:
+                    tries += 1
                     v = validate_image_with_context(cand["url"], etype, ename, last_q, reply)
                     if v.get("ok"):
                         ok_url = cand["url"]
                         note = v.get("reason","")
+                        debug_log_agent2({"ev":"item_validate_ok", "key": key, "tries": tries})
                         break
                     else:
-                        note = v.get("reason","")
+                        debug_log_agent2({"ev":"item_validate_ko", "key": key, "tries": tries, "reason": v.get("reason","")[:160]})
 
                 if not ok_url:
-                    # keine valide Übereinstimmung → nicht anlegen
+                    debug_log_agent2({"ev":"item_no_valid_image", "key": key})
                     continue
 
-                # Jetzt Slot anlegen und als seen markieren
                 self.seen.append(key)
                 label_hint = {
                     "book": "Must-Read",
@@ -433,12 +455,15 @@ class Orchestrator:
                 sid = next_free_slot()
                 if not sid:
                     results.append({"status": "full", "label": label})
+                    debug_log_agent2({"ev":"slots_full"})
                     break
                 results.append({"status": "ok", "sid": sid, "label": label, "media": media})
+                debug_log_agent2({"ev":"slot_created", "sid": sid, "label": label})
                 processed += 1
 
             return {"status": "batch", "items": results}
         except Exception as e:
+            debug_log_agent2({"ev":"job_error", "error": str(e)})
             return {"status": "error", "error": str(e), "trace": traceback.format_exc()[:1200]}
 
     def poll(self) -> List[str]:
@@ -448,13 +473,18 @@ class Orchestrator:
                 rm.append(jid)
                 try:
                     res = fut.result()
-                except Exception:
+                except Exception as e:
+                    debug_log_agent2({"ev":"poll_exception", "error": str(e)})
                     continue
                 if res.get("status") == "batch":
                     for it in res.get("items", []):
                         if it.get("status") == "ok":
                             self.upsert(it["sid"], it["label"], it["media"])
                             updated.append(it["sid"])
+                elif res.get("status") == "skip":
+                    debug_log_agent2({"ev":"poll_skip"})
+                elif res.get("status") == "error":
+                    debug_log_agent2({"ev":"poll_error", "error": res.get("error")})
         for jid in rm:
             del self.jobs[jid]
         return updated
@@ -516,10 +546,22 @@ def render_overrides():
                     except Exception:
                         st.error("Could not read image.")
 
+def render_debug_sidebar():
+    st.sidebar.header("🔍 Agent 2 Debug")
+    st.sidebar.caption("Extraktion → Google CSE → Vision → Slots")
+    st.sidebar.write(f"Google CSE key: {'✅ set' if bool(GOOGLE_CSE_KEY) else '❌ MISSING'}")
+    st.sidebar.write(f"Google CSE cx : {'✅ set' if bool(GOOGLE_CSE_CX)  else '❌ MISSING'}")
+    st.sidebar.write(f"Seen entities: {len(st.session_state.seen_entities)}")
+    if st.session_state.debug_agent2:
+        for entry in reversed(st.session_state.debug_agent2):
+            st.sidebar.json(entry, expanded=False)
+    else:
+        st.sidebar.caption("No Agent-2 events yet.")
+
 # ---------- Main
 st.set_page_config(page_title=APP_TITLE, page_icon="🟡", layout="wide")
 st.title(APP_TITLE)
-st.caption("Agent 2: Google Image API (+Vision-Check) • Keine Tool-Simulation • Slots nur bei validem Bild")
+st.caption("Agent 2: Google Image API (+Vision-Check) • Sichtbares Debug • Slots nur bei validem Bild")
 
 init_state()
 
@@ -538,6 +580,7 @@ for sid in orch.poll():
 # Render UI
 render_slots()
 render_history()
+render_debug_sidebar()
 
 # Auto-finalize fallback
 if not st.session_state.auto_finalized:
