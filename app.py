@@ -216,22 +216,47 @@ def agent1_next_question(history: List[Dict[str,str]]) -> str:
     return q
 
 # -------- Agent 2 (Observer + Hosted Web Search) — nur letzte Q↔A
-AGENT2_SYSTEM = """\
+AGENT2_SYSTEM = """
 You are Agent 2 — Observer + Web Image Finder.
-Steps:
-  1) From the latest assistant question and the latest user reply, detect ONE PUBLIC item if present:
-     Types: book | podcast | person | tool | film.
-     If none, return ONLY: {"detected": false}.
-  2) If present, you MUST use the built-in web_search_preview tool to fetch ONE authoritative image.
-     • Return a direct image URL (.jpg/.jpeg/.png/.webp), not an HTML page.
-     • Prefer official sources; avoid thumbnails, memes, watermarks, wrong items.
-  3) Output ONLY JSON:
-     {"detected":true,"entity_type":"book|podcast|person|tool|film","entity_name":"...",
-      "url":"...","page_url":"...","source":"...","confidence":0..1,"reason":"..."}
-Notes:
-  • Do not hallucinate — if unsure, return detected=false.
-  • Use the tool even if you think you know it.
-  • Do NOT reference any examples; they are not part of this conversation.
+
+Your responsibilities:
+1. Monitor ONLY the latest user reply + latest assistant question (do not use full history).
+2. Detect if the reply contains at least ONE PUBLIC ITEM of these types:
+   • book
+   • podcast
+   • person
+   • tool
+   • film
+
+Rules for detection:
+- If no valid item is present, output EXACTLY:
+  {"detected": false}
+- If one valid item is present:
+  • You MUST call the built-in tool `web_search_preview`.
+  • Always search for the detected entity, even if you know it already.
+  • Never fabricate or simulate results.
+  • Return a single direct image URL (.jpg | .jpeg | .png | .webp).
+  • Prefer official or authoritative sources (publisher, author page, film studio, verified press).
+  • Reject memes, thumbnails, watermarked, unrelated images.
+  • If the tool returns nothing reliable → {"detected": false}.
+
+Output format:
+Return ONLY strict JSON in this structure:
+{
+  "detected": true,
+  "entity_type": "book|podcast|person|tool|film",
+  "entity_name": "...",
+  "url": "...",        // direct image link
+  "page_url": "...",   // page where the image is hosted
+  "source": "...",     // site name
+  "reason": "why this match is correct"
+}
+
+Important notes:
+- Always use the tool — do not rely on memory.
+- Do not simulate web search results.
+- Do not include reasoning text outside JSON.
+- If multiple possible matches exist, return the most authoritative one.
 """
 
 def agent2_detect_and_search(last_q: str, user_reply: str) -> Dict[str,Any]:
