@@ -16,7 +16,9 @@ MODEL = os.getenv("OPENAI_GPT5_SNAPSHOT", "gpt-5-2025-08-07")
 MEDIA_DIR = os.path.join(os.getcwd(), "media")
 os.makedirs(MEDIA_DIR, exist_ok=True)
 
-MAX_SEARCHES_PER_RUN = 2         # Agent 2: cap per turn
+# ---- Token/Cost controls
+MAX_SEARCHES_PER_RUN = 1         # Agent 2: cap per turn (was 2)
+AGENT2_MODEL = os.getenv("OPENAI_AGENT2_MODEL", "gpt-4o-mini")  # cheaper/smaller model for Agent 2
 OPENAI_MAX_RETRIES = 3           # Retry count for rate limits / 5xx
 OPENAI_BACKOFF_BASE = 1.8        # Exponential backoff base
 
@@ -110,17 +112,20 @@ def next_free_slot() -> Optional[str]:
             return sid
     return None
 
-# ---------- Preflight hosted web_search_preview
+# ---------- Preflight hosted web_search_preview (now using Agent 2 model + JSON-only)
 def preflight():
     if st.session_state.web_search_ok is not None:
         return
     try:
         _ = call_with_retry(
             client().responses.create,
-            model=MODEL,
+            model=AGENT2_MODEL,  # cheaper preflight
             input=[{"role": "user", "content": "Return JSON: {\"ok\":true}"}],
             tools=[{"type": "web_search_preview"}],
-            parallel_tool_calls=True
+            parallel_tool_calls=False,
+            response_format={"type": "json_object"},
+            store=False,
+            max_output_tokens=60
         )
         st.session_state.web_search_ok = True
     except Exception as e:
@@ -184,7 +189,6 @@ Don’t reveal internal agents/tools. Keep it professional. Mirror language swit
 4) Continue until 4 good items → give the handoff line.
 """
 
-
 def agent1_next_question(history: List[Dict[str, str]]) -> str:
     msgs = [{"role": "system", "content": AGENT1_SYSTEM}]
     if st.session_state.used_openers:
@@ -201,31 +205,16 @@ def agent1_next_question(history: List[Dict[str, str]]) -> str:
     st.session_state.used_openers.add(q.lower()[:72])
     return q
 
-# ---------- Agent 2 (Observer + Web Image Finder) — multi-item; de-dupe; capped searches
-# NO f-string for the big block; we inject MAX_SEARCHES_PER_RUN via replace to avoid brace escaping issues.
-AGENT2_SYSTEM = (
-"""You are Agent 2 — Observer + Web Image Finder.
+# ---------- Agent 2 (Observer + Web Image Finder) — ultra-lean; JSON-only; 1 search; de-dupe
+AGENT2_SYSTEM = """You are Agent 2.
 
-Inputs (provided as a single JSON in the user message each turn):
-- assistant_question: last question from Agent 1
-- user_reply: latest user reply
-- seen_entities: array of strings like "book|the little prince" already processed
+Task:
+- From assistant_question + user_reply extract 0..N PUBLIC items (book|podcast|person|tool|film).
+- Build keys "type|normalized_name" (lowercase). If a key is in seen_entities → action="skipped_duplicate".
+- For each NEW item: call web_search_preview **exactly once**. Choose the **first authoritative** source (official site / publisher / verified page) and return a **direct image** (.jpg|.jpeg|.png|.webp).
+- Stop after you have searched **at most 1 item** this turn. For any additional new items use action="detected_no_search".
 
-Your job each turn:
-1) From assistant_question + user_reply, extract ZERO OR MORE PUBLIC items:
-   Types: book | podcast | person | tool | film.
-   Use the question only for disambiguation; do not invent items.
-
-2) DEDUPE: For each detected item, build a key "type|normalized_name" (lowercase, trim quotes).
-   If the key is in seen_entities, DO NOT search it again; mark action="skipped_duplicate".
-
-3) For each new item, use the built-in web_search_preview tool to find ONE authoritative image:
-   - Return a direct image URL (.jpg/.jpeg/.png/.webp), not an HTML page.
-   - Prefer official sources; avoid thumbnails, memes, watermarks, wrong items.
-   - Perform at most MAX_SEARCHES=__CAP__ tool calls per run.
-   - If more new items exist than the cap, include the extras with action="detected_no_search" (no URL).
-
-4) OUTPUT ONLY strict JSON:
+Output ONLY strict JSON:
 {
   "detected": true|false,
   "items": [
@@ -236,19 +225,16 @@ Your job each turn:
       "url": "...",
       "page_url": "...",
       "source": "...",
-      "confidence": 0.0,
+      "confidence": 0.0-1.0,
       "reason": "one short sentence"
     }
   ]
 }
 
 Rules:
-- If no item is present, return {"detected": false}.
-- Never duplicate the same item within one response.
-- Never fabricate URLs; always use the tool for items you mark as "searched".
-- Keep reasons short.
+- If no item present → {"detected": false}
+- Do not fabricate URLs. No extra text outside JSON.
 """
-).replace("__CAP__", str(MAX_SEARCHES_PER_RUN))
 
 def agent2_detect_and_search_multi(last_q: str, user_reply: str, seen_entities: List[str]) -> Dict[str, Any]:
     payload = {
@@ -259,14 +245,26 @@ def agent2_detect_and_search_multi(last_q: str, user_reply: str, seen_entities: 
     try:
         resp = call_with_retry(
             client().responses.create,
-            model=MODEL,
+            model=AGENT2_MODEL,  # smaller/cheaper model for Agent 2
             input=[
                 {"role": "system", "content": AGENT2_SYSTEM},
                 {"role": "user", "content": json.dumps(payload, ensure_ascii=False)}
             ],
             tools=[{"type": "web_search_preview"}],
-            parallel_tool_calls=True
+            parallel_tool_calls=False,                 # no multi-source cascades
+            response_format={"type": "json_object"},   # JSON-only
+            store=False,                               # no hidden session state reuse
+            max_output_tokens=600                      # hard cap for output
         )
+
+        # Optional: display token usage for Agent 2 (helps debugging)
+        try:
+            usage = getattr(resp, "usage", None)
+            if usage:
+                st.sidebar.info(f"Agent2 tokens — input:{usage.input_tokens} output:{usage.output_tokens}", icon="🧮")
+        except Exception:
+            pass
+
         out = resp.output_text or ""
         data = parse_json_loose(out)
         if isinstance(data, dict):
@@ -466,7 +464,7 @@ def render_overrides():
 # ---------- Main
 st.set_page_config(page_title=APP_TITLE, page_icon="🟡", layout="wide")
 st.title(APP_TITLE)
-st.caption("Pure prompt orchestration • Hosted Web Search via Responses API • Agent 2 does multi-item extraction + de-dupe per turn")
+st.caption("Pure prompt orchestration • Hosted Web Search via Responses API • Agent 2: JSON-only, 1 search max, de-dupe")
 
 init_state()
 preflight()
