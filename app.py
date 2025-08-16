@@ -202,7 +202,8 @@ Avoid repeating your own earlier phrasing within this session.
 
 ## Stop Condition (Handoff)
 When you judge 4 strong slots are covered, say a short line like:
-“Got it — I’ll assemble your 4-point card now.”
+“Got it — I’ll assemble your 4-point card now.” or "we have four aspects we can turn into a profile"
+Give the user a chance to answer on follow-up to your fourth and last item youre asking for.
 The system will route to Agent 3.
 
 ## Guardrails
