@@ -1,24 +1,31 @@
 # app_expert_card_gpt5_3agents_clean.py
 # 3 Agents: Chat (Agent 1) · Search (Agent 2) · Finalize (Agent 3)
-# GPT-5 (Responses API) with hosted web_search_preview; async Agent 2 jobs.
+# Uses Google Custom Search (image) for real images; Agent 2 runs cheap LLM extraction + HTTP image search.
 
-import os, json, time, uuid, random, traceback
-from typing import List, Dict, Any, Optional, Tuple, Callable
-from concurrent.futures import ThreadPoolExecutor, Future
+import os, json, time, uuid, random, traceback, re
+from typing import List, Dict, Any, Optional, Callable
+from concurrent.futures import ThreadPoolExecutor
 
 import streamlit as st
 from PIL import Image, ImageDraw, ImageFont
+import requests
+from urllib.parse import urlparse
+
 from openai import OpenAI
 from openai import APIStatusError
 
-APP_TITLE = "🟡 Expert Card — GPT-5 (3 Agents · Hosted Web Search · Async)"
+APP_TITLE = "🟡 Expert Card — GPT-5 (3 Agents · Google Image Search · Async)"
 MODEL = os.getenv("OPENAI_GPT5_SNAPSHOT", "gpt-5-2025-08-07")
-AGENT2_MODEL = os.getenv("OPENAI_AGENT2_MODEL", "gpt-4o-mini")  # schlank für Agent 2
+AGENT2_MODEL = os.getenv("OPENAI_AGENT2_MODEL", "gpt-4o-mini")  # günstig für Extraction
 MEDIA_DIR = os.path.join(os.getcwd(), "media")
 os.makedirs(MEDIA_DIR, exist_ok=True)
 
-# ---- Token/Cost controls
-MAX_SEARCHES_PER_RUN = 1         # Agent 2: cap per turn
+# ---- Google Image Search (Programmable Search)
+GOOGLE_CSE_ID = os.getenv("GOOGLE_CSE_ID", "")
+GOOGLE_API_KEY = os.getenv("GOOGLE_API_KEY", "")
+
+# ---- Cost/robustness
+MAX_SEARCHES_PER_RUN = 1         # Agent 2: max Bildsuchen pro Turn
 OPENAI_MAX_RETRIES = 3           # Retry count for rate limits / 5xx
 OPENAI_BACKOFF_BASE = 1.8        # Exponential backoff base
 
@@ -59,10 +66,10 @@ def init_state():
     st.session_state.setdefault("jobs", {})                   # id -> (sid, Future)
     if "executor" not in st.session_state or st.session_state.get("executor") is None:
         st.session_state.executor = ThreadPoolExecutor(max_workers=4)
-    st.session_state.setdefault("seen_entities", [])          # e.g., "book|the little prince"
+    st.session_state.setdefault("seen_entities", [])          # e.g., "book|antifragile"
     st.session_state.setdefault("final_text", "")
-    st.session_state.setdefault("web_search_ok", None)
-    st.session_state.setdefault("web_search_err", "")
+    st.session_state.setdefault("img_search_ok", None)
+    st.session_state.setdefault("img_search_err", "")
     st.session_state.setdefault("used_openers", set())
     st.session_state.setdefault("auto_finalized", False)
 
@@ -70,12 +77,10 @@ def init_state():
 def parse_json_loose(text: str) -> Optional[dict]:
     if not text:
         return None
-    # strict first
     try:
         return json.loads(text)
     except Exception:
         pass
-    # loose extract first {...}
     a, b = text.find("{"), text.rfind("}")
     if a != -1 and b != -1 and b > a:
         frag = text[a:b+1]
@@ -86,7 +91,7 @@ def parse_json_loose(text: str) -> Optional[dict]:
     return None
 
 def placeholder_image(text: str, name: str) -> str:
-    # (Nur noch optional in Overrides genutzt; Agent 2 legt keine Placeholder mehr an)
+    # Wird nur bei Overrides genutzt – Agent 2 legt keinen Slot ohne echtes Bild an.
     img = Image.new("RGB", (640, 640), (24, 31, 55))
     d = ImageDraw.Draw(img)
     for r, c in [(260, (57, 96, 199)), (200, (73, 199, 142)), (140, (255, 205, 86))]:
@@ -112,23 +117,87 @@ def next_free_slot() -> Optional[str]:
             return sid
     return None
 
-# ---------- Preflight hosted web_search_preview
-def preflight():
-    if st.session_state.web_search_ok is not None:
-        return
+def hostname(url: str) -> str:
     try:
-        _ = call_with_retry(
-            client().responses.create,
-            model=AGENT2_MODEL,  # günstiger Preflight
-            input=[{"role": "user", "content": "Return JSON: {\"ok\":true}"}],
-            tools=[{"type": "web_search_preview"}],
-            parallel_tool_calls=False,
-            store=False
-        )
-        st.session_state.web_search_ok = True
-    except Exception as e:
-        st.session_state.web_search_ok = False
-        st.session_state.web_search_err = str(e)
+        return urlparse(url).hostname or ""
+    except Exception:
+        return ""
+
+# ---------- Google Image Search (JSON API)
+def google_image_search(query: str, kind: str) -> Optional[Dict[str, str]]:
+    """Return {'url', 'page_url', 'source'} or None."""
+    if not GOOGLE_CSE_ID or not GOOGLE_API_KEY:
+        return None
+
+    q = query.strip()
+    # leichte Query-Hints je nach Typ
+    if kind == "book":
+        # häufig sinnvoll, um Cover statt Fan-Art zu bekommen
+        if "cover" not in q.lower():
+            q = f"{q} book cover"
+    elif kind == "person":
+        # Portraits eher als Logos
+        if "portrait" not in q.lower():
+            q = f"{q} portrait"
+    elif kind == "podcast":
+        if "podcast" not in q.lower():
+            q = f"{q} podcast"
+    elif kind == "tool":
+        # nichts erzwingen – oft Produktshots
+        pass
+    elif kind == "film":
+        if "film" not in q.lower() and "movie" not in q.lower():
+            q = f"{q} film"
+
+    url = "https://www.googleapis.com/customsearch/v1"
+    params = {
+        "q": q,
+        "searchType": "image",
+        "num": 5,                 # bis zu 5 Treﬀer prüfen
+        "safe": "active",
+        "cx": GOOGLE_CSE_ID,
+        "key": GOOGLE_API_KEY,
+        # Optional: Qualitätsfilter
+        "imgType": "photo",
+        "imgSize": "large",
+    }
+    try:
+        r = requests.get(url, params=params, timeout=10)
+        if r.status_code != 200:
+            return None
+        data = r.json()
+        items = data.get("items") or []
+        exts = (".jpg", ".jpeg", ".png", ".webp")
+        for it in items:
+            link = (it.get("link") or "").strip()
+            mime = (it.get("mime") or "").lower()
+            if (link.lower().endswith(exts)) or mime.startswith("image/"):
+                page = (it.get("image", {}) or {}).get("contextLink") or it.get("displayLink") or link
+                return {
+                    "url": link,
+                    "page_url": page,
+                    "source": hostname(page) or hostname(link)
+                }
+        # Falls nichts mit sauberem Bild-Link: nimm den ersten „link“, wenn vorhanden
+        if items:
+            it = items[0]
+            link = (it.get("link") or "").strip()
+            if link:
+                page = (it.get("image", {}) or {}).get("contextLink") or it.get("displayLink") or link
+                return {"url": link, "page_url": page, "source": hostname(page) or hostname(link)}
+    except Exception:
+        return None
+    return None
+
+# ---------- Preflight (prüft nur, ob Google Keys gesetzt sind)
+def preflight():
+    if st.session_state.img_search_ok is not None:
+        return
+    if not GOOGLE_CSE_ID or not GOOGLE_API_KEY:
+        st.session_state.img_search_ok = False
+        st.session_state.img_search_err = "GOOGLE_CSE_ID or GOOGLE_API_KEY missing"
+    else:
+        st.session_state.img_search_ok = True
 
 # ---------- Agent 1 (Interview)
 AGENT1_SYSTEM = """You are Agent 1 — a warm, incisive interviewer.
@@ -155,9 +224,9 @@ Favor variety across types.
 
 ## Handling inputs
 - PUBLIC item present → proceed; Agent 2 will search on its own. Don’t re-confirm what the user already gave unless ambiguity blocks a meaningful question.
-- Unusual/private/non-technical item → briefly acknowledge positively and clarify if it’s a public reference (e.g., “Is this someone others could look up, or more of a personal figure?”).  
-  - If public → one micro-clarifier (name/title/host) if needed, then continue as usual.  
-  - If private → ask for a PUBLIC stand-in (book/person/tool/podcast/film) that best represents that influence, then pivot.  
+- Unusual/private/non-technical item → briefly acknowledge positively and clarify if it’s a public reference (e.g., “Is this someone others could look up, or more of a personal figure?”).
+  - If public → one micro-clarifier (name/title/host) if needed, then continue as usual.
+  - If private → ask for a PUBLIC stand-in (book/person/tool/podcast/film) that best represents that influence, then pivot.
 - Meta/process-only → ask for one PUBLIC stand-in (book/person/tool/podcast/film).
 - Multiple items in one reply → pick one now; you may revisit others later.
 - Sensitive/emotional → acknowledge briefly; steer back to practice and PUBLIC anchors.
@@ -203,14 +272,14 @@ def agent1_next_question(history: List[Dict[str, str]]) -> str:
     st.session_state.used_openers.add(q.lower()[:72])
     return q
 
-# ---------- Agent 2 (Observer + Web Image Finder)
+# ---------- Agent 2 (Extractor; Google image search)
 AGENT2_SYSTEM = """You are Agent 2.
 
 Task:
 - From assistant_question + user_reply extract 0..N PUBLIC items (book|podcast|person|tool|film).
-- Build keys "type|normalized_name" (lowercase). If a key is in seen_entities → action="skipped_duplicate".
-- For each NEW item: call web_search_preview **exactly once**. Choose the **first authoritative** source (official site / publisher / verified page) and return a **direct image** (.jpg|.jpeg|.png|.webp).
-- Stop after you have searched **at most 1 item** this turn. For any additional new items use action="detected_no_search".
+- Return canonical names (e.g., map 'antifragility by taleb' -> 'Antifragile' by Nassim Taleb).
+- Deduplicate via keys 'type|normalized_name' (lowercase).
+- Do NOT do web searches. Only return clean JSON; the app will fetch images.
 
 Output ONLY strict JSON:
 {
@@ -218,42 +287,37 @@ Output ONLY strict JSON:
   "items": [
     {
       "entity_type": "book|podcast|person|tool|film",
-      "entity_name": "...",
-      "action": "searched|skipped_duplicate|detected_no_search",
-      "url": "...",
-      "page_url": "...",
-      "source": "...",
-      "confidence": 0.0-1.0,
+      "entity_name": "...",     // canonical title/name
+      "display_name": "...",    // optional: prettier label (title + author/host)
       "reason": "one short sentence"
     }
   ]
 }
 
 Rules:
-- If no item present → {"detected": false}
-- Do not fabricate URLs. No extra text outside JSON.
+- If nothing present → {"detected": false}
+- No prose outside JSON.
 """
 
-def agent2_detect_and_search_multi(last_q: str, user_reply: str, seen_entities: List[str]) -> Dict[str, Any]:
+def agent2_extract_items(last_q: str, user_reply: str, seen_entities: List[str]) -> Dict[str, Any]:
     payload = {
         "assistant_question": last_q or "",
         "user_reply": user_reply or "",
         "seen_entities": list(seen_entities or [])
     }
+    msgs = [
+        {"role": "system", "content": AGENT2_SYSTEM},
+        {"role": "user", "content": json.dumps(payload, ensure_ascii=False)}
+    ]
     try:
         resp = call_with_retry(
-            client().responses.create,
+            client().chat.completions.create,
             model=AGENT2_MODEL,
-            input=[
-                {"role": "system", "content": AGENT2_SYSTEM},
-                {"role": "user", "content": json.dumps(payload, ensure_ascii=False)}
-            ],
-            tools=[{"type": "web_search_preview"}],
-            parallel_tool_calls=False,
-            store=False
+            messages=msgs,
+            temperature=0.1
         )
-        raw_text = getattr(resp, "output_text", "") or ""
-        data = parse_json_loose(raw_text)
+        raw = (resp.choices[0].message.content or "").strip()
+        data = parse_json_loose(raw)
         if isinstance(data, dict):
             return data
         return {"detected": False, "reason": "no-parse"}
@@ -309,9 +373,12 @@ class Orchestrator:
         self.seen = st.session_state.seen_entities
 
     def upsert(self, sid: str, label: str, media: Dict[str, Any]):
-        s = self.slots.get(sid, {"slot_id": sid, "label": "", "media": {"status": "pending", "best_image_url": "", "candidates": [], "notes": ""}})
+        s = self.slots.get(sid, {
+            "slot_id": sid,
+            "label": "",
+            "media": {"status": "pending", "best_image_url": "", "candidates": [], "notes": ""}
+        })
         s["label"] = label[:160] if label else sid
-        # Ensure media defaults so UI renders
         m = s.get("media", {})
         m.setdefault("status", "pending")
         m.setdefault("best_image_url", "")
@@ -329,30 +396,38 @@ class Orchestrator:
 
     def _job(self, last_q: str, reply: str, seen_snapshot: List[str]) -> Dict[str, Any]:
         try:
-            data = agent2_detect_and_search_multi(last_q, reply, seen_snapshot)
+            data = agent2_extract_items(last_q, reply, seen_snapshot)
             if not data.get("detected"):
                 return {"status": "skip"}
+
             items = data.get("items") or []
             results: List[Dict[str, Any]] = []
+            searches_done = 0
 
             for item in items:
                 etype = (item.get("entity_type") or "").lower().strip()
                 ename = (item.get("entity_name") or "").strip()
-                action = (item.get("action") or "").strip()
-                url = (item.get("url") or "").strip()
-                page = (item.get("page_url") or "").strip()
-                src = (item.get("source") or "").strip()
-                conf = float(item.get("confidence") or 0.0) if "confidence" in item else 0.0
-                rsn = (item.get("reason") or "").strip()
+                dname = (item.get("display_name") or ename).strip()
 
-                # STRICT: Only create a slot if a REAL SEARCH happened AND we have a direct image URL
-                if action != "searched" or not url:
+                if not etype or not ename:
                     continue
 
                 key = f"{etype}|{ename.lower()}"
                 if key in self.seen:
                     continue
-                # Mark seen ONLY when we actually create a slot (prevents "invisible" dedupe)
+
+                if searches_done >= MAX_SEARCHES_PER_RUN:
+                    # Wir legen KEINEN Slot an, wenn kein echtes Bild – und wir haben das Kontingent ausgeschöpft
+                    continue
+
+                # echte Bildsuche via Google
+                hit = google_image_search(ename, etype)
+                if not hit or not (hit.get("url") or "").strip():
+                    # Kein Bild → kein Slot
+                    continue
+
+                searches_done += 1
+                # Erst jetzt als "gesehen" markieren (damit nur echte Treffer zählen)
                 self.seen.append(key)
 
                 label_hint = {
@@ -362,13 +437,17 @@ class Orchestrator:
                     "tool": "Go-to Tool",
                     "film": "Influence",
                 }.get(etype, "Item")
-                label = f"{label_hint} — {ename}"
+                label = f"{label_hint} — {dname or ename}"
+
+                url = hit.get("url", "").strip()
+                page = hit.get("page_url", "").strip()
+                src = hit.get("source", "").strip()
 
                 media = {
                     "status": "found",
                     "best_image_url": url,
-                    "candidates": [{"url": url, "page_url": page, "source": src, "confidence": conf, "reason": rsn}],
-                    "notes": rsn
+                    "candidates": [{"url": url, "page_url": page, "source": src}],
+                    "notes": f"google image | {src}"
                 }
 
                 sid = next_free_slot()
@@ -376,18 +455,19 @@ class Orchestrator:
                     results.append({"status": "full", "label": label})
                     break
                 results.append({"status": "ok", "sid": sid, "label": label, "media": media})
+
             return {"status": "batch", "items": results}
         except Exception as e:
             return {"status": "error", "error": str(e), "trace": traceback.format_exc()[:1200]}
 
     def poll(self) -> List[str]:
         updated, rm = [], []
-        for jid, (sid, fut) in list(self.jobs.items()):
+        for jid, (_, fut) in list(self.jobs.items()):
             if fut.done():
                 rm.append(jid)
                 try:
                     res = fut.result()
-                except Exception as e:
+                except Exception:
                     continue
                 if res.get("status") == "batch":
                     for it in res.get("items", []):
@@ -458,14 +538,14 @@ def render_overrides():
 # ---------- Main
 st.set_page_config(page_title=APP_TITLE, page_icon="🟡", layout="wide")
 st.title(APP_TITLE)
-st.caption("Pure prompt orchestration • Hosted Web Search via Responses API • Agent 2: strict slots only on real search hits")
+st.caption("Günstige LLM-Orchestrierung • Google Image Search (Programmable Search) • Agent 2 erzeugt Slots nur bei echten Bildtreffern")
 
 init_state()
 preflight()
-if st.session_state.web_search_ok is False:
-    st.error(f"Hosted web_search not available: {st.session_state.web_search_err}")
+if st.session_state.img_search_ok is False:
+    st.error(f"Image search not configured: {st.session_state.img_search_err}")
 
-# --- FIRST OPENER (moved up & rerun so it appears immediately)
+# FIRST OPENER sofort setzen
 if not st.session_state.history:
     opener = agent1_next_question([])
     st.session_state.history.append({"role": "assistant", "content": opener})
@@ -481,7 +561,7 @@ for sid in orch.poll():
 render_slots()
 render_history()
 
-# Auto-finalize fallback: finalize automatically when 4 slots are filled (optional)
+# Auto-finalize: wenn 4 Slots gefüllt
 if not st.session_state.auto_finalized:
     if all(sid in st.session_state.slots and (st.session_state.slots[sid].get("label") or "").strip() for sid in st.session_state.order):
         st.session_state.final_text = agent3_finalize(st.session_state.history, st.session_state.slots)
@@ -493,21 +573,21 @@ user_text = st.chat_input("Your turn…")
 if user_text:
     st.session_state.history.append({"role": "user", "content": user_text})
 
-    # Find last Agent 1 question
+    # Letzte Frage des Assistenten (Agent 1) finden
     last_q = ""
     for m in reversed(st.session_state.history[:-1]):
         if m["role"] == "assistant":
             last_q = m["content"]
             break
 
-    # Agent 2: monitor + search (only last Q↔A), pass seen_entities for dedupe
+    # Agent 2: Extrahieren + Google-Bildsuche (nur letzte Q↔A), dedupe via seen_entities
     orch.schedule_watch(last_q, user_text)
 
-    # Agent 1: next question
+    # Agent 1: nächste Frage
     nxt = agent1_next_question(st.session_state.history)
     st.session_state.history.append({"role": "assistant", "content": nxt})
 
-    # Optional handoff-phrase trigger (falls Agent 1 es mal sagt)
+    # Handoff-Trigger (falls Agent 1 es ausspricht)
     if "assemble your 4-point card now" in nxt.lower() or "assemble your 4-point" in nxt.lower():
         st.session_state.final_text = agent3_finalize(st.session_state.history, st.session_state.slots)
         st.session_state.auto_finalized = True
