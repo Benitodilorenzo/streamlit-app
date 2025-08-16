@@ -1,30 +1,24 @@
 # app_expert_card_gpt5_3agents_clean.py
 # 3 Agents: Chat (Agent 1) · Search (Agent 2) · Finalize (Agent 3)
 # GPT-5 (Responses API) with hosted web_search_preview; async Agent 2 jobs.
-# Agent 2 processes ONLY the last Q↔A + seen_entities, extracts 0..N items,
-# de-dupes, and searches up to MAX_SEARCHES per turn. Orchestrator maps to slots.
-#
-# Requirements:
-#   pip install streamlit openai pillow
-#
-# Env:
-#   OPENAI_API_KEY              (required)
-#   OPENAI_GPT5_SNAPSHOT        (optional, default: gpt-5-2025-08-07)
 
-import os, json, uuid
-from typing import List, Dict, Any, Optional, Tuple
+import os, json, time, uuid, math, random
+from typing import List, Dict, Any, Optional, Tuple, Callable
 from concurrent.futures import ThreadPoolExecutor, Future
 
 import streamlit as st
 from PIL import Image, ImageDraw, ImageFont
 from openai import OpenAI
+from openai import APIStatusError
 
 APP_TITLE = "🟡 Expert Card — GPT-5 (3 Agents · Hosted Web Search · Async)"
 MODEL = os.getenv("OPENAI_GPT5_SNAPSHOT", "gpt-5-2025-08-07")
 MEDIA_DIR = os.path.join(os.getcwd(), "media")
 os.makedirs(MEDIA_DIR, exist_ok=True)
 
-MAX_SEARCHES_PER_RUN = 2  # Agent 2: cap per turn
+MAX_SEARCHES_PER_RUN = 2         # Agent 2: cap per turn
+OPENAI_MAX_RETRIES = 3           # Retry count for rate limits / 5xx
+OPENAI_BACKOFF_BASE = 1.8        # Exponential backoff base
 
 # ---------- OpenAI client
 def client() -> OpenAI:
@@ -33,22 +27,46 @@ def client() -> OpenAI:
         raise RuntimeError("OPENAI_API_KEY missing")
     return OpenAI(api_key=key)
 
-# ---------- Session state
+# ---------- Simple retry wrapper for OpenAI calls
+def call_with_retry(fn: Callable, *args, **kwargs):
+    for attempt in range(OPENAI_MAX_RETRIES):
+        try:
+            return fn(*args, **kwargs)
+        except APIStatusError as e:
+            # Retry on 429/5xx
+            status = getattr(e, "status_code", None)
+            if status in (429, 500, 502, 503, 504):
+                delay = OPENAI_BACKOFF_BASE ** attempt + random.uniform(0, 0.3)
+                time.sleep(delay)
+                continue
+            raise
+        except Exception as e:
+            # Some SDKs raise RateLimitError directly
+            msg = str(e).lower()
+            if "rate limit" in msg or "429" in msg:
+                delay = OPENAI_BACKOFF_BASE ** attempt + random.uniform(0, 0.3)
+                time.sleep(delay)
+                continue
+            raise
+    # Last try (if still failing), let it raise
+    return fn(*args, **kwargs)
+
+# ---------- Session state (idempotent)
 def init_state():
-    if st.session_state.get("init"):
-        return
-    st.session_state.init = True
-    st.session_state.history: List[Dict[str, str]] = []          # Agent1 ↔ User
-    st.session_state.slots: Dict[str, Dict[str, Any]] = {}       # S1..S4
-    st.session_state.order = ["S1", "S2", "S3", "S4"]
-    st.session_state.jobs: Dict[str, Tuple[str, Future]] = {}     # Agent 2 futures
-    st.session_state.executor = ThreadPoolExecutor(max_workers=4)
-    st.session_state.seen_entities: List[str] = []               # e.g., "book|the little prince"
-    st.session_state.final_text = ""
-    st.session_state.web_search_ok = None
-    st.session_state.web_search_err = ""
-    st.session_state.used_openers = set()                        # Agent 1 self-variation
-    st.session_state.auto_finalized = False
+    # do NOT early-return only on "init": ensure keys exist each time
+    st.session_state.setdefault("init", True)
+    st.session_state.setdefault("history", [])                # Agent1 ↔ User
+    st.session_state.setdefault("slots", {})                  # S1..S4
+    st.session_state.setdefault("order", ["S1","S2","S3","S4"])
+    st.session_state.setdefault("jobs", {})                   # id -> (sid, Future)
+    if "executor" not in st.session_state or st.session_state.get("executor") is None:
+        st.session_state.executor = ThreadPoolExecutor(max_workers=4)
+    st.session_state.setdefault("seen_entities", [])          # e.g., "book|the little prince"
+    st.session_state.setdefault("final_text", "")
+    st.session_state.setdefault("web_search_ok", None)
+    st.session_state.setdefault("web_search_err", "")
+    st.session_state.setdefault("used_openers", set())
+    st.session_state.setdefault("auto_finalized", False)
 
 # ---------- Utils
 def parse_json_loose(text: str) -> Optional[dict]:
@@ -97,7 +115,8 @@ def preflight():
     if st.session_state.web_search_ok is not None:
         return
     try:
-        _ = client().responses.create(
+        _ = call_with_retry(
+            client().responses.create,
             model=MODEL,
             input=[{"role": "user", "content": "Return JSON: {\"ok\":true}"}],
             tools=[{"type": "web_search_preview"}],
@@ -171,7 +190,7 @@ def agent1_next_question(history: List[Dict[str, str]]) -> str:
         msgs.append({"role": "system", "content": avoid})
     short = history[-6:] if len(history) > 6 else history
     msgs += short
-    resp = client().chat.completions.create(model=MODEL, messages=msgs)
+    resp = call_with_retry(client().chat.completions.create, model=MODEL, messages=msgs)
     q = (resp.choices[0].message.content or "").strip()
     if "\n" in q:
         q = q.split("\n")[0].strip()
@@ -181,7 +200,7 @@ def agent1_next_question(history: List[Dict[str, str]]) -> str:
     return q
 
 # ---------- Agent 2 (Observer + Web Image Finder) — multi-item; de-dupe; capped searches
-# ---------- Agent 2 (Observer + Web Image Finder) — multi-item; de-dupe; capped searches
+# NO f-string for the big block; we inject MAX_SEARCHES_PER_RUN via replace to avoid brace escaping issues.
 AGENT2_SYSTEM = (
 """You are Agent 2 — Observer + Web Image Finder.
 
@@ -201,9 +220,7 @@ Your job each turn:
 3) For each new item, use the built-in web_search_preview tool to find ONE authoritative image:
    - Return a direct image URL (.jpg/.jpeg/.png/.webp), not an HTML page.
    - Prefer official sources; avoid thumbnails, memes, watermarks, wrong items.
-"""
-+ f"   - Perform at most MAX_SEARCHES={MAX_SEARCHES_PER_RUN} tool calls per run.\n"
-+ """
+   - Perform at most MAX_SEARCHES=__CAP__ tool calls per run.
    - If more new items exist than the cap, include the extras with action="detected_no_search" (no URL).
 
 4) OUTPUT ONLY strict JSON:
@@ -229,8 +246,7 @@ Rules:
 - Never fabricate URLs; always use the tool for items you mark as "searched".
 - Keep reasons short.
 """
-)
-
+).replace("__CAP__", str(MAX_SEARCHES_PER_RUN))
 
 def agent2_detect_and_search_multi(last_q: str, user_reply: str, seen_entities: List[str]) -> Dict[str, Any]:
     payload = {
@@ -239,7 +255,8 @@ def agent2_detect_and_search_multi(last_q: str, user_reply: str, seen_entities: 
         "seen_entities": list(seen_entities or [])
     }
     try:
-        resp = client().responses.create(
+        resp = call_with_retry(
+            client().responses.create,
             model=MODEL,
             input=[
                 {"role": "system", "content": AGENT2_SYSTEM},
@@ -291,16 +308,19 @@ def agent3_finalize(history: List[Dict[str, str]], slots: Dict[str, Dict[str, An
         {"role": "system", "content": FINALIZER_SYSTEM},
         {"role": "user", "content": f"Transcript:\n{convo_text}\n\nSlots:\n{slots_text}"}
     ]
-    resp = client().chat.completions.create(model=MODEL, messages=msgs)
+    resp = call_with_retry(client().chat.completions.create, model=MODEL, messages=msgs)
     return (resp.choices[0].message.content or "").strip()
 
 # ---------- Orchestrator
 class Orchestrator:
     def __init__(self):
+        # harden against half-initialized sessions
+        if "seen_entities" not in st.session_state:
+            st.session_state.seen_entities = []
         self.slots = st.session_state.slots
         self.jobs = st.session_state.jobs
         self.exec = st.session_state.executor
-        self.seen = st.session_state.seen_entities   # list of keys type|name
+        self.seen = st.session_state.seen_entities   # list[str] type|name
 
     def upsert(self, sid: str, label: str, media: Dict[str, Any]):
         s = self.slots.get(sid, {"slot_id": sid, "label": "", "media": {"status": "pending", "best_image_url": "", "candidates": [], "notes": ""}})
@@ -311,7 +331,6 @@ class Orchestrator:
     def schedule_watch(self, last_q: str, reply: str):
         jid = str(uuid.uuid4())[:8]
         fut = self.exec.submit(self._job, last_q, reply, list(self.seen))
-        # We keep "TBD" — multiple slots may be updated; job id only tracks completion.
         self.jobs[jid] = ("TBD", fut)
         st.toast("🛰️ Agent 2 is scanning for public items…", icon="🛰️")
 
@@ -331,10 +350,10 @@ class Orchestrator:
 
             key = f"{etype}|{ename.lower()}"
             if key in self.seen:
-                # Even if Agent 2 marked it skipped, ensure dedupe here too
+                # double-guard dedupe
                 continue
 
-            # Record as seen (prevents future repeats)
+            # mark seen to avoid future searches
             self.seen.append(key)
 
             label_hint = {
@@ -381,7 +400,6 @@ class Orchestrator:
                         if it.get("status") == "ok":
                             self.upsert(it["sid"], it["label"], it["media"])
                             updated.append(it["sid"])
-                # skip/other statuses are ignored
         for jid in rm:
             del self.jobs[jid]
         return updated
@@ -455,14 +473,13 @@ if st.session_state.web_search_ok is False:
 
 orch = Orchestrator()
 
-# First dynamic opener from Agent 1
+# First opener from Agent 1
 if not st.session_state.history:
     opener = agent1_next_question([])
     st.session_state.history.append({"role": "assistant", "content": opener})
 
 # Poll Agent 2 async jobs
-updated = orch.poll()
-for sid in updated:
+for sid in orch.poll():
     st.toast(f"🖼️ Media updated: {sid}", icon="🖼️")
 
 # Render UI
@@ -495,9 +512,8 @@ if user_text:
     nxt = agent1_next_question(st.session_state.history)
     st.session_state.history.append({"role": "assistant", "content": nxt})
 
-    # If Agent 1 signals handoff, finalize now (even if <4, it'll fill with practices)
-    handoff_trigger = "assemble your 4" in nxt.lower() or "assemble your 4-point" in nxt.lower() or "assemble your 4-point" in nxt.lower()
-    if handoff_trigger:
+    # Handoff line (if Agent 1 decides to say it)
+    if "assemble your 4-point card now" in nxt.lower() or "assemble your 4-point" in nxt.lower():
         st.session_state.final_text = agent3_finalize(st.session_state.history, st.session_state.slots)
         st.session_state.auto_finalized = True
 
