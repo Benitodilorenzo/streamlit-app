@@ -1,33 +1,30 @@
 # app_expert_card_gpt5_3agents_clean.py
-# 3 Agents: Chat (Agent 1) · Detect+Verify (Agent 2) · Finalize (Agent 3)
-# Agent 2: Items extrahieren (günstig) + Bild über Google CSE holen + Vision-Validierung
+# 3 Agents: Chat (Agent 1) · Search (Agent 2) · Finalize (Agent 3)
+# Agent 2: Google CSE Image API + Vision-Validierung; keine teuren Tool-Simulationen.
 
-import os, json, time, uuid, random, traceback
+import os, json, time, uuid, random, traceback, requests
 from typing import List, Dict, Any, Optional, Callable
 from concurrent.futures import ThreadPoolExecutor
-from urllib.parse import urlencode
 
 import streamlit as st
 from PIL import Image, ImageDraw, ImageFont
 from openai import OpenAI
 from openai import APIStatusError
-import requests
 
-APP_TITLE = "🟡 Expert Card — GPT-5 (3 Agents · Google Image + Vision Verify)"
+APP_TITLE = "🟡 Expert Card — GPT-5 (3 Agents · Google Image API · Async)"
 MODEL = os.getenv("OPENAI_GPT5_SNAPSHOT", "gpt-5-2025-08-07")
-AGENT2_MODEL = os.getenv("OPENAI_AGENT2_MODEL", "gpt-4o-mini")          # günstig (Text)
-AGENT2_VISION_MODEL = os.getenv("OPENAI_AGENT2_VISION_MODEL", "gpt-4o-mini")  # Vision
+AGENT2_MODEL = os.getenv("OPENAI_AGENT2_MODEL", "gpt-4o-mini")  # günstig für Extraktion + Vision
 MEDIA_DIR = os.path.join(os.getcwd(), "media")
 os.makedirs(MEDIA_DIR, exist_ok=True)
 
-# ---- Controls
-OPENAI_MAX_RETRIES = 3
-OPENAI_BACKOFF_BASE = 1.8
-MAX_CANDIDATES_TO_VERIFY = int(os.getenv("MAX_CANDIDATES_TO_VERIFY", "1"))  # 1 = kein endloses Probieren
+# ---- Google Programmable Search (CSE)
+GOOGLE_CSE_KEY = os.getenv("GOOGLE_CSE_KEY", "")
+GOOGLE_CSE_CX  = os.getenv("GOOGLE_CSE_CX", "")  # Suchmaschinen-ID
 
-# ---- Google CSE env
-GOOGLE_CSE_API_KEY = os.getenv("GOOGLE_CSE_API_KEY", "").strip()
-GOOGLE_CSE_CX = os.getenv("GOOGLE_CSE_CX", "").strip()
+# ---- Token/Cost controls
+MAX_SEARCHES_PER_RUN = 1         # pro Turn max. so viele neue Items mit Bild verarbeiten
+OPENAI_MAX_RETRIES = 3           # Retry count für 429/5xx
+OPENAI_BACKOFF_BASE = 1.8        # Exponential backoff
 
 # ---------- OpenAI client
 def client() -> OpenAI:
@@ -36,7 +33,7 @@ def client() -> OpenAI:
         raise RuntimeError("OPENAI_API_KEY missing")
     return OpenAI(api_key=key)
 
-# ---------- Simple retry wrapper
+# ---------- Simple retry wrapper for OpenAI calls
 def call_with_retry(fn: Callable, *args, **kwargs):
     for attempt in range(OPENAI_MAX_RETRIES):
         try:
@@ -57,8 +54,9 @@ def call_with_retry(fn: Callable, *args, **kwargs):
             raise
     return fn(*args, **kwargs)
 
-# ---------- Session state
+# ---------- Session state (idempotent)
 def init_state():
+    st.session_state.setdefault("init", True)
     st.session_state.setdefault("history", [])                # Agent1 ↔ User
     st.session_state.setdefault("slots", {})                  # S1..S4
     st.session_state.setdefault("order", ["S1","S2","S3","S4"])
@@ -113,66 +111,189 @@ def next_free_slot() -> Optional[str]:
             return sid
     return None
 
-# ---------- Agent 1 (Interview)
-AGENT1_SYSTEM = """You are Agent 1 — a warm, incisive interviewer.
+# ---------- Google CSE: Image Search
+def google_image_search(query: str, num: int = 4) -> List[Dict[str, str]]:
+    """
+    searchType=image → liefert direkte Bild-Links in items[].link
+    """
+    if not GOOGLE_CSE_KEY or not GOOGLE_CSE_CX:
+        return []
+    try:
+        params = {
+            "q": query,
+            "searchType": "image",
+            "num": max(1, min(num, 10)),
+            "safe": "active",
+            "fields": "items(link,contextLink)",
+            "key": GOOGLE_CSE_KEY,
+            "cx": GOOGLE_CSE_CX,
+        }
+        r = requests.get("https://www.googleapis.com/customsearch/v1", params=params, timeout=12)
+        r.raise_for_status()
+        data = r.json()
+        items = data.get("items", []) or []
+        out = []
+        for it in items:
+            link = (it.get("link") or "").strip()
+            ctx  = (it.get("contextLink") or "").strip()
+            if link and any(link.lower().endswith(ext) for ext in (".jpg",".jpeg",".png",".webp")):
+                out.append({"url": link, "page_url": ctx})
+        return out
+    except Exception:
+        return []
 
-## Scope
-You run the conversation and never call tools. Agent 2 observes items; Agent 3 finalizes.
-
-## Mission
-Build a 4-item Expert Card: PUBLIC anchors (book/podcast/person/tool/film) + the user’s personal angle (decisions, habits, examples, trade-offs). Favor variety.
-
-## Style
-- Natural, concise (1–3 short sentences). Mirror user language. One primary move per turn: micro-clarify → deepen → pivot → close-and-move.
-
-## Deepen vs Pivot
-- Deepen up to ~2 turns if concrete and high-signal; else pivot for diversity.
-
-## Handling inputs
-- PUBLIC item present → proceed.
-- Private/unusual → ask if public; else request a PUBLIC stand-in.
-- Multiple items → pick one now; revisit others later.
-- Sensitive → acknowledge briefly; steer back to practice + PUBLIC anchors.
-
-## Stop Condition
-When 4 strong slots are covered, say: “Got it — I’ll assemble your 4-point card now.”
-"""
-
-def agent1_next_question(history: List[Dict[str, str]]) -> str:
-    msgs = [{"role": "system", "content": AGENT1_SYSTEM}]
-    if st.session_state.used_openers:
-        avoid = "Avoid these phrasings this session: " + "; ".join(list(st.session_state.used_openers))[:600]
-        msgs.append({"role": "system", "content": avoid})
-    short = history[-6:] if len(history) > 6 else history
-    msgs += short
-    resp = call_with_retry(client().chat.completions.create, model=MODEL, messages=msgs, temperature=0)
-    q = (resp.choices[0].message.content or "").strip()
-    if "\n" in q:
-        q = q.split("\n")[0].strip()
-    if not q.endswith("?"):
-        q = q.rstrip(".! ") + "?"
-    st.session_state.used_openers.add(q.lower()[:72])
-    return q
-
-# ---------- Agent 2 (Detector — text only)
-AGENT2_SYSTEM = """You are Agent 2 (detector).
-From assistant_question + user_reply extract ZERO OR MORE PUBLIC items with types: book | podcast | person | tool | film.
-Return strict JSON:
-{"detected": true|false, "items":[{"entity_type":"book|podcast|person|tool|film","entity_name":"..."}]}
-Rules: Use the question only for disambiguation. If none present → {"detected": false}. No extra text.
-"""
-
-def agent2_detect_items(last_q: str, user_reply: str) -> Dict[str, Any]:
-    payload = {"assistant_question": last_q or "", "user_reply": user_reply or ""}
+# ---------- Vision: Validate image vs. context
+def validate_image_with_context(image_url: str, entity_type: str, entity_name: str, q_text: str, a_text: str) -> Dict[str, Any]:
+    """
+    Fragt das Modell, ob das Bild plausibel zu (entity_type, entity_name) passt.
+    Ausgabe: {"ok": bool, "reason": "..."}
+    """
+    sys = (
+        "You are an image verifier. Respond with STRICT JSON like "
+        "{\"ok\":true/false,\"reason\":\"...\"}. "
+        "Check if the image plausibly depicts the requested public item "
+        "(book/podcast/person/tool/film) given the context. "
+        "Be strict about wrong people/logos, but flexible with cover art variants."
+    )
+    user_text = (
+        f"Item type: {entity_type}\n"
+        f"Item name: {entity_name}\n"
+        f"Context Q: {q_text[:300]}\n"
+        f"Context A: {a_text[:500]}\n"
+        "Does this image plausibly match the item?"
+    )
     try:
         resp = call_with_retry(
             client().chat.completions.create,
             model=AGENT2_MODEL,
             messages=[
-                {"role": "system", "content": AGENT2_SYSTEM},
-                {"role": "user", "content": json.dumps(payload, ensure_ascii=False)}
-            ],
-            temperature=0
+                {"role": "system", "content": sys},
+                {
+                    "role": "user",
+                    "content": [
+                        {"type": "text", "text": user_text},
+                        {"type": "image_url", "image_url": {"url": image_url}}
+                    ]
+                }
+            ]
+        )
+        txt = (resp.choices[0].message.content or "").strip()
+        data = parse_json_loose(txt)
+        if isinstance(data, dict) and "ok" in data:
+            return {"ok": bool(data.get("ok")), "reason": str(data.get("reason") or "")[:200]}
+    except Exception:
+        pass
+    # Fallback: wenn nicht parsebar, lieber ablehnen (konservativ)
+    return {"ok": False, "reason": "unverifiable"}
+
+# ---------- Agent 1 (Interview) — unverändert
+AGENT1_SYSTEM = """You are Agent 1 — a warm, incisive interviewer.
+
+## Identity & Scope
+You are Agent 1. You run the conversation and never call tools.
+- Agent 2 observes each turn and handles web images for PUBLIC items (book/podcast/person/tool/film).
+- Agent 3 will finalize the 4-point card when you signal the handoff.
+
+## Mission
+Build a 4-item Expert Card combining:
+1) PUBLIC anchors (book/podcast/person/tool/film), and
+2) The user’s personal angle (decisions, habits, examples, trade-offs).
+Favor variety across types.
+
+## Output Style (visible)
+- Natural, concise (1–3 short sentences). Mirror user language. Warm, specific, no fluff.
+- One primary move per turn: micro-clarify → deepen → pivot → close-and-move.
+- If the user asks you something, answer in ≤1 sentence, then continue.
+
+## Deepen vs Pivot
+- Deepen up to ~2 turns if concrete and high-signal; aim for specific decisions, habits, before/after, in-the-wild examples, accepted trade-offs.
+- Pivot if vague/repetitive, you already asked ~2 on this item, or you want diversity.
+
+## Handling inputs
+- PUBLIC item present → proceed; Agent 2 will search on its own. Don’t re-confirm what the user already gave unless ambiguity blocks a meaningful question.
+- Unusual/private/non-technical item → briefly acknowledge positively and clarify if it’s a public reference (e.g., “Is this someone others could look up, or more of a personal figure?”).  
+  - If public → one micro-clarifier (name/title/host) if needed, then continue as usual.  
+  - If private → ask for a PUBLIC stand-in (book/person/tool/podcast/film) that best represents that influence, then pivot.  
+- Meta/process-only → ask for one PUBLIC stand-in (book/person/tool/podcast/film).
+- Multiple items in one reply → pick one now; you may revisit others later.
+- Sensitive/emotional → acknowledge briefly; steer back to practice and PUBLIC anchors.
+
+## Diversity Goal
+Prefer a mix (e.g., books + a podcast + a person/tool/film). Nudge gently.
+
+## Opening & Flow
+Vary openings; reasonable examples include:
+- “What’s one book/podcast/person/tool/film that genuinely shifted how you work — and in what way?”
+- “Think of the last 12 months: which public influence most changed your decisions?”
+- “If someone wanted to think like you in Data/AI, what one public thing should they start with?”
+Avoid repeating your own earlier phrasing within this session.
+
+## Stop Condition (Handoff)
+When you judge 4 strong slots are covered, say a short line like:
+“Got it — I’ll assemble your 4-point card now.”
+The system will route to Agent 3.
+
+## Guardrails
+Don’t reveal internal agents/tools. Keep it professional. Mirror language switching.
+
+## What you do each turn
+1) Read latest user message + light memory of prior slots.
+2) Decide one move (micro-clarify, deepen, pivot, close-and-move).
+3) Ask one focused question (optionally with a brief synthesis).
+4) Continue until 4 good items → give the handoff line.
+"""
+
+def agent1_next_question(history: List[Dict[str, str]]) -> str:
+    msgs = [{"role": "system", "content": AGENT1_SYSTEM}]
+    if st.session_state.get("used_openers"):
+        avoid = "Avoid these phrasings this session: " + "; ".join(list(st.session_state.used_openers))[:600]
+        msgs.append({"role": "system", "content": avoid})
+    short = history[-6:] if len(history) > 6 else history
+    msgs += short
+    resp = call_with_retry(client().chat.completions.create, model=MODEL, messages=msgs)
+    q = (resp.choices[0].message.content or "").strip()
+    if "\n" in q:
+        q = q.split("\n")[0].strip()
+    if not q.endswith("?"):
+        q = q.rstrip(".! ") + "?"
+    st.session_state.setdefault("used_openers", set()).add(q.lower()[:72])
+    return q
+
+# ---------- Agent 2 (Extractor ONLY; keine Tools)
+AGENT2_SYSTEM = """You are Agent 2.
+
+Task:
+- From assistant_question + user_reply extract 0..N PUBLIC items (book|podcast|person|tool|film).
+- For each item, return {entity_type, entity_name}. Do NOT search the web. Do NOT invent.
+- Dedupe by normalized lowercase name per type.
+
+Output ONLY strict JSON:
+{
+  "detected": true|false,
+  "items": [
+    {"entity_type":"book|podcast|person|tool|film","entity_name":"..."}
+  ]
+}
+
+Rules:
+- If no item present → {"detected": false}
+- Return ONLY JSON.
+"""
+
+def agent2_extract_items(last_q: str, user_reply: str, seen_entities: List[str]) -> Dict[str, Any]:
+    payload = {
+        "assistant_question": last_q or "",
+        "user_reply": user_reply or "",
+        "seen_entities": list(seen_entities or [])
+    }
+    try:
+        resp = call_with_retry(
+            client().chat.completions.create,
+            model=AGENT2_MODEL,
+            messages=[
+                {"role":"system","content": AGENT2_SYSTEM},
+                {"role":"user","content": json.dumps(payload, ensure_ascii=False)}
+            ]
         )
         raw = (resp.choices[0].message.content or "").strip()
         data = parse_json_loose(raw)
@@ -180,126 +301,9 @@ def agent2_detect_items(last_q: str, user_reply: str) -> Dict[str, Any]:
             return data
         return {"detected": False, "reason": "no-parse"}
     except Exception as e:
-        return {"detected": False, "reason": f"error: {e}"}
+        return {"detected": False, "reason": f"error: {e}", "trace": traceback.format_exc()[:600]}
 
-# ---------- Google CSE (image)
-BLOCKED_HOSTS = {
-    "pinterest.", "alamy.", "shutterstock.", "istockphoto.", "gettyimages.",
-    "dreamstime.", "depositphotos.", "123rf.", "vectorstock.", "freepik.", "adobe."
-}
-
-def _host(url: str) -> str:
-    try:
-        return requests.utils.urlparse(url).netloc.lower()
-    except Exception:
-        return ""
-
-def google_image_candidates(query: str, *, site: Optional[str]=None, img_type: Optional[str]=None, num: int=5) -> List[Dict[str, Any]]:
-    """Return up to `num` candidate dicts with direct image links."""
-    if not GOOGLE_CSE_API_KEY or not GOOGLE_CSE_CX:
-        return []
-    params = {
-        "key": GOOGLE_CSE_API_KEY,
-        "cx": GOOGLE_CSE_CX,
-        "q": query,
-        "searchType": "image",
-        "num": max(1, min(num, 10)),
-        "safe": "active",
-        "imgSize": "large"
-    }
-    if site:
-        params["siteSearch"] = site
-    if img_type:
-        params["imgType"] = img_type
-    url = "https://www.googleapis.com/customsearch/v1?" + urlencode(params)
-    try:
-        r = requests.get(url, timeout=12)
-        r.raise_for_status()
-        data = r.json()
-        items = data.get("items") or []
-        out = []
-        for it in items:
-            link = it.get("link") or ""
-            imeta = it.get("image") or {}
-            w, h = int(imeta.get("width", 0) or 0), int(imeta.get("height", 0) or 0)
-            mime = it.get("mime", "")
-            host = _host(link)
-            if any(b in host for b in BLOCKED_HOSTS):
-                continue
-            if not link.lower().endswith((".jpg", ".jpeg", ".png", ".webp")) and not (mime and ("image/" in mime)):
-                continue
-            if max(w, h) < 300:
-                continue
-            out.append({
-                "link": link,
-                "contextLink": imeta.get("contextLink") or it.get("image", {}).get("contextLink") or it.get("link"),
-                "mime": mime,
-                "width": w,
-                "height": h,
-                "byteSize": imeta.get("byteSize"),
-                "host": host
-            })
-        return out
-    except Exception:
-        return []
-
-def query_hint(etype: str, name: str) -> Dict[str, Optional[str]]:
-    et = (etype or "").lower()
-    if et == "person":
-        return {"q": f'{name} official portrait', "img_type": "face", "site": None}
-    if et == "book":
-        return {"q": f'{name} book cover', "img_type": None, "site": None}
-    if et == "podcast":
-        return {"q": f'{name} podcast cover', "img_type": None, "site": None}
-    if et == "tool":
-        return {"q": f'{name} logo', "img_type": None, "site": None}
-    if et == "film":
-        return {"q": f'{name} poster', "img_type": None, "site": None}
-    return {"q": name, "img_type": None, "site": None}
-
-# ---------- Vision verification
-VISION_SYSTEM = """You are an image verifier. Output strict JSON only.
-Decide if the image matches the referenced PUBLIC item and type for use on an expert card.
-Accept only if it is plausibly the correct item (not stock/watermarked/meme/wrong subject).
-JSON schema: {"ok":true|false,"confidence":0..1,"reason":"short"}"""
-
-def verify_image_with_vision(etype: str, name: str, link: str, context: str) -> Dict[str, Any]:
-    # Minimal, deterministic check
-    try:
-        prompt = (
-            f"Type: {etype}\n"
-            f"Name: {name}\n"
-            f"Context (why relevant): {context[:240]}\n"
-            "Does this image plausibly match the item and type (e.g., book cover, podcast cover, person portrait, tool logo, film poster)?"
-            " Only say true if it's clearly correct or close enough for an expert-card thumbnail."
-        )
-        resp = call_with_retry(
-            client().chat.completions.create,
-            model=AGENT2_VISION_MODEL,
-            temperature=0,
-            messages=[
-                {"role": "system", "content": VISION_SYSTEM},
-                {"role": "user", "content": [
-                    {"type": "text", "text": prompt},
-                    {"type": "image_url", "image_url": {"url": link}}
-                ]}
-            ]
-        )
-        raw = (resp.choices[0].message.content or "").strip()
-        data = parse_json_loose(raw)
-        if isinstance(data, dict) and "ok" in data:
-            # Clamp confidence
-            try:
-                c = float(data.get("confidence", 0))
-                data["confidence"] = max(0.0, min(1.0, c))
-            except Exception:
-                data["confidence"] = 0.0
-            return data
-        return {"ok": False, "confidence": 0.0, "reason": "no-parse"}
-    except Exception as e:
-        return {"ok": False, "confidence": 0.0, "reason": f"error: {e}"}
-
-# ---------- Agent 3 (Finalizer)
+# ---------- Agent 3 (Finalizer) — unverändert
 FINALIZER_SYSTEM = """You are Agent 3 — Finalizer.
 Create an Expert Card with exactly 4 items from:
 - The conversation (assistant questions + user answers).
@@ -307,7 +311,7 @@ Create an Expert Card with exactly 4 items from:
 Rules:
 - Each line: '- Label: 1–2 short sentences' grounded in THIS user.
 - Prefer PUBLIC items; if fewer than 4, fill with the user's stated practices/principles.
-- No fluff, no generic facts, no references to these instructions.
+- No fluff, no generic Wikipedia facts, no references to these instructions.
 """
 
 def agent3_finalize(history: List[Dict[str, str]], slots: Dict[str, Dict[str, Any]]) -> str:
@@ -334,7 +338,7 @@ def agent3_finalize(history: List[Dict[str, str]], slots: Dict[str, Dict[str, An
         {"role": "system", "content": FINALIZER_SYSTEM},
         {"role": "user", "content": f"Transcript:\n{convo_text}\n\nSlots:\n{slots_text}"}
     ]
-    resp = call_with_retry(client().chat.completions.create, model=MODEL, messages=msgs, temperature=0)
+    resp = call_with_retry(client().chat.completions.create, model=MODEL, messages=msgs)
     return (resp.choices[0].message.content or "").strip()
 
 # ---------- Orchestrator
@@ -363,55 +367,53 @@ class Orchestrator:
         jid = str(uuid.uuid4())[:8]
         fut = self.exec.submit(self._job, last_q, reply, list(self.seen))
         self.jobs[jid] = ("TBD", fut)
-        st.toast("🛰️ Agent 2 is extracting + vision-verifying…", icon="🛰️")
+        st.toast("🛰️ Agent 2 is extracting items + fetching images…", icon="🛰️")
 
     def _job(self, last_q: str, reply: str, seen_snapshot: List[str]) -> Dict[str, Any]:
         try:
-            det = agent2_detect_items(last_q, reply)
-            if not det.get("detected"):
+            data = agent2_extract_items(last_q, reply, seen_snapshot)
+            if not data.get("detected"):
                 return {"status": "skip"}
-            items = det.get("items") or []
+
+            items = data.get("items") or []
+            # Dedupe & cap processing per run
+            processed = 0
             results: List[Dict[str, Any]] = []
 
-            # Short context for the verifier (blend last Q & A)
-            context = (last_q or "")[:160] + " || " + (reply or "")[:200]
-
             for item in items:
+                if processed >= MAX_SEARCHES_PER_RUN:
+                    break
                 etype = (item.get("entity_type") or "").lower().strip()
                 ename = (item.get("entity_name") or "").strip()
                 if not etype or not ename:
                     continue
-
                 key = f"{etype}|{ename.lower()}"
                 if key in self.seen:
                     continue
 
-                # Google image candidates (direct URLs)
-                hint = query_hint(etype, ename)
-                candidates = google_image_candidates(hint["q"], site=hint["site"], img_type=hint["img_type"], num=max(1, MAX_CANDIDATES_TO_VERIFY))
-
-                if not candidates:
+                # Bildsuche über Google CSE
+                imgs = google_image_search(ename, num=4)
+                if not imgs:
                     continue
 
-                # Try limited number of candidates with vision verification
-                chosen = None
-                tried = 0
-                for cand in candidates:
-                    if tried >= MAX_CANDIDATES_TO_VERIFY:
+                # Vision-Validierung (max. 2 Versuche)
+                ok_url = ""
+                note = ""
+                for cand in imgs[:2]:
+                    v = validate_image_with_context(cand["url"], etype, ename, last_q, reply)
+                    if v.get("ok"):
+                        ok_url = cand["url"]
+                        note = v.get("reason","")
                         break
-                    tried += 1
-                    v = verify_image_with_vision(etype, ename, cand["link"], context)
-                    if v.get("ok") and v.get("confidence", 0) >= 0.5:
-                        chosen = (cand, v)
-                        break
+                    else:
+                        note = v.get("reason","")
 
-                if not chosen:
-                    # no suitable image → skip slot (keine falschen Treffer)
+                if not ok_url:
+                    # keine valide Übereinstimmung → nicht anlegen
                     continue
 
-                # Create slot
+                # Jetzt Slot anlegen und als seen markieren
                 self.seen.append(key)
-                cand, v = chosen
                 label_hint = {
                     "book": "Must-Read",
                     "podcast": "Podcast",
@@ -423,15 +425,9 @@ class Orchestrator:
 
                 media = {
                     "status": "found",
-                    "best_image_url": cand["link"],
-                    "candidates": [{
-                        "url": cand["link"],
-                        "page_url": cand.get("contextLink") or "",
-                        "source": cand.get("host") or "",
-                        "confidence": float(v.get("confidence", 0)),
-                        "reason": f"Vision OK: {v.get('reason','')[:80]}"
-                    }],
-                    "notes": f"{cand.get('host','')} · {cand.get('width','?')}×{cand.get('height','?')}"
+                    "best_image_url": ok_url,
+                    "candidates": [{"url": ok_url, "page_url": imgs[0].get("page_url",""), "source": "google-cse", "confidence": 0.9, "reason": note}],
+                    "notes": note or "validated"
                 }
 
                 sid = next_free_slot()
@@ -439,6 +435,7 @@ class Orchestrator:
                     results.append({"status": "full", "label": label})
                     break
                 results.append({"status": "ok", "sid": sid, "label": label, "media": media})
+                processed += 1
 
             return {"status": "batch", "items": results}
         except Exception as e:
@@ -522,15 +519,11 @@ def render_overrides():
 # ---------- Main
 st.set_page_config(page_title=APP_TITLE, page_icon="🟡", layout="wide")
 st.title(APP_TITLE)
-st.caption("Agent 2 extrahiert Items, holt Bild via Google CSE und **validiert per Vision**. Slots zählen nur verifizierte Bilder.")
+st.caption("Agent 2: Google Image API (+Vision-Check) • Keine Tool-Simulation • Slots nur bei validem Bild")
 
 init_state()
 
 orch = Orchestrator()
-
-# Poll Agent 2 async jobs
-for sid in orch.poll():
-    st.toast(f"🖼️ Media updated: {sid}", icon="🖼️")
 
 # First opener from Agent 1
 if not st.session_state.history:
@@ -538,11 +531,15 @@ if not st.session_state.history:
     st.session_state.history.append({"role": "assistant", "content": opener})
     st.rerun()
 
+# Poll Agent 2 async jobs
+for sid in orch.poll():
+    st.toast(f"🖼️ Media updated: {sid}", icon="🖼️")
+
 # Render UI
 render_slots()
 render_history()
 
-# Auto-finalize when 4 slots filled
+# Auto-finalize fallback
 if not st.session_state.auto_finalized:
     if all(sid in st.session_state.slots and (st.session_state.slots[sid].get("label") or "").strip() for sid in st.session_state.order):
         st.session_state.final_text = agent3_finalize(st.session_state.history, st.session_state.slots)
@@ -561,14 +558,14 @@ if user_text:
             last_q = m["content"]
             break
 
-    # Agent 2: detect → google image → vision verify → create slot
+    # Agent 2: extract + google image + vision
     orch.schedule_watch(last_q, user_text)
 
     # Agent 1: next question
     nxt = agent1_next_question(st.session_state.history)
     st.session_state.history.append({"role": "assistant", "content": nxt})
 
-    # Optional handoff phrase trigger
+    # Optional Handoff Phrase
     if "assemble your 4-point card now" in nxt.lower() or "assemble your 4-point" in nxt.lower():
         st.session_state.final_text = agent3_finalize(st.session_state.history, st.session_state.slots)
         st.session_state.auto_finalized = True
