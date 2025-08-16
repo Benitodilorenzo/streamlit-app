@@ -1,7 +1,9 @@
 # app_expert_card_gpt5_3agents_clean.py
 # 3 Agents: Chat (Agent 1) · Search (Agent 2) · Finalize (Agent 3)
 # Debug sichtbar im Frontend: Agent-2 Steps + Google Image Search
-# Fix: remove 'fields' param to avoid 400; parse image.contextLink from full payload
+# Fixes:
+#  - Person-safe vision policy (no identity confirmation; portrait-only check)
+#  - Move slot assignment to main thread (poll), not in worker
 
 import os, json, time, uuid, random, traceback, requests
 from typing import List, Dict, Any, Optional, Callable
@@ -44,7 +46,7 @@ def call_with_retry(fn: Callable, *args, **kwargs):
         except APIStatusError as e:
             status = getattr(e, "status_code", None)
             if status in (429, 500, 502, 503, 504):
-                delay = OPENAI_BACKOFF_BASE ** attempt + random.uniform(0, 0.3)
+                delay = OPENAI_MAX_RETRIES ** attempt + random.uniform(0, 0.3)
                 time.sleep(delay)
                 continue
             raise
@@ -78,6 +80,7 @@ def init_state():
 
 # ---------- Debug helpers (thread-safe via buffer)
 def debug_emit(event: Dict[str, Any], buffer: Optional[list] = None):
+    """In Worker-Threads: in lokalen Buffer; im Main-Thread: direkt in session_state."""
     e = dict(event)
     e["ts"] = time.strftime("%H:%M:%S")
     if buffer is not None:
@@ -131,7 +134,8 @@ def placeholder_image(text: str, name: str) -> str:
     return path
 
 def next_free_slot() -> Optional[str]:
-    for sid in st.session_state.order:
+    order = st.session_state.get("order", ["S1","S2","S3","S4"])
+    for sid in order:
         if sid not in st.session_state.slots:
             return sid
     return None
@@ -306,22 +310,39 @@ def google_image_search(query: str, num: int = 4, dbg: Optional[list] = None) ->
         debug_emit({"ev":"cse_error", "query": query, "error": str(e)}, dbg)
         return []
 
-# ---------- Vision: Validate image vs. context
+# ---------- Vision: Validate image vs. context (person-safe branch)
 def validate_image_with_context(image_url: str, entity_type: str, entity_name: str, q_text: str, a_text: str, dbg: Optional[list] = None) -> Dict[str, Any]:
-    sys = (
-        "You are an image verifier. Respond with STRICT JSON like "
-        "{\"ok\":true/false,\"reason\":\"...\"}. "
-        "Check if the image plausibly depicts the requested public item "
-        "(book/podcast/person/tool/film) given the context. "
-        "Be strict about wrong people/logos, but flexible with cover art variants."
-    )
-    user_text = (
-        f"Item type: {entity_type}\n"
-        f"Item name: {entity_name}\n"
-        f"Context Q: {q_text[:300]}\n"
-        f"Context A: {a_text[:500]}\n"
-        "Does this image plausibly match the item?"
-    )
+    if (entity_type or "").lower().strip() == "person":
+        sys = (
+            "You are an image verifier. Respond with STRICT JSON like "
+            '{"ok":true/false,"reason":"..."}. '
+            "Policy: Do NOT attempt to identify or confirm a specific person’s identity. "
+            "For PERSON items, only verify:\n"
+            " - The image is a single-human portrait or headshot (not a logo, meme, cartoon, or product shot).\n"
+            " - Not a group photo (ideally 1 clearly visible person).\n"
+            " - Reasonable to use as a generic portrait representation.\n"
+            "Return ok=true if those conditions hold; otherwise false."
+        )
+        user_text = (
+            "Item type: person\n"
+            f"Item name (for context only, DO NOT IDENTIFY): {entity_name}\n"
+            "Context is irrelevant to identity. Only check portrait criteria above."
+        )
+    else:
+        sys = (
+            "You are an image verifier. Respond with STRICT JSON like "
+            '{"ok":true/false,"reason":"..."}. '
+            "Check if the image plausibly depicts the requested public item "
+            "(book/podcast/person/tool/film) given the context. "
+            "Be strict about wrong items/logos/memes; flexible with cover art variants."
+        )
+        user_text = (
+            f"Item type: {entity_type}\n"
+            f"Item name: {entity_name}\n"
+            f"Context Q: {q_text[:300]}\n"
+            f"Context A: {a_text[:500]}\n"
+            "Does this image plausibly match the item?"
+        )
     try:
         resp = call_with_retry(
             client().chat.completions.create,
@@ -338,7 +359,12 @@ def validate_image_with_context(image_url: str, entity_type: str, entity_name: s
         data = parse_json_loose(txt)
         ok = bool(data.get("ok")) if isinstance(data, dict) else False
         reason = (data.get("reason") if isinstance(data, dict) else "") or ""
-        debug_emit({"ev":"vision_check", "item": f"{entity_type}|{entity_name}", "ok": ok, "reason": reason[:160], "img": image_url[:140]}, dbg)
+        debug_emit(
+            {"ev":"vision_check", "item": f"{entity_type}|{entity_name}", "ok": ok,
+             "reason": reason[:160], "img": image_url[:140],
+             "mode": "person-portrait" if (entity_type or "").lower() == "person" else "exact-match"},
+            dbg
+        )
         if isinstance(data, dict) and "ok" in data:
             return {"ok": ok, "reason": reason[:200]}
     except Exception as e:
@@ -477,10 +503,7 @@ class Orchestrator:
                     debug_emit({"ev":"item_set_cooldown", "key": key, "cooldown_s": COOLDOWN_SECONDS}, dbg)
                     continue
 
-                if key in self.cooldown:
-                    del self.cooldown[key]
-
-                self.seen.append(key)
+                # ⚠️ No slot assignment or seen-mutation here (worker thread).
                 label_hint = {
                     "book": "Must-Read",
                     "podcast": "Podcast",
@@ -497,13 +520,9 @@ class Orchestrator:
                     "notes": note or "validated"
                 }
 
-                sid = next_free_slot()
-                if not sid:
-                    results.append({"status": "full", "label": label})
-                    debug_emit({"ev":"slots_full"}, dbg)
-                    break
-                results.append({"status": "ok", "sid": sid, "label": label, "media": media})
-                debug_emit({"ev":"slot_created", "sid": sid, "label": label}, dbg)
+                # Return prepared item; main thread will pick a free slot & mark seen
+                results.append({"status": "ok", "key": key, "label": label, "media": media})
+                debug_emit({"ev":"item_ready_for_slot", "key": key}, dbg)
                 processed += 1
 
             return {"status": "batch", "items": results, "debug": dbg}
@@ -522,14 +541,24 @@ class Orchestrator:
                     debug_emit({"ev":"poll_exception", "error": str(e)})
                     continue
 
+                # Worker-Debug in Main-Thread-Log pushen
                 for ev in res.get("debug", []) or []:
                     debug_emit(ev, buffer=None)
 
                 if res.get("status") == "batch":
                     for it in res.get("items", []):
                         if it.get("status") == "ok":
-                            self.upsert(it["sid"], it["label"], it["media"])
-                            updated.append(it["sid"])
+                            sid = next_free_slot()
+                            if sid:
+                                self.upsert(sid, it["label"], it["media"])
+                                # Mark seen only after successful slot set
+                                key = it.get("key")
+                                if key and key not in self.seen:
+                                    self.seen.append(key)
+                                updated.append(sid)
+                                debug_emit({"ev":"slot_created_main", "sid": sid, "key": key})
+                            else:
+                                debug_emit({"ev":"slots_full"})
                 elif res.get("status") == "skip":
                     debug_emit({"ev":"poll_skip"})
                 elif res.get("status") == "error":
