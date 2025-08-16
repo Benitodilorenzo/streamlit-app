@@ -1,4 +1,4 @@
-# app_expert_card_gpt5_fixed.py
+# app_expert_card_gpt5.py
 # Single-file Streamlit app — GPT-5 only, Hosted Web Search (Responses API),
 # async media, minimal prompting — NO response_format / NO reasoning params.
 #
@@ -139,15 +139,12 @@ def normalize_entity(raw: str) -> Tuple[Optional[str], Optional[str]]:
     return (None, None)
 
 def parse_json_loose(text: str) -> Optional[dict]:
-    """Robust JSON extraction from a text-only model reply."""
     if not text:
         return None
-    # Try direct parse
     try:
         return json.loads(text)
     except Exception:
         pass
-    # Extract first {...} block
     start = text.find("{")
     end = text.rfind("}")
     if start != -1 and end != -1 and end > start:
@@ -159,13 +156,12 @@ def parse_json_loose(text: str) -> Optional[dict]:
     return None
 
 # =========================
-# GPT-5 HELPERS
+# GPT-5 HELPERS (Hosted Web Search)
 # =========================
 def hosted_search_best_image(entity_type: str, entity_name: str) -> Dict[str, Any]:
     """
     Hosted Web Search via Responses API — NO response_format / NO reasoning.
-    We ask for JSON-only output and parse it ourselves.
-    Expected JSON:
+    Model instructed to return JSON only:
       { "url": "...jpg|png", "page_url":"...", "source":"...", "confidence":0-1, "reason":"..." }
     """
     prefer = PREFERRED_DOMAINS.get(entity_type, [])
@@ -186,16 +182,14 @@ def hosted_search_best_image(entity_type: str, entity_name: str) -> Dict[str, An
                 {
                     "role": "user",
                     "content": [
-                        {"type":"text", "text": instruction},
-                        {"type":"input_text", "text": f"Item: {entity_name}"}
+                        {"type": "input_text", "text": instruction},
+                        {"type": "input_text", "text": f"Item: {entity_name}"}
                     ]
                 }
             ]
         )
-        # Best-effort get text
         out_text = getattr(resp, "output_text", None)
         if not out_text and hasattr(resp, "output"):
-            # Some SDKs return a string in .output or a list of segments
             try:
                 out_text = resp.output if isinstance(resp.output, str) else json.dumps(resp.output)
             except Exception:
@@ -208,19 +202,27 @@ def hosted_search_best_image(entity_type: str, entity_name: str) -> Dict[str, An
         return {"status":"error","best_image_url":"","candidates":[],"notes": f"web_search error: {e}"}
 
 def preflight_web_search():
-    """Probe hosted web_search without response_format."""
+    """Probe hosted web_search using only input_text blocks."""
     try:
-        resp = client.responses.create(
+        _ = client.responses.create(
             model=OPENAI_MODEL,
             tools=[{"type":"web_search"}],
             tool_choice="auto",
-            input=[{"role":"user","content":[{"type":"text","text":"Return JSON: {\"url\":\"https://example.com/a.jpg\",\"page_url\":\"https://example.com\",\"source\":\"example.com\",\"confidence\":0.1,\"reason\":\"test\"}"}]}]
+            input=[{
+                "role":"user",
+                "content":[
+                    {"type":"input_text","text":"Return JSON: {\"url\":\"https://example.com/a.jpg\",\"page_url\":\"https://example.com\",\"source\":\"example.com\",\"confidence\":0.1,\"reason\":\"test\"}"}
+                ]
+            }]
         )
         st.session_state.web_search_ok = True
     except Exception as e:
         st.session_state.web_search_ok = False
         st.session_state.web_search_err = str(e)
 
+# =========================
+# GPT-5 HELPERS (Chat: Routing / Insights / Finalize)
+# =========================
 def route_entity_with_gpt(text: str) -> Tuple[Optional[str], Optional[str]]:
     """Chat Completions — ask for JSON ONLY; parse loosely."""
     sys = (
@@ -231,10 +233,7 @@ def route_entity_with_gpt(text: str) -> Tuple[Optional[str], Optional[str]]:
     try:
         resp = client.chat.completions.create(
             model=OPENAI_MODEL,
-            messages=[
-                {"role":"system","content": sys},
-                {"role":"user","content": text}
-            ]
+            messages=[{"role":"system","content": sys},{"role":"user","content": text}]
         )
         data = parse_json_loose(resp.choices[0].message.content or "")
         if data and data.get("detected") and data.get("entity_type") != "none":
@@ -254,10 +253,7 @@ def distill_insights_with_gpt(text: str, context_hint: str = "") -> Tuple[Option
     try:
         resp = client.chat.completions.create(
             model=OPENAI_MODEL,
-            messages=[
-                {"role":"system","content": sys},
-                {"role":"user","content": text}
-            ]
+            messages=[{"role":"system","content": sys},{"role":"user","content": text}]
         )
         data = parse_json_loose(resp.choices[0].message.content or "")
         if data and data.get("label") and isinstance(data.get("bullets"), list):
