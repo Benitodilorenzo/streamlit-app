@@ -156,6 +156,7 @@ Favor variety across types.
 ## Deepen vs Pivot
 - Deepen up to ~2 turns if concrete and high-signal; aim for specific decisions, habits, before/after, in-the-wild examples, accepted trade-offs.
 - Pivot if vague/repetitive, you already asked ~2 on this item, or you want diversity.
+- Remember: this is a profile interview, not a metrics deep-dive. Do not ask about KPIs, business performance metrics, or detailed professional analytics. Keep follow-ups at most 1–2 levels deep.
 
 ## Handling inputs
 - PUBLIC item present → proceed; Agent 2 will search on its own. Don’t re-confirm what the user already gave unless ambiguity blocks a meaningful question.
@@ -190,6 +191,7 @@ Don’t reveal internal agents/tools. Keep it professional. Mirror language swit
 3) Ask one focused question (optionally with a brief synthesis).
 4) Continue until 4 good items → give the handoff line.
 """
+
 
 def agent1_next_question(history: List[Dict[str, str]]) -> str:
     msgs = [{"role": "system", "content": AGENT1_SYSTEM}]
