@@ -211,11 +211,6 @@ def route_entity_with_gpt(text: str, expected_type: Optional[str] = None) -> Tup
 # GPT-5 HELPERS (Hosted Web Search)
 # =========================
 def hosted_search_best_image(entity_type: str, entity_name: str) -> Dict[str, Any]:
-    """
-    Hosted Web Search via Responses API — Tool-Call wird NUR hier erzwungen.
-    Erwartetes JSON:
-      { "url":"...jpg|png", "page_url":"...", "source":"...", "confidence":0-1, "reason":"..." }
-    """
     prefer = PREFERRED_DOMAINS.get(entity_type, [])
     instruction = (
         "Task: Use the web_search tool to find ONE authoritative image for the given public item.\n"
@@ -223,34 +218,34 @@ def hosted_search_best_image(entity_type: str, entity_name: str) -> Dict[str, An
         f"- Prefer domains: {', '.join(prefer) if prefer else 'none'}\n"
         "- You MUST call the web_search tool (do not answer from memory).\n"
         "- Return a direct image URL (.jpg or .png), not an HTML page.\n"
-        "- Avoid thumbnails, memes, watermarks, or wrong items.\n"
-        "- OUTPUT: a single JSON object with keys: url, page_url, source, confidence, reason. No extra text."
+        "- OUTPUT: JSON {url,page_url,source,confidence,reason}"
     )
     try:
         resp = client.responses.create(
             model=OPENAI_MODEL,
             tools=[{"type": "web_search"}],
-            tool_choice={"type": "tool", "name": "web_search"},  # ERZWINGEN
+            tool_choice="web_search",  # ✅ korrekt
             input=[{
-                "role":"user",
-                "content":[
-                    {"type":"input_text","text": instruction},
-                    {"type":"input_text","text": f"Item: {entity_name}"}
+                "role": "user",
+                "content": [
+                    {"type": "input_text", "text": instruction},
+                    {"type": "input_text", "text": f"Item: {entity_name}"}
                 ]
             }]
         )
         out_text = getattr(resp, "output_text", None)
-        if not out_text and hasattr(resp, "output"):
-            try:
-                out_text = resp.output if isinstance(resp.output, str) else json.dumps(resp.output)
-            except Exception:
-                out_text = None
         data = parse_json_loose(out_text or "")
         if isinstance(data, dict) and data.get("url") and data.get("page_url"):
-            return {"status":"found","best_image_url": data["url"], "candidates":[data], "notes": data.get("reason","")}
-        return {"status":"error","best_image_url":"","candidates":[],"notes":"web_search returned no parseable JSON"}
+            return {
+                "status": "found",
+                "best_image_url": data["url"],
+                "candidates": [data],
+                "notes": data.get("reason", "")
+            }
+        return {"status": "error", "best_image_url": "", "candidates": [], "notes": "no parseable JSON"}
     except Exception as e:
-        return {"status":"error","best_image_url":"","candidates":[],"notes": f"web_search error: {e}"}
+        return {"status": "error", "best_image_url": "", "candidates": [], "notes": f"web_search error: {e}"}
+
 
 def preflight_web_search():
     """Probe hosted web_search; reine input_text-Blöcke; keine Structured Outputs-Parameter."""
