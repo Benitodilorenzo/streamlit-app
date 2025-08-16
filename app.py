@@ -524,9 +524,8 @@ def render_final_card():
             st.markdown(f"**{label}**")
             st.write(line)
 
-# =========================
-# MAIN
-# =========================
+# --- MAIN (Patch) ---
+
 st.set_page_config(page_title=APP_TITLE, page_icon="🟡", layout="wide")
 st.title(APP_TITLE)
 st.caption("GPT-5 only • Hosted Web Search • Async media • One short question per turn")
@@ -534,38 +533,47 @@ st.caption("GPT-5 only • Hosted Web Search • Async media • One short quest
 client = get_client()
 init_state()
 
-# Preflight hosted web_search once
+# 1) Preflight hosted web_search once (vor UI-Render, aber nach State-Init)
 if st.session_state.web_search_ok is None:
     preflight_web_search()
+
 if st.session_state.web_search_ok is False:
     st.error(f"Hosted web_search not available: {st.session_state.web_search_err}")
 
 orch = Orchestrator()
 
-# Poll media jobs each run
+# 2) **Seed**: Erste Assistentenfrage früh setzen (VOR jeglichem Render!)
+def ensure_seed_question():
+    # Falls noch kein Assistant-Post im Verlauf ist, jetzt hinzufügen
+    if not any(m["role"] == "assistant" for m in st.session_state.history):
+        st.session_state.history.append({
+            "role": "assistant",
+            "content": "Hi! Which single book most changed how you think about building data-driven products? Title only."
+        })
+
+ensure_seed_question()
+
+# 3) Poll Media-Jobs (kann Toasts erzeugen)
 updated_slots = orch.poll_media()
 if updated_slots:
     for sid in updated_slots:
         st.toast(f"Media updated: {sid}", icon="🖼️")
 
+# 4) Jetzt ERST rendern (Timeline/Chat)
 render_progress_and_timeline()
 render_chat_history()
 
-# Initial question
-if not any(m["role"] == "assistant" for m in st.session_state.history):
-    st.session_state.history.append({
-        "role":"assistant",
-        "content":"Hi! Which single book most changed how you think about building data-driven products? Title only."
-    })
-
-# Input
+# 5) Eingabe
 user_text = st.chat_input("Your turn…")
+
 if user_text:
+    # Alles stateful erledigen VOR UI-Render
     st.session_state.history.append({"role":"user","content": user_text})
     process_user_message(user_text, orch)
+    # Sofort rerun, damit die eben hinzugefügte Assistant-Nachricht sichtbar wird
     st.rerun()
 
-# Actions
+# 6) Actions & Final Card (rendern zum Schluss)
 c1, c2, c3 = st.columns(3)
 with c1:
     if st.button("✨ Finalize (needs 4 slots)"):
