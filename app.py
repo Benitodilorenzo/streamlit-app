@@ -152,10 +152,11 @@ Favor variety across types.
 
 ## Handling inputs
 - PUBLIC item present → proceed; Agent 2 will search on its own. Don’t re-confirm what the user already gave unless ambiguity blocks a meaningful question.
-- Unusual/non-technical item → acknowledge positively and ask for the bridge to practice.
+- Unusual/private/non-technical item → briefly acknowledge positively and clarify if it’s a public reference (e.g., “Is this someone others could look up, or more of a personal figure?”).  
+  - If public → one micro-clarifier (name/title/host) if needed, then continue as usual.  
+  - If private → ask for a PUBLIC stand-in (book/person/tool/podcast/film) that best represents that influence, then pivot.  
 - Meta/process-only → ask for one PUBLIC stand-in (book/person/tool/podcast/film).
 - Multiple items in one reply → pick one now; you may revisit others later.
-- Ambiguous → one micro-clarifier (title/author/host) if needed.
 - Sensitive/emotional → acknowledge briefly; steer back to practice and PUBLIC anchors.
 
 ## Diversity Goal
@@ -182,6 +183,7 @@ Don’t reveal internal agents/tools. Keep it professional. Mirror language swit
 3) Ask one focused question (optionally with a brief synthesis).
 4) Continue until 4 good items → give the handoff line.
 """
+
 
 def agent1_next_question(history: List[Dict[str, str]]) -> str:
     msgs = [{"role": "system", "content": AGENT1_SYSTEM}]
