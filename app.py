@@ -73,7 +73,7 @@ def init_state():
     st.session_state.final_lines: Dict[str, str] = {}
     st.session_state.web_search_ok = None
     st.session_state.web_search_err = ""
-    st.session_state.web_tool = "web_search"
+    st.session_state.web_tool = "web_search"  # will be set by preflight
 
     # Erwarteter Entitätstyp für die nächste User-Antwort (steuert Erkennung)
     st.session_state.expected_type: Optional[str] = None  # "book" | "podcast" | "person" | "tool" | "film" | None
@@ -220,39 +220,67 @@ def route_entity_with_gpt(text: str, expected_type: Optional[str] = None) -> Tup
 # =========================
 # GPT-5 HELPERS (Hosted Web Search)
 # =========================
+def _extract_output_text(resp) -> Optional[str]:
+    # Prefer resp.output_text; if absent, try to gather text from any output items.
+    txt = getattr(resp, "output_text", None)
+    if txt:
+        return txt
+    # Some SDKs expose .output as list/obj; try best-effort flatten
+    out = getattr(resp, "output", None)
+    if isinstance(out, str):
+        return out
+    if isinstance(out, list):
+        parts = []
+        for item in out:
+            if isinstance(item, dict):
+                # responses-style content may live under item.get("content")
+                c = item.get("content")
+                if isinstance(c, list):
+                    for piece in c:
+                        if isinstance(piece, dict) and piece.get("type") in ("output_text","summary_text","input_text"):
+                            if "text" in piece:
+                                parts.append(piece["text"])
+                elif isinstance(c, str):
+                    parts.append(c)
+        if parts:
+            return "\n".join(parts)
+    return None
+
 def hosted_search_best_image(entity_type: str, entity_name: str) -> Dict[str, Any]:
     prefer = PREFERRED_DOMAINS.get(entity_type, [])
     instruction = (
-        "Task: Use the web_search tool to find ONE authoritative image for the given public item.\n"
-        f"- Item type: {entity_type}\n"
-        f"- Prefer domains: {', '.join(prefer) if prefer else 'none'}\n"
-        "- You MUST call the web_search tool (do not answer from memory).\n"
-        "- Return a direct image URL (.jpg or .png), not an HTML page.\n"
-        "- OUTPUT JSON ONLY with keys: url, page_url, source, confidence, reason."
+        "Use the web_search tool to find ONE authoritative image for the item. "
+        "Prefer domains: " + (", ".join(prefer) if prefer else "none") + ". "
+        "Return ONLY JSON with keys: url, page_url, source, confidence, reason. "
+        "If you cannot call the tool, return exactly: {\"error\":\"no_tool\"}."
     )
     try:
         tool = st.session_state.get("web_tool", "web_search")
         resp = client.responses.create(
             model=OPENAI_MODEL,
-            tools=[{"type": tool}],
-            tool_choice="required",
+            tools=[{"type": tool}],         # web_search or web_search_preview
+            tool_choice="auto",             # <-- snapshot requires auto for hosted web search
             input=[{
                 "role": "user",
                 "content": [
-                    {"type": "input_text", "text": instruction},
-                    {"type": "input_text", "text": f"Item: {entity_name}"}
+                    {"type": "input_text", "text": f"Item type: {entity_type}"},
+                    {"type": "input_text", "text": f"Item: {entity_name}"},
+                    {"type": "input_text", "text": instruction}
                 ]
             }]
         )
-        out_text = getattr(resp, "output_text", None)
+        out_text = _extract_output_text(resp)
         data = parse_json_loose(out_text or "")
-        if isinstance(data, dict) and data.get("url") and data.get("page_url"):
-            return {
-                "status": "found",
-                "best_image_url": data["url"],
-                "candidates": [data],
-                "notes": data.get("reason", "")
-            }
+        if isinstance(data, dict):
+            if data.get("error") == "no_tool":
+                return {"status":"error","best_image_url":"","candidates":[],"notes":"model did not invoke web_search"}
+            if data.get("url") and data.get("page_url"):
+                return {
+                    "status": "found",
+                    "best_image_url": data["url"],
+                    "candidates": [data],
+                    "notes": data.get("reason", "")
+                }
         return {
             "status": "error",
             "best_image_url": "",
@@ -274,7 +302,7 @@ def preflight_web_search():
             _ = client.responses.create(
                 model=OPENAI_MODEL,
                 tools=[{"type": tool}],
-                tool_choice="required",
+                tool_choice="auto",   # <-- allow only auto
                 input=[{
                     "role":"user",
                     "content":[
