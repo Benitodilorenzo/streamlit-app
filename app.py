@@ -1,8 +1,9 @@
 # app_expert_card_gpt5.py
 # Single-file Streamlit app — GPT-5 only, Hosted Web Search, async media, minimal prompting
-# Includes patches:
-#  (1) Placeholder image generation compatible with Pillow ≥10 (uses textbbox, not textsize)
-#  (2) Hosted web_search errors are surfaced (not swallowed) + preflight check + UI notes
+# Corrections:
+#  - Removed unsupported `verbosity` and *all* reasoning parameters from Responses API calls
+#  - Pillow ≥10-safe placeholder generation (uses textbbox, not textsize)
+#  - Web search errors are surfaced (not swallowed) + preflight check + UI notes
 #
 # Requirements:
 #   pip install streamlit openai pillow requests
@@ -102,7 +103,7 @@ def _get(url, params=None, headers=None, timeout=HTTP_TIMEOUT):
     return requests.get(url, params=params, headers=h, timeout=timeout)
 
 def generate_placeholder_icon(text: str, slot_id: str) -> str:
-    """Patch (1): Pillow ≥10 compatible placeholder (textbbox)."""
+    """Pillow ≥10 compatible placeholder (textbbox)."""
     size = (640, 640)
     img = Image.new("RGB", size, color=(24, 31, 55))
     draw = ImageDraw.Draw(img)
@@ -216,7 +217,7 @@ INSIGHT_SCHEMA = {
 def hosted_search_best_image(entity_type: str, entity_name: str) -> Dict[str, Any]:
     """
     Use GPT-5 Responses API with hosted web_search to pick ONE authoritative image.
-    Patch (2): Do NOT swallow errors — return status=error with notes.
+    No `verbosity`, no `reasoning` — strictly minimal call.
     """
     prefer = PREFERRED_DOMAINS.get(entity_type, [])
     instructions = (
@@ -232,8 +233,6 @@ def hosted_search_best_image(entity_type: str, entity_name: str) -> Dict[str, An
             model=OPENAI_MODEL,
             tools=[{"type":"web_search"}],
             tool_choice="auto",
-            reasoning={"effort":"minimal"},
-            verbosity="low",
             response_format={"type":"json_schema","json_schema": BEST_IMAGE_SCHEMA},
             input=[{
                 "role":"user",
@@ -251,14 +250,12 @@ def hosted_search_best_image(entity_type: str, entity_name: str) -> Dict[str, An
         return {"status":"error","best_image_url":"","candidates":[],"notes": f"web_search error: {e}"}
 
 def preflight_web_search():
-    """One-time probe to detect if hosted web_search is available and callable."""
+    """One-time probe to detect if hosted web_search is callable."""
     try:
         resp = client.responses.create(
             model=OPENAI_MODEL,
             tools=[{"type":"web_search"}],
             tool_choice="auto",
-            reasoning={"effort":"minimal"},
-            verbosity="low",
             response_format={"type":"json_schema","json_schema": BEST_IMAGE_SCHEMA},
             input=[{"role":"user","content":[
                 {"type":"text","text":"Test web search availability. Return any valid JSON per schema."}
@@ -275,8 +272,6 @@ def route_entity_with_gpt(text: str) -> Tuple[Optional[str], Optional[str]]:
     try:
         resp = client.responses.create(
             model=OPENAI_MODEL,
-            reasoning={"effort":"minimal"},
-            verbosity="low",
             response_format={"type":"json_schema","json_schema": ENTITY_SCHEMA},
             input=[{"role":"user","content":[{"type":"text","text": f"Extract one public entity if present from: {text}"}]}]
         )
@@ -298,8 +293,6 @@ def distill_insights_with_gpt(text: str, context_hint: str = "") -> Tuple[Option
             inst += f" Context: {context_hint}"
         resp = client.responses.create(
             model=OPENAI_MODEL,
-            reasoning={"effort":"minimal"},
-            verbosity="low",
             response_format={"type":"json_schema","json_schema": INSIGHT_SCHEMA},
             input=[{"role":"user","content":[{"type":"text","text": inst}, {"type":"input_text","text": text}]}]
         )
@@ -426,7 +419,7 @@ class Orchestrator:
             res["slot_id"] = slot_id
             return res
 
-        # Patch (2): On error, return status=error with notes (do not go to placeholder yet)
+        # On error, return status=error with notes (do not go to placeholder yet)
         if res.get("status") == "error":
             res["slot_id"] = slot_id
             return res
@@ -539,7 +532,7 @@ def render_progress_and_timeline():
                 except Exception: st.caption("(image unavailable)")
             else:
                 st.caption("(image pending)")
-            # Show notes (Patch 2: surface errors)
+            # Show notes (surface errors)
             notes = (m.get("notes") or "").strip()
             if notes:
                 st.code(notes, language="text")
