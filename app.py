@@ -2,7 +2,7 @@
 # 3 Agents: Chat (Agent 1) · Search (Agent 2) · Finalize (Agent 3)
 # GPT-5 (Responses API) with hosted web_search_preview; async Agent 2 jobs.
 
-import os, json, time, uuid, math, random
+import os, json, time, uuid, math, random, traceback
 from typing import List, Dict, Any, Optional, Tuple, Callable
 from concurrent.futures import ThreadPoolExecutor, Future
 
@@ -17,7 +17,7 @@ MEDIA_DIR = os.path.join(os.getcwd(), "media")
 os.makedirs(MEDIA_DIR, exist_ok=True)
 
 # ---- Token/Cost controls
-MAX_SEARCHES_PER_RUN = 1         # Agent 2: cap per turn (was 2)
+MAX_SEARCHES_PER_RUN = 1         # Agent 2: cap per turn
 AGENT2_MODEL = os.getenv("OPENAI_AGENT2_MODEL", "gpt-4o-mini")  # cheaper/smaller model for Agent 2
 OPENAI_MAX_RETRIES = 3           # Retry count for rate limits / 5xx
 OPENAI_BACKOFF_BASE = 1.8        # Exponential backoff base
@@ -35,7 +35,6 @@ def call_with_retry(fn: Callable, *args, **kwargs):
         try:
             return fn(*args, **kwargs)
         except APIStatusError as e:
-            # Retry on 429/5xx
             status = getattr(e, "status_code", None)
             if status in (429, 500, 502, 503, 504):
                 delay = OPENAI_BACKOFF_BASE ** attempt + random.uniform(0, 0.3)
@@ -43,19 +42,16 @@ def call_with_retry(fn: Callable, *args, **kwargs):
                 continue
             raise
         except Exception as e:
-            # Some SDKs raise RateLimitError directly
             msg = str(e).lower()
             if "rate limit" in msg or "429" in msg:
                 delay = OPENAI_BACKOFF_BASE ** attempt + random.uniform(0, 0.3)
                 time.sleep(delay)
                 continue
             raise
-    # Last try (if still failing), let it raise
     return fn(*args, **kwargs)
 
 # ---------- Session state (idempotent)
 def init_state():
-    # do NOT early-return only on "init": ensure keys exist each time
     st.session_state.setdefault("init", True)
     st.session_state.setdefault("history", [])                # Agent1 ↔ User
     st.session_state.setdefault("slots", {})                  # S1..S4
@@ -69,19 +65,29 @@ def init_state():
     st.session_state.setdefault("web_search_err", "")
     st.session_state.setdefault("used_openers", set())
     st.session_state.setdefault("auto_finalized", False)
+    st.session_state.setdefault("debug_agent2", [])           # store last N debug entries
+
+def debug_log_agent2(entry: Dict[str, Any]):
+    # Keep last 15 entries
+    st.session_state.debug_agent2.append(entry)
+    if len(st.session_state.debug_agent2) > 15:
+        st.session_state.debug_agent2 = st.session_state.debug_agent2[-15:]
 
 # ---------- Utils
 def parse_json_loose(text: str) -> Optional[dict]:
     if not text:
         return None
+    # strict first
     try:
         return json.loads(text)
     except Exception:
         pass
+    # loose extract first {...}
     a, b = text.find("{"), text.rfind("}")
     if a != -1 and b != -1 and b > a:
+        frag = text[a:b+1]
         try:
-            return json.loads(text[a:b+1])
+            return json.loads(frag)
         except Exception:
             return None
     return None
@@ -112,7 +118,7 @@ def next_free_slot() -> Optional[str]:
             return sid
     return None
 
-# ---------- Preflight hosted web_search_preview  (FIX: remove response_format)
+# ---------- Preflight hosted web_search_preview
 def preflight():
     if st.session_state.web_search_ok is not None:
         return
@@ -203,7 +209,7 @@ def agent1_next_question(history: List[Dict[str, str]]) -> str:
     st.session_state.used_openers.add(q.lower()[:72])
     return q
 
-# ---------- Agent 2 (Observer + Web Image Finder) — ultra-lean; JSON-only via prompt; 1 search; de-dupe
+# ---------- Agent 2 (Observer + Web Image Finder)
 AGENT2_SYSTEM = """You are Agent 2.
 
 Task:
@@ -243,30 +249,37 @@ def agent2_detect_and_search_multi(last_q: str, user_reply: str, seen_entities: 
     try:
         resp = call_with_retry(
             client().responses.create,
-            model=AGENT2_MODEL,  # smaller/cheaper model for Agent 2
+            model=AGENT2_MODEL,
             input=[
                 {"role": "system", "content": AGENT2_SYSTEM},
                 {"role": "user", "content": json.dumps(payload, ensure_ascii=False)}
             ],
             tools=[{"type": "web_search_preview"}],
-            parallel_tool_calls=False,                 # no multi-source cascades
-            store=False                                # no hidden session state reuse
+            parallel_tool_calls=False,
+            store=False
         )
 
-        # Optional: display token usage for Agent 2 (helps debugging)
-        try:
-            usage = getattr(resp, "usage", None)
-            if usage:
-                st.sidebar.info(f"Agent2 tokens — input:{usage.input_tokens} output:{usage.output_tokens}", icon="🧮")
-        except Exception:
-            pass
+        raw_text = getattr(resp, "output_text", "") or ""
+        data = parse_json_loose(raw_text)
+        # Debug to sidebar
+        dbg = {
+            "status": "raw",
+            "assistant_question": last_q[:120],
+            "user_reply": user_reply[:120],
+            "seen_entities": seen_entities,
+            "raw_len": len(raw_text),
+            "raw_preview": raw_text[:500],
+        }
+        debug_log_agent2(dbg)
 
-        out = resp.output_text or ""
-        data = parse_json_loose(out)
         if isinstance(data, dict):
+            debug_log_agent2({"status":"parsed", "json": data})
             return data
+
+        debug_log_agent2({"status":"no-parse"})
         return {"detected": False, "reason": "no-parse"}
     except Exception as e:
+        debug_log_agent2({"status":"error", "error": str(e), "trace": traceback.format_exc()[:800]})
         return {"detected": False, "reason": f"error: {e}"}
 
 # ---------- Agent 3 (Finalizer)
@@ -310,18 +323,24 @@ def agent3_finalize(history: List[Dict[str, str]], slots: Dict[str, Dict[str, An
 # ---------- Orchestrator
 class Orchestrator:
     def __init__(self):
-        # harden against half-initialized sessions
         if "seen_entities" not in st.session_state:
             st.session_state.seen_entities = []
         self.slots = st.session_state.slots
         self.jobs = st.session_state.jobs
         self.exec = st.session_state.executor
-        self.seen = st.session_state.seen_entities   # list[str] type|name
+        self.seen = st.session_state.seen_entities
 
     def upsert(self, sid: str, label: str, media: Dict[str, Any]):
         s = self.slots.get(sid, {"slot_id": sid, "label": "", "media": {"status": "pending", "best_image_url": "", "candidates": [], "notes": ""}})
-        s["label"] = label[:160]
-        s["media"].update(media or {})
+        s["label"] = label[:160] if label else sid
+        # Ensure media defaults so UI renders
+        m = s.get("media", {})
+        m.setdefault("status", "pending")
+        m.setdefault("best_image_url", "")
+        m.setdefault("candidates", [])
+        m.setdefault("notes", "")
+        m.update(media or {})
+        s["media"] = m
         self.slots[sid] = s
 
     def schedule_watch(self, last_q: str, reply: str):
@@ -331,56 +350,56 @@ class Orchestrator:
         st.toast("🛰️ Agent 2 is scanning for public items…", icon="🛰️")
 
     def _job(self, last_q: str, reply: str, seen_snapshot: List[str]) -> Dict[str, Any]:
-        data = agent2_detect_and_search_multi(last_q, reply, seen_snapshot)
-        if not data.get("detected"):
-            return {"status": "skip"}
-        items = data.get("items") or []
-        results: List[Dict[str, Any]] = []
+        try:
+            data = agent2_detect_and_search_multi(last_q, reply, seen_snapshot)
+            if not data.get("detected"):
+                return {"status": "skip"}
+            items = data.get("items") or []
+            results: List[Dict[str, Any]] = []
 
-        for item in items:
-            etype = (item.get("entity_type") or "").lower()
-            ename = (item.get("entity_name") or "").strip()
-            action = (item.get("action") or "").strip()
-            if not etype or not ename:
-                continue
+            for item in items:
+                etype = (item.get("entity_type") or "").lower().strip()
+                ename = (item.get("entity_name") or "").strip()
+                action = (item.get("action") or "").strip()
+                if not etype or not ename:
+                    continue
 
-            key = f"{etype}|{ename.lower()}"
-            if key in self.seen:
-                # double-guard dedupe
-                continue
+                key = f"{etype}|{ename.lower()}"
+                if key in self.seen:
+                    continue
+                self.seen.append(key)
 
-            # mark seen to avoid future searches
-            self.seen.append(key)
+                label_hint = {
+                    "book": "Must-Read",
+                    "podcast": "Podcast",
+                    "person": "Role Model",
+                    "tool": "Go-to Tool",
+                    "film": "Influence",
+                }.get(etype, "Item")
+                label = f"{label_hint} — {ename}"
 
-            label_hint = {
-                "book": "Must-Read",
-                "podcast": "Podcast",
-                "person": "Role Model",
-                "tool": "Go-to Tool",
-                "film": "Influence",
-            }.get(etype, "Item")
-            label = f"{label_hint} — {ename}"
+                url = (item.get("url") or "").strip()
+                page = (item.get("page_url") or "").strip()
+                src = (item.get("source") or "").strip()
+                conf = float(item.get("confidence") or 0.0) if "confidence" in item else 0.0
+                rsn = (item.get("reason") or "").strip()
 
-            url = (item.get("url") or "").strip()
-            page = (item.get("page_url") or "").strip()
-            src = (item.get("source") or "").strip()
-            conf = float(item.get("confidence") or 0.0) if "confidence" in item else 0.0
-            rsn = (item.get("reason") or "").strip()
+                # IMPORTANT: Even if no image (detected_no_search), we still create the slot with a placeholder.
+                media = {
+                    "status": "found" if (action == "searched" and url) else ("pending" if action == "detected_no_search" else "skipped"),
+                    "best_image_url": url or (placeholder_image(ename or etype, "tmp") if action != "skipped_duplicate" else ""),
+                    "candidates": ([{"url": url, "page_url": page, "source": src, "confidence": conf, "reason": rsn}] if url else []),
+                    "notes": rsn or (action if action else "")
+                }
 
-            media = {
-                "status": "found" if (action == "searched" and url) else ("pending" if action == "detected_no_search" else "skipped"),
-                "best_image_url": url or (placeholder_image(ename or etype, "tmp") if action != "skipped_duplicate" else ""),
-                "candidates": ([{"url": url, "page_url": page, "source": src, "confidence": conf, "reason": rsn}] if url else []),
-                "notes": rsn or (action if action else "")
-            }
-
-            sid = next_free_slot()
-            if not sid:
-                results.append({"status": "full", "label": label})
-                break
-            results.append({"status": "ok", "sid": sid, "label": label, "media": media})
-
-        return {"status": "batch", "items": results}
+                sid = next_free_slot()
+                if not sid:
+                    results.append({"status": "full", "label": label})
+                    break
+                results.append({"status": "ok", "sid": sid, "label": label, "media": media})
+            return {"status": "batch", "items": results}
+        except Exception as e:
+            return {"status": "error", "error": str(e), "trace": traceback.format_exc()[:1200]}
 
     def poll(self) -> List[str]:
         updated, rm = [], []
@@ -389,13 +408,22 @@ class Orchestrator:
                 rm.append(jid)
                 try:
                     res = fut.result()
-                except Exception:
+                except Exception as e:
+                    debug_log_agent2({"status":"poll-exception", "error": str(e)})
                     continue
+
+                debug_log_agent2({"status":"poll-result", "result": res})
+
                 if res.get("status") == "batch":
                     for it in res.get("items", []):
                         if it.get("status") == "ok":
                             self.upsert(it["sid"], it["label"], it["media"])
                             updated.append(it["sid"])
+                elif res.get("status") in ("skip", "full"):
+                    # Show in sidebar for transparency
+                    debug_log_agent2({"status":"poll-info", "info": res.get("status")})
+                elif res.get("status") == "error":
+                    debug_log_agent2({"status":"poll-error", "error": res.get("error"), "trace": res.get("trace")})
         for jid in rm:
             del self.jobs[jid]
         return updated
@@ -403,7 +431,7 @@ class Orchestrator:
 # ---------- Render
 def render_slots():
     slots = st.session_state.slots
-    filled = len([s for s in slots.values() if s.get("label")])
+    filled = len([s for s in slots.values() if (s.get("label") or "").strip()])
     st.progress(min(1.0, filled / 4), text=f"Progress: {filled}/4")
     cols = st.columns(4)
     for i, sid in enumerate(st.session_state.order):
@@ -457,10 +485,18 @@ def render_overrides():
                     except Exception:
                         st.error("Could not read image.")
 
+def render_debug_sidebar():
+    st.sidebar.header("🔍 Agent 2 Debug")
+    if st.session_state.debug_agent2:
+        for entry in reversed(st.session_state.debug_agent2):
+            st.sidebar.json(entry, expanded=False)
+    else:
+        st.sidebar.caption("No Agent-2 events yet.")
+
 # ---------- Main
 st.set_page_config(page_title=APP_TITLE, page_icon="🟡", layout="wide")
 st.title(APP_TITLE)
-st.caption("Pure prompt orchestration • Hosted Web Search via Responses API • Agent 2: JSON-only via prompt, 1 search max, de-dupe")
+st.caption("Pure prompt orchestration • Hosted Web Search via Responses API • Agent 2: JSON-only, 1 search max, de-dupe")
 
 init_state()
 preflight()
@@ -469,11 +505,6 @@ if st.session_state.web_search_ok is False:
 
 orch = Orchestrator()
 
-# First opener from Agent 1
-if not st.session_state.history:
-    opener = agent1_next_question([])
-    st.session_state.history.append({"role": "assistant", "content": opener})
-
 # Poll Agent 2 async jobs
 for sid in orch.poll():
     st.toast(f"🖼️ Media updated: {sid}", icon="🖼️")
@@ -481,13 +512,19 @@ for sid in orch.poll():
 # Render UI
 render_slots()
 render_history()
+render_debug_sidebar()
 
 # Auto-finalize fallback: if 4 slots filled and not yet finalized, run Agent 3
 if not st.session_state.auto_finalized:
-    if all(sid in st.session_state.slots and st.session_state.slots[sid].get("label") for sid in st.session_state.order):
+    if all(sid in st.session_state.slots and (st.session_state.slots[sid].get("label") or "").strip() for sid in st.session_state.order):
         st.session_state.final_text = agent3_finalize(st.session_state.history, st.session_state.slots)
         st.session_state.auto_finalized = True
         st.toast("✅ Auto-finalized your Expert Card.", icon="✨")
+
+# First opener from Agent 1
+if not st.session_state.history:
+    opener = agent1_next_question([])
+    st.session_state.history.append({"role": "assistant", "content": opener})
 
 # Input handling
 user_text = st.chat_input("Your turn…")
@@ -508,7 +545,7 @@ if user_text:
     nxt = agent1_next_question(st.session_state.history)
     st.session_state.history.append({"role": "assistant", "content": nxt})
 
-    # Handoff line (if Agent 1 decides to say it)
+    # Optional: handoff phrase trigger if Agent 1 ever uses it
     if "assemble your 4-point card now" in nxt.lower() or "assemble your 4-point" in nxt.lower():
         st.session_state.final_text = agent3_finalize(st.session_state.history, st.session_state.slots)
         st.session_state.auto_finalized = True
