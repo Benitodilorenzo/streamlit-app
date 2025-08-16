@@ -248,12 +248,12 @@ def hosted_search_best_image(entity_type: str, entity_name: str) -> Dict[str, An
 
 
 def preflight_web_search():
-    """Probe hosted web_search; reine input_text-Blöcke; keine Structured Outputs-Parameter."""
+    """Probe hosted web_search; reine input_text-Blöcke; keine Structured-Outputs-Extras."""
     try:
         _ = client.responses.create(
             model=OPENAI_MODEL,
-            tools=[{"type": "web_search"}],
-            tool_choice="web_search",
+            tools=[{"type":"web_search"}],
+            tool_choice="web_search",  # << hier ebenfalls string!
             input=[{
                 "role":"user",
                 "content":[
@@ -265,6 +265,7 @@ def preflight_web_search():
     except Exception as e:
         st.session_state.web_search_ok = False
         st.session_state.web_search_err = str(e)
+
 
 # =========================
 # GPT-5 HELPERS (Insights + Finalize)
