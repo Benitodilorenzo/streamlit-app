@@ -1,7 +1,7 @@
 # app_expert_card_gpt5_3agents_clean.py
 # 3 Agents: Chat (Agent 1) · Search (Agent 2) · Finalize (Agent 3)
 # Debug sichtbar im Frontend: Agent-2 Steps + Google Image Search
-# Nur Debug-Patches; Agent 1 & Agent 2 Prompts wie besprochen.
+# Nur Debug-/SAFE-Patches; Agent 1 & Agent 2 Prompts wie besprochen.
 
 import os, json, time, uuid, random, traceback, requests
 from typing import List, Dict, Any, Optional, Callable
@@ -19,9 +19,10 @@ AGENT2_MODEL = os.getenv("OPENAI_AGENT2_MODEL", "gpt-4o-mini")  # günstig für 
 MEDIA_DIR = os.path.join(os.getcwd(), "media")
 os.makedirs(MEDIA_DIR, exist_ok=True)
 
-# ---- Google Programmable Search (CSE)
-GOOGLE_CSE_KEY = os.getenv("GOOGLE_CSE_KEY", "").strip()
-GOOGLE_CSE_CX  = os.getenv("GOOGLE_CSE_CX", "").strip()
+# ---- Google Programmable Search (CSE) — via secrets.toml
+GOOGLE_CSE_KEY = st.secrets["GOOGLE_CSE_KEY"]
+GOOGLE_CSE_CX  = st.secrets["GOOGLE_CSE_CX"]
+GOOGLE_CSE_SAFE = st.secrets.get("GOOGLE_CSE_SAFE", "off").strip().lower()  # "off" oder "active"
 
 # ---- Token/Cost controls
 MAX_SEARCHES_PER_RUN = 1
@@ -192,7 +193,6 @@ Don’t reveal internal agents/tools. Keep it professional. Mirror language swit
 4) Continue until 4 good items → give the handoff line.
 """
 
-
 def agent1_next_question(history: List[Dict[str, str]]) -> str:
     msgs = [{"role": "system", "content": AGENT1_SYSTEM}]
     if st.session_state.get("used_openers"):
@@ -258,7 +258,7 @@ def agent2_extract_items(last_q: str, user_reply: str, seen_entities: List[str],
         debug_emit({"ev":"extract_error", "error": str(e)}, dbg)
         return {"detected": False, "reason": f"error: {e}", "trace": traceback.format_exc()[:600]}
 
-# ---------- Google CSE: Image Search (nur Debug erweitert)
+# ---------- Google CSE: Image Search (SAFE param aus secrets)
 def google_image_search(query: str, num: int = 4, dbg: Optional[list] = None) -> List[Dict[str, str]]:
     if not GOOGLE_CSE_KEY or not GOOGLE_CSE_CX:
         debug_emit({"ev":"cse_keys_missing", "query": query, "key_set": bool(GOOGLE_CSE_KEY), "cx_set": bool(GOOGLE_CSE_CX)}, dbg)
@@ -268,12 +268,12 @@ def google_image_search(query: str, num: int = 4, dbg: Optional[list] = None) ->
             "q": query,
             "searchType": "image",
             "num": max(1, min(num, 10)),
-            "safe": "active",
+            "safe": GOOGLE_CSE_SAFE,  # <- dynamisch aus secrets.toml ("off"/"active")
             "fields": "items(link,contextLink),error",
             "key": GOOGLE_CSE_KEY,
             "cx": GOOGLE_CSE_CX,
         }
-        debug_emit({"ev":"cse_start", "query": query, "params": {"num": params["num"], "safe": "active"}}, dbg)
+        debug_emit({"ev":"cse_start", "query": query, "params": {"num": params["num"], "safe": GOOGLE_CSE_SAFE}}, dbg)
         r = requests.get("https://www.googleapis.com/customsearch/v1", params=params, timeout=12)
         try:
             r.raise_for_status()
