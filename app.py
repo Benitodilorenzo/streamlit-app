@@ -319,19 +319,16 @@ def agent1_stream_question(history_snapshot: List[Dict[str, str]]) -> str:
         text = "".join(full).strip()
     except Exception as e:
         # Fallback bei "organization must be verified to stream this model" o.ä.
-        # -> Non-Streaming Request und Ausgabe ohne Crash
         try:
             from openai import BadRequestError  # optional, falls verfügbar
         except Exception:
             BadRequestError = Exception
-        # Nur wenn es klar ein Stream-Policy-Problem ist: fallback
         if isinstance(e, BadRequestError) or "must be verified to stream" in str(e).lower() or "unsupported_value" in str(e).lower():
             resp = call_with_retry(client().chat.completions.create, model=MODEL, messages=msgs)
             text = (resp.choices[0].message.content or "").strip()
             with st.chat_message("assistant"):
                 st.markdown(text if text else "...")
         else:
-            # Unbekannter Fehler -> rethrow, damit du ihn siehst
             raise
 
     # Post-Processing (Fragezeichen, opener tracking, Handoff)
@@ -340,13 +337,14 @@ def agent1_stream_question(history_snapshot: List[Dict[str, str]]) -> str:
     st.session_state.setdefault("used_openers", set()).add(text.lower()[:72])
 
     low = text.lower()
-    if any(phrase in low for phrase in HANDOFF_PHRASES]):
+    if any(phrase in low for phrase in HANDOFF_PHRASES):  # ✅ korrigiert: ) statt ]
         # finalisiere sofort (wie zuvor)
         st.session_state.final_text = agent3_finalize(
             st.session_state.history + [{"role": "assistant", "content": text}],
             st.session_state.slots
         )
     return text
+
 
 
 # ---------- Agent 2 (Extractor ONLY; keine Tools)
