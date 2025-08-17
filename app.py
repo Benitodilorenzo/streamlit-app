@@ -7,6 +7,8 @@
 # - Debug-Funktionen weiterhin vorhanden, aber deaktiviert (kein UI-Logging).
 # - Media Overrides weiterhin entfernt.
 # - Finale Darstellung & Person-Policy bleiben wie zuvor implementiert.
+# - Agent 1 asynchron (Jobs + "typing" Flag) — UI reagiert sofort.
+# - Followup-Helper (register_followup) ergänzt.
 
 import os, json, time, uuid, random, traceback, requests, re
 from typing import List, Dict, Any, Optional, Callable
@@ -100,6 +102,11 @@ def init_state():
         "done_keys": []             # Liste in Reihenfolge der Fertigstellung
     })
     st.session_state.setdefault("stop_signal", False)
+    # (1) Agent-1-Jobs & Typing-Flag
+    st.session_state.setdefault("agent1_jobs", {})      # id -> Future
+    st.session_state.setdefault("agent1_typing", False) # UI-Tippindikator
+    # Followup-Zähler Map
+    st.session_state.setdefault("followup_count", {})
 
 # ---------- Debug helpers (deaktiviert)
 def debug_emit(event: Dict[str, Any], buffer: Optional[list] = None):
@@ -269,6 +276,61 @@ def agent1_next_question(history: List[Dict[str, str]]) -> str:
         q = q.rstrip(".! ") + "?"
     st.session_state.setdefault("used_openers", set()).add(q.lower()[:72])
     return q
+
+# ---------- (2) Asynchronen Agent-1 Job anlegen
+def schedule_agent1_question(history_snapshot: List[Dict[str, str]]):
+    jid = str(uuid.uuid4())[:8]
+    # wichtig: snapshot kopieren, damit spätere Mutationen den Prompt nicht verändern
+    hist = list(history_snapshot)
+    fut = st.session_state.executor.submit(_agent1_job, hist)
+    st.session_state.agent1_jobs[jid] = fut
+    st.session_state.agent1_typing = True  # „tippt…“ anzeigen
+    return jid
+
+def _agent1_job(history_snapshot: List[Dict[str, str]]) -> str:
+    # nutzt deine bestehende agent1_next_question-Logik, aber ohne UI-Zugriff
+    msgs = [{"role": "system", "content": AGENT1_SYSTEM}]
+    used = st.session_state.get("used_openers", set())
+    if used:
+        avoid = "Avoid these phrasings this session: " + "; ".join(list(used))[:600]
+        msgs.append({"role": "system", "content": avoid})
+    short = history_snapshot[-6:] if len(history_snapshot) > 6 else history_snapshot
+    msgs += short
+    resp = call_with_retry(client().chat.completions.create, model=MODEL, messages=msgs)
+    q = (resp.choices[0].message.content or "").strip()
+    if "\n" in q:
+        q = q.split("\n")[0].strip()
+    if not q.endswith("?"):
+        q = q.rstrip(".! ") + "?"
+    return q
+
+# ---------- (3) Poller für Agent-1-Jobs
+def poll_agent1():
+    # fertige Futures einsammeln
+    done_ids = []
+    for jid, fut in list(st.session_state.agent1_jobs.items()):
+        if fut.done():
+            done_ids.append(jid)
+            try:
+                q = fut.result()
+            except Exception:
+                q = "Got it — I’ll assemble your 4-point card now?"
+            # opener-Duplikatvermeidung wie gehabt
+            if "\n" in q:
+                q = q.split("\n")[0].strip()
+            if not q.endswith("?"):
+                q = q.rstrip(".! ") + "?"
+            st.session_state.setdefault("used_openers", set()).add(q.lower()[:72])
+            # Agent-1-Nachricht JETZT zur History hinzufügen
+            st.session_state.history.append({"role": "assistant", "content": q})
+            # optional: Handoff erkennung
+            low = q.lower()
+            if any(phrase in low for phrase in HANDOFF_PHRASES):
+                st.session_state.final_text = agent3_finalize(st.session_state.history, st.session_state.slots)
+    for jid in done_ids:
+        del st.session_state.agent1_jobs[jid]
+    # Tippindikator aus, wenn keine Jobs mehr offen
+    st.session_state.agent1_typing = len(st.session_state.agent1_jobs) > 0
 
 # ---------- Agent 2 (Extractor ONLY; keine Tools)
 AGENT2_SYSTEM = """You are Agent 2.
@@ -612,6 +674,20 @@ class Orchestrator:
             del self.jobs[jid]
         return updated
 
+# ---------- Followup-Helper (zusätzlicher Patch)
+def register_followup(item_key):
+    followup_count = st.session_state.get("followup_count", {})
+    followup_count[item_key] = followup_count.get(item_key, 0) + 1
+    st.session_state.followup_count = followup_count
+
+    # Zusatz-Absicherung: wenn wir schon 3 Items "done" haben,
+    # und das aktuelle (4.) Item hat >=2 Followups,
+    # dann Gespräch stoppen
+    done_keys = st.session_state.flow.get("done_keys", [])
+    if len(done_keys) == 3 and followup_count.get(item_key, 0) >= 2:
+        st.session_state.stop_signal = True
+        debug_emit({"ev":"stop_signal_auto","item":item_key}, None)
+
 # ---------- Render
 def render_slots_summary():
     slots = st.session_state.slots
@@ -674,6 +750,13 @@ if not st.session_state.history:
 
 # Poll Agent 2 async jobs (silent; kein Debug/Toast)
 orch.poll()
+# (5) Agent-1 Ergebnisse einsammeln
+poll_agent1()
+
+# Tippindikator (kein echter Chat-Post, nur visuelle Hilfe)
+if st.session_state.agent1_typing:
+    with st.chat_message("assistant"):
+        st.caption("Agent 1 is typing…")
 
 # UI
 render_slots_summary()
@@ -684,30 +767,24 @@ if st.session_state.final_text:
     st.subheader("Your Expert Card")
     render_final_card(st.session_state.final_text, st.session_state.slots)
 
-# Input handling
+# ---------- Input handling
 user_text = st.chat_input("Your turn…")
 if user_text:
+    # 1) User Nachricht zeigen
     st.session_state.history.append({"role": "user", "content": user_text})
 
-    # Let Agent 2 watch last Q/A for public items
+    # 2) Agent 2 anwerfen (asynchron)
     last_q = ""
     for m in reversed(st.session_state.history[:-1]):
         if m["role"] == "assistant":
             last_q = m["content"]
             break
-
-    # Agent 2: extract → google image → vision
     orch.schedule_watch(last_q, user_text)
 
-    # Agent 1: next question (respektiert stop_signal -> Handoff)
-    nxt = agent1_next_question(st.session_state.history)
-    st.session_state.history.append({"role": "assistant", "content": nxt})
+    # 3) Agent 1 asynchron starten (statt synchroner Blocker)
+    schedule_agent1_question(st.session_state.history)
 
-    # Finalize ONLY when Agent 1 explicitly signals (Stop-Signal wählt Handoff-Phrase)
-    low = nxt.lower()
-    if any(phrase in low for phrase in HANDOFF_PHRASES):
-        st.session_state.final_text = agent3_finalize(st.session_state.history, st.session_state.slots)
-
+    # 4) Sofort rerendern (UI wirkt snappy)
     st.rerun()
 
 # Actions
