@@ -9,6 +9,7 @@
 # - Finale Darstellung & Person-Policy bleiben wie zuvor implementiert.
 # - Agent 1 asynchron (Jobs + "typing" Flag) — UI reagiert sofort.
 # - Followup-Helper (register_followup) ergänzt.
+# - FIX: Auto-Refresh solange Jobs laufen + Agent-1-Worker nutzt State-Snapshots (keine direkten Session-Zugriffe).
 
 import os, json, time, uuid, random, traceback, requests, re
 from typing import List, Dict, Any, Optional, Callable
@@ -260,7 +261,6 @@ Don’t reveal internal agents/tools. Keep it professional. Mirror language swit
 def agent1_next_question(history: List[Dict[str, str]]) -> str:
     # Wenn Stop-Signal gesetzt: direkt Handoff-Phrase ausgeben
     if st.session_state.get("stop_signal"):
-        # Wähle eine der Phrasen aus HANDOFF_PHRASES (erste englische)
         return "Got it — I’ll assemble your 4-point card now."
     msgs = [{"role": "system", "content": AGENT1_SYSTEM}]
     if st.session_state.get("used_openers"):
@@ -280,19 +280,21 @@ def agent1_next_question(history: List[Dict[str, str]]) -> str:
 # ---------- (2) Asynchronen Agent-1 Job anlegen
 def schedule_agent1_question(history_snapshot: List[Dict[str, str]]):
     jid = str(uuid.uuid4())[:8]
-    # wichtig: snapshot kopieren, damit spätere Mutationen den Prompt nicht verändern
-    hist = list(history_snapshot)
-    fut = st.session_state.executor.submit(_agent1_job, hist)
+    hist = list(history_snapshot)  # Snapshot
+    used = list(st.session_state.get("used_openers", set()))  # Snapshot
+    stop = bool(st.session_state.get("stop_signal", False))   # Snapshot
+    fut = st.session_state.executor.submit(_agent1_job, hist, used, stop)
     st.session_state.agent1_jobs[jid] = fut
     st.session_state.agent1_typing = True  # „tippt…“ anzeigen
     return jid
 
-def _agent1_job(history_snapshot: List[Dict[str, str]]) -> str:
-    # nutzt deine bestehende agent1_next_question-Logik, aber ohne UI-Zugriff
+def _agent1_job(history_snapshot: List[Dict[str, str]], used_openers_snapshot: List[str], stop_signal_snapshot: bool) -> str:
+    # Kein Zugriff auf st.session_state hier!
+    if stop_signal_snapshot:
+        return "Got it — I’ll assemble your 4-point card now."
     msgs = [{"role": "system", "content": AGENT1_SYSTEM}]
-    used = st.session_state.get("used_openers", set())
-    if used:
-        avoid = "Avoid these phrasings this session: " + "; ".join(list(used))[:600]
+    if used_openers_snapshot:
+        avoid = "Avoid these phrasings this session: " + "; ".join(list(used_openers_snapshot))[:600]
         msgs.append({"role": "system", "content": avoid})
     short = history_snapshot[-6:] if len(history_snapshot) > 6 else history_snapshot
     msgs += short
@@ -306,7 +308,6 @@ def _agent1_job(history_snapshot: List[Dict[str, str]]) -> str:
 
 # ---------- (3) Poller für Agent-1-Jobs
 def poll_agent1():
-    # fertige Futures einsammeln
     done_ids = []
     for jid, fut in list(st.session_state.agent1_jobs.items()):
         if fut.done():
@@ -315,21 +316,17 @@ def poll_agent1():
                 q = fut.result()
             except Exception:
                 q = "Got it — I’ll assemble your 4-point card now?"
-            # opener-Duplikatvermeidung wie gehabt
             if "\n" in q:
                 q = q.split("\n")[0].strip()
             if not q.endswith("?"):
                 q = q.rstrip(".! ") + "?"
             st.session_state.setdefault("used_openers", set()).add(q.lower()[:72])
-            # Agent-1-Nachricht JETZT zur History hinzufügen
             st.session_state.history.append({"role": "assistant", "content": q})
-            # optional: Handoff erkennung
             low = q.lower()
             if any(phrase in low for phrase in HANDOFF_PHRASES):
                 st.session_state.final_text = agent3_finalize(st.session_state.history, st.session_state.slots)
     for jid in done_ids:
         del st.session_state.agent1_jobs[jid]
-    # Tippindikator aus, wenn keine Jobs mehr offen
     st.session_state.agent1_typing = len(st.session_state.agent1_jobs) > 0
 
 # ---------- Agent 2 (Extractor ONLY; keine Tools)
@@ -680,9 +677,6 @@ def register_followup(item_key):
     followup_count[item_key] = followup_count.get(item_key, 0) + 1
     st.session_state.followup_count = followup_count
 
-    # Zusatz-Absicherung: wenn wir schon 3 Items "done" haben,
-    # und das aktuelle (4.) Item hat >=2 Followups,
-    # dann Gespräch stoppen
     done_keys = st.session_state.flow.get("done_keys", [])
     if len(done_keys) == 3 and followup_count.get(item_key, 0) >= 2:
         st.session_state.stop_signal = True
@@ -803,3 +797,17 @@ with c2:
         for k in list(st.session_state.keys()):
             del st.session_state[k]
         st.rerun()
+
+# ---------- Auto-Refresh, solange Jobs laufen (damit Antworten ohne weiteren Input erscheinen)
+def _has_pending_jobs() -> bool:
+    # Agent 1
+    if any(not fut.done() for fut in st.session_state.agent1_jobs.values()):
+        return True
+    # Agent 2
+    if any(not fut.done() for _, fut in st.session_state.jobs.values()):
+        return True
+    return False
+
+if _has_pending_jobs():
+    time.sleep(0.25)  # kurzer Tick, blockiert minimal
+    st.rerun()
