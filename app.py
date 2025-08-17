@@ -725,15 +725,62 @@ def render_final_card(final_text: str, slots: Dict[str, Dict[str, Any]]):
         with col_img:
             if img:
                 st.markdown(
-                    f"""
+                    f'''
                     <div style="display:flex;justify-content:center;">
-                      <img src="{img}" style="width:100%;max-width:280px;aspect-ratio:1/1;border-radius:9999px;object-fit:cover;border:1px solid rgba(0,0,0,0.05);" />
+                      <img src="{img}" alt="Expert Card item image"
+                           style="width:100%;max-width:320px;height:auto;
+                                  border-radius:12px;border:1px solid rgba(0,0,0,0.06);
+                                  object-fit:contain;" />
                     </div>
-                    """,
+                    ''',
                     unsafe_allow_html=True
                 )
             else:
                 st.caption("(no image)")
+
+def build_export_html(final_text: str, slots: Dict[str, Dict[str, Any]]) -> str:
+    lines = parse_final_lines(final_text)
+    # gather 4 items in S1..S4 order
+    items = []
+    for idx, sid in enumerate(["S1","S2","S3","S4"]):
+        if idx >= len(lines): break
+        s = slots.get(sid, {})
+        label = (s.get("label","") or "").split("—")[-1].strip() or f"Item {idx+1}"
+        body  = lines[idx]
+        img   = (s.get("media",{}).get("best_image_url") or "").strip()
+        items.append({"title": label, "body": body, "img": img})
+
+    # inline CSS (very light; BuddyBoss/WordPress friendly)
+    html = f"""<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8"/>
+  <title>Expert Card</title>
+</head>
+<body style="margin:0;padding:24px;background:#ffffff;color:#111111;font-family:-apple-system,BlinkMacSystemFont,Segoe UI,Roboto,Helvetica,Arial,sans-serif;line-height:1.5;">
+  <div style="max-width:900px;margin:0 auto;">
+    <h1 style="margin:0 0 16px 0;font-size:28px;">Expert Card</h1>
+    <div style="font-size:14px;color:#555;margin:0 0 24px 0;">Generated from interview notes.</div>
+
+    {"".join([
+      f'''
+      <section style="display:flex;gap:20px;align-items:flex-start;justify-content:space-between;margin:0 0 28px 0;flex-wrap:wrap;">
+        <div style="flex: 1 1 56%;min-width:260px;">
+          <h2 style="margin:0 0 8px 0;font-size:20px;">{item["title"]}</h2>
+          <p style="margin:0;font-size:16px;">{item["body"]}</p>
+        </div>
+        <div style="flex: 1 1 38%;min-width:220px;display:flex;justify-content:center;">
+          { (f'<img src="{item["img"]}" alt="{item["title"]}" style="max-width:100%;height:auto;border-radius:12px;border:1px solid rgba(0,0,0,0.06);object-fit:contain;" />') if item["img"] else '<div style="color:#999;font-size:13px;">(no image)</div>' }
+        </div>
+      </section>
+      '''
+      for item in items
+    ])}
+  </div>
+</body>
+</html>"""
+    return html
+
 
 # ---------- Main
 st.set_page_config(page_title=APP_TITLE, page_icon="🟡", layout="wide")
@@ -761,6 +808,15 @@ render_history()
 if st.session_state.final_text:
     st.subheader("Your Expert Card")
     render_final_card(st.session_state.final_text, st.session_state.slots)
+
+    export_html = build_export_html(st.session_state.final_text, st.session_state.slots)
+    st.download_button(
+        "⬇️ Export HTML",
+        data=export_html.encode("utf-8"),
+        file_name="expert-card.html",
+        mime="text/html"
+    )
+
 
 # Input handling
 user_text = st.chat_input("Your turn…")
