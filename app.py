@@ -274,7 +274,8 @@ def agent1_next_question(history: List[Dict[str, str]]) -> str:
 
 # -------- NEW: Agent 1 — Streaming helper --------
 def agent1_stream_question(history_snapshot: List[Dict[str, str]]) -> str:
-    """Streamt Agent-1-Frage live ins UI und gibt den finalen Text zurück."""
+    """Versucht Streaming. Wenn die Orga kein Streaming darf (400 unsupported_value),
+    fällt automatisch auf Non-Streaming zurück und zeigt die Antwort normal an."""
     # Stop-Signal respektieren
     if st.session_state.get("stop_signal"):
         final = "Got it — I’ll assemble your 4-point card now."
@@ -292,37 +293,61 @@ def agent1_stream_question(history_snapshot: List[Dict[str, str]]) -> str:
     short = history_snapshot[-6:] if len(history_snapshot) > 6 else history_snapshot
     msgs += short
 
-    stream = client().chat.completions.create(model=MODEL, messages=msgs, stream=True)
+    # --- Versuch: echtes Streaming
+    try:
+        stream = client().chat.completions.create(model=MODEL, messages=msgs, stream=True)
 
-    full = []
-    def token_gen():
-        for chunk in stream:
-            # OpenAI stream: try choices[0].delta.content; fallback for other shapes
-            try:
-                piece = chunk.choices[0].delta.get("content") if hasattr(chunk.choices[0], "delta") else None
-            except Exception:
-                piece = None
-            if not piece:
+        full = []
+        def token_gen():
+            for chunk in stream:
                 try:
-                    piece = chunk.choices[0].message.get("content")
+                    piece = chunk.choices[0].delta.get("content") if hasattr(chunk.choices[0], "delta") else None
                 except Exception:
                     piece = None
-            if piece:
-                full.append(piece)
-                yield piece
+                if not piece:
+                    try:
+                        piece = chunk.choices[0].message.get("content")
+                    except Exception:
+                        piece = None
+                if piece:
+                    full.append(piece)
+                    yield piece
 
-    with st.chat_message("assistant"):
-        st.write_stream(token_gen())
+        with st.chat_message("assistant"):
+            st.write_stream(token_gen())
 
-    text = "".join(full).strip()
+        text = "".join(full).strip()
+    except Exception as e:
+        # Fallback bei "organization must be verified to stream this model" o.ä.
+        # -> Non-Streaming Request und Ausgabe ohne Crash
+        try:
+            from openai import BadRequestError  # optional, falls verfügbar
+        except Exception:
+            BadRequestError = Exception
+        # Nur wenn es klar ein Stream-Policy-Problem ist: fallback
+        if isinstance(e, BadRequestError) or "must be verified to stream" in str(e).lower() or "unsupported_value" in str(e).lower():
+            resp = call_with_retry(client().chat.completions.create, model=MODEL, messages=msgs)
+            text = (resp.choices[0].message.content or "").strip()
+            with st.chat_message("assistant"):
+                st.markdown(text if text else "...")
+        else:
+            # Unbekannter Fehler -> rethrow, damit du ihn siehst
+            raise
+
+    # Post-Processing (Fragezeichen, opener tracking, Handoff)
     if text and not text.endswith("?"):
         text = text.rstrip(".! ") + "?"
-    # opener tracking + ggf. finalize trigger
     st.session_state.setdefault("used_openers", set()).add(text.lower()[:72])
+
     low = text.lower()
-    if any(phrase in low for phrase in HANDOFF_PHRASES):
-        st.session_state.final_text = agent3_finalize(st.session_state.history + [{"role":"assistant","content": text}], st.session_state.slots)
+    if any(phrase in low for phrase in HANDOFF_PHRASES]):
+        # finalisiere sofort (wie zuvor)
+        st.session_state.final_text = agent3_finalize(
+            st.session_state.history + [{"role": "assistant", "content": text}],
+            st.session_state.slots
+        )
     return text
+
 
 # ---------- Agent 2 (Extractor ONLY; keine Tools)
 AGENT2_SYSTEM = """You are Agent 2.
