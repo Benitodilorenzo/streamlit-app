@@ -194,6 +194,18 @@ def update_flow_with_detected(detected_key: Optional[str]):
     if len(done_keys) >= 4:
         st.session_state.stop_signal = True
 
+def summarize_slots_for_agent1(slots: Dict[str, Dict[str, Any]]) -> str:
+    """Return a short natural-language summary of which slots are already filled."""
+    lines = []
+    for sid, s in slots.items():
+        label = (s.get("label") or "").split("—")[-1].strip()
+        if label:
+            lines.append(label)
+    if not lines:
+        return "So far, no slots are filled."
+    return "So far, you already covered: " + ", ".join(lines) + "."
+
+
 # ---------- Agent 1 (Interview) — inkl. Profil-/Tiefe-Guard
 AGENT1_SYSTEM = """You are Agent 1 — a warm, incisive interviewer.
 
@@ -253,29 +265,34 @@ Don’t reveal internal agents/tools. Keep it professional. Mirror language swit
 4) Continue until 4 good items → give the handoff line.
 """
 
-def agent1_next_question(history: List[Dict[str, str]]) -> str:
-    # Wenn Stop-Signal gesetzt: direkt Handoff-Phrase ausgeben
-    if st.session_state.get("stop_signal"):
-        return "Got it — I’ll assemble your 4-point card now."
+def agent1_next_question(history_snapshot):
     msgs = [{"role": "system", "content": AGENT1_SYSTEM}]
-    if st.session_state.get("used_openers"):
-        avoid = "Avoid these phrasings this session: " + "; ".join(list(st.session_state.used_openers))[:600]
+
+    # NEW: add slot summary
+    slot_state = summarize_slots_for_agent1(st.session_state.slots)
+    msgs.append({"role": "system", "content": slot_state})
+
+    used = st.session_state.get("used_openers", set())
+    if used:
+        avoid = "Avoid these phrasings this session: " + "; ".join(list(used))[:600]
         msgs.append({"role": "system", "content": avoid})
-    short = history[-6:] if len(history) > 6 else history
+
+    short = history_snapshot[-6:] if len(history_snapshot) > 6 else history_snapshot
     msgs += short
-    resp = call_with_retry(client().chat.completions.create, model=MODEL, messages=msgs)
-    q = (resp.choices[0].message.content or "").strip()
-    if "\n" in q:
-        q = q.split("\n")[0].strip()
-    if not q.endswith("?"):
-        q = q.rstrip(".! ") + "?"
-    st.session_state.setdefault("used_openers", set()).add(q.lower()[:72])
-    return q
+
+    resp = client().chat.completions.create(model=MODEL, messages=msgs)
+    return resp.choices[0].message.content.strip()
+
 
 # -------- NEW: Agent 1 — Streaming helper --------
 def agent1_stream_question(history_snapshot: List[Dict[str, str]]) -> str:
-    """Versucht Streaming. Wenn die Orga kein Streaming darf (400 unsupported_value),
-    fällt automatisch auf Non-Streaming zurück und zeigt die Antwort normal an."""
+    """Streaming-fähige Version von Agent 1.
+    - Nutzt Slot-Summary
+    - Respektiert Stop-Signal
+    - Fällt bei 400-Fehler zurück auf Non-Streaming
+    - Fragt nur neue Items
+    """
+
     # Stop-Signal respektieren
     if st.session_state.get("stop_signal"):
         final = "Got it — I’ll assemble your 4-point card now."
@@ -286,10 +303,16 @@ def agent1_stream_question(history_snapshot: List[Dict[str, str]]) -> str:
         return final
 
     msgs = [{"role": "system", "content": AGENT1_SYSTEM}]
+
+    # NEW: add slot summary
+    slot_state = summarize_slots_for_agent1(st.session_state.slots)
+    msgs.append({"role": "system", "content": slot_state})
+
     used = st.session_state.get("used_openers", set())
     if used:
         avoid = "Avoid these phrasings this session: " + "; ".join(list(used))[:600]
         msgs.append({"role": "system", "content": avoid})
+
     short = history_snapshot[-6:] if len(history_snapshot) > 6 else history_snapshot
     msgs += short
 
@@ -320,7 +343,7 @@ def agent1_stream_question(history_snapshot: List[Dict[str, str]]) -> str:
     except Exception as e:
         # Fallback bei "organization must be verified to stream this model" o.ä.
         try:
-            from openai import BadRequestError  # optional, falls verfügbar
+            from openai import BadRequestError
         except Exception:
             BadRequestError = Exception
         if isinstance(e, BadRequestError) or "must be verified to stream" in str(e).lower() or "unsupported_value" in str(e).lower():
@@ -337,13 +360,13 @@ def agent1_stream_question(history_snapshot: List[Dict[str, str]]) -> str:
     st.session_state.setdefault("used_openers", set()).add(text.lower()[:72])
 
     low = text.lower()
-    if any(phrase in low for phrase in HANDOFF_PHRASES):  # ✅ korrigiert: ) statt ]
-        # finalisiere sofort (wie zuvor)
+    if any(phrase in low for phrase in HANDOFF_PHRASES):
         st.session_state.final_text = agent3_finalize(
             st.session_state.history + [{"role": "assistant", "content": text}],
             st.session_state.slots
         )
     return text
+
 
 
 
