@@ -1,14 +1,13 @@
 # app_expert_card_gpt5_3agents_clean.py
 # 3 Agents: Chat (Agent 1) · Search (Agent 2) · Finalize (Agent 3)
 # Änderungen in diesem Commit:
-# - Pivot-basierte Fertig-Logik (unverändert aus letzter Version)
+# - Pivot-basierte Fertig-Logik:
+#   * Ein Item wird erst 'done', wenn zu einem NEUEN Item gewechselt wird (Pivot).
+#   * Bei geplantem Pivot auf das 5. Item -> stop_signal=True; Agent 1 gibt Handoff-Phrase aus.
 # - Debug-Funktionen weiterhin vorhanden, aber deaktiviert (kein UI-Logging).
-# - Media Overrides entfernt.
-# - Person-Policy in Vision-Check.
-# - Agent 1 asynchron (Jobs + "typing" Flag) — UI reagiert sofort.
-# - Followup-Helper (register_followup) jetzt AUCH aufgerufen.
-# - **NEU:** Harte Stop-Bedingung: Sobald 4 Slots gefüllt sind, wird stop_signal gesetzt,
-#   VOR dem nächsten Agent-1-Start. Zusätzliches Gate in poll_agent1().
+# - Media Overrides weiterhin entfernt.
+# - Finale Darstellung & Person-Policy bleiben wie zuvor implementiert.
+# - **NEU:** Agent 1 Antwort wird **gestreamt** (stream=True) und live angezeigt.
 
 import os, json, time, uuid, random, traceback, requests, re
 from typing import List, Dict, Any, Optional, Callable
@@ -39,12 +38,14 @@ MAX_SEARCHES_PER_RUN = 1
 OPENAI_MAX_RETRIES = 3
 OPENAI_BACKOFF_BASE = 1.8
 
-# ---- Finalize trigger phrases
+# ---- Finalize trigger phrases (nur bei diesen Phrasen wird Agent 3 gerufen)
 HANDOFF_PHRASES = [
+    # Englisch
     "i’ll assemble your 4-point card now",
     "i'll assemble your 4-point card now",
     "we have 4 aspects we can turn into a profile",
     "we have four aspects we can turn into a profile",
+    # Deutsch
     "wir haben nun 4 aspekte",
     "wir haben jetzt 4 aspekte",
     "wir haben vier aspekte",
@@ -92,15 +93,15 @@ def init_state():
     st.session_state.setdefault("seen_entities", [])
     st.session_state.setdefault("final_text", "")
     st.session_state.setdefault("used_openers", set())
-    st.session_state.setdefault("auto_finalized", False)
-    st.session_state.setdefault("cooldown_entities", {})
+    st.session_state.setdefault("auto_finalized", False)  # bleibt ungenutzt (kein Auto-Finalize)
+    st.session_state.setdefault("cooldown_entities", {})  # anti-loop cooldown
+    # Flow-Tracking für Pivot-basierte Done-Logik
     st.session_state.setdefault("flow", {
-        "current_item_key": None,
-        "done_keys": []
+        "current_item_key": None,   # z.B. "podcast|machine learning street talk"
+        "done_keys": []             # Liste in Reihenfolge der Fertigstellung
     })
     st.session_state.setdefault("stop_signal", False)
-    st.session_state.setdefault("agent1_jobs", {})
-    st.session_state.setdefault("agent1_typing", False)
+    # Followup-Count (Auto-Stop auf Item 4 nach 2 Vertiefungen)
     st.session_state.setdefault("followup_count", {})
 
 # ---------- Debug helpers (deaktiviert)
@@ -110,12 +111,14 @@ def debug_emit(event: Dict[str, Any], buffer: Optional[list] = None):
     e = dict(event)
     e["ts"] = time.strftime("%H:%M:%S")
     if buffer is not None:
-        buffer.append(e); return
+        buffer.append(e)
+        return
     if "debug_agent2" not in st.session_state:
         st.session_state["debug_agent2"] = []
     st.session_state.debug_agent2.append(e)
-    if len(st.session_state.debug_agent2) > 80:
-        st.session_state.debug_agent2 = st.session_state.debug_agent2[-80:]
+    limit = 80
+    if len(st.session_state.debug_agent2) > limit:
+        st.session_state.debug_agent2 = st.session_state.debug_agent2[-limit:]
 
 def debug_log_agent2(event: Dict[str, Any]):
     debug_emit(event, buffer=None)
@@ -166,30 +169,32 @@ def next_free_slot() -> Optional[str]:
 def normalize_key(etype: str, ename: str) -> str:
     return f"{(etype or '').lower().strip()}|{(ename or '').lower().strip()}"
 
-def filled_slots_count() -> int:
-    return sum(1 for s in st.session_state.slots.values() if (s.get("label") or "").strip())
-
 def update_flow_with_detected(detected_key: Optional[str]):
+    """Pivot-Logik: Wenn detected_key != current -> markiere current als done und setze current=detected_key.
+       Setze stop_signal, wenn 4 Items abgeschlossen wären (bevor ein 5. begonnen wird)."""
     if not detected_key:
         return
     flow = st.session_state.flow
     current = flow.get("current_item_key")
     done_keys: List[str] = flow.get("done_keys", [])
+    # Kein Wechsel
     if current is None:
         flow["current_item_key"] = detected_key
         st.session_state.flow = flow
         return
     if detected_key == current:
         return
+    # Pivot: current wird abgeschlossen
     if current not in done_keys:
         done_keys.append(current)
     flow["done_keys"] = done_keys
     flow["current_item_key"] = detected_key
     st.session_state.flow = flow
+    # Stop-Signal setzen, wenn mit diesem Pivot bereits 4 abgeschlossen wären
     if len(done_keys) >= 4:
         st.session_state.stop_signal = True
 
-# ---------- Agent 1
+# ---------- Agent 1 (Interview) — inkl. Profil-/Tiefe-Guard
 AGENT1_SYSTEM = """You are Agent 1 — a warm, incisive interviewer.
 
 ## Identity & Scope
@@ -249,6 +254,7 @@ Don’t reveal internal agents/tools. Keep it professional. Mirror language swit
 """
 
 def agent1_next_question(history: List[Dict[str, str]]) -> str:
+    # Wenn Stop-Signal gesetzt: direkt Handoff-Phrase ausgeben
     if st.session_state.get("stop_signal"):
         return "Got it — I’ll assemble your 4-point card now."
     msgs = [{"role": "system", "content": AGENT1_SYSTEM}]
@@ -266,60 +272,59 @@ def agent1_next_question(history: List[Dict[str, str]]) -> str:
     st.session_state.setdefault("used_openers", set()).add(q.lower()[:72])
     return q
 
-# ---------- Agent-1 Async
-def schedule_agent1_question(history_snapshot: List[Dict[str, str]]):
-    jid = str(uuid.uuid4())[:8]
-    hist = list(history_snapshot)
-    used = list(st.session_state.get("used_openers", set()))
-    stop = bool(st.session_state.get("stop_signal", False))
-    fut = st.session_state.executor.submit(_agent1_job, hist, used, stop)
-    st.session_state.agent1_jobs[jid] = fut
-    st.session_state.agent1_typing = True
-    return jid
+# -------- NEW: Agent 1 — Streaming helper --------
+def agent1_stream_question(history_snapshot: List[Dict[str, str]]) -> str:
+    """Streamt Agent-1-Frage live ins UI und gibt den finalen Text zurück."""
+    # Stop-Signal respektieren
+    if st.session_state.get("stop_signal"):
+        final = "Got it — I’ll assemble your 4-point card now."
+        def gen():
+            yield final
+        with st.chat_message("assistant"):
+            st.write_stream(gen())
+        return final
 
-def _agent1_job(history_snapshot: List[Dict[str, str]], used_openers_snapshot: List[str], stop_signal_snapshot: bool) -> str:
-    if stop_signal_snapshot:
-        return "Got it — I’ll assemble your 4-point card now."
     msgs = [{"role": "system", "content": AGENT1_SYSTEM}]
-    if used_openers_snapshot:
-        avoid = "Avoid these phrasings this session: " + "; ".join(list(used_openers_snapshot))[:600]
+    used = st.session_state.get("used_openers", set())
+    if used:
+        avoid = "Avoid these phrasings this session: " + "; ".join(list(used))[:600]
         msgs.append({"role": "system", "content": avoid})
     short = history_snapshot[-6:] if len(history_snapshot) > 6 else history_snapshot
     msgs += short
-    resp = call_with_retry(client().chat.completions.create, model=MODEL, messages=msgs)
-    q = (resp.choices[0].message.content or "").strip()
-    if "\n" in q:
-        q = q.split("\n")[0].strip()
-    if not q.endswith("?"):
-        q = q.rstrip(".! ") + "?"
-    return q
 
-def poll_agent1():
-    done_ids = []
-    for jid, fut in list(st.session_state.agent1_jobs.items()):
-        if fut.done():
-            done_ids.append(jid)
+    stream = client().chat.completions.create(model=MODEL, messages=msgs, stream=True)
+
+    full = []
+    def token_gen():
+        for chunk in stream:
+            # OpenAI stream: try choices[0].delta.content; fallback for other shapes
             try:
-                q = fut.result()
+                piece = chunk.choices[0].delta.get("content") if hasattr(chunk.choices[0], "delta") else None
             except Exception:
-                q = "Got it — I’ll assemble your 4-point card now?"
-            # **Gate:** wenn 4/4 Slots gefüllt, zwinge Handoff
-            if filled_slots_count() >= 4 and not any(phrase in q.lower() for phrase in HANDOFF_PHRASES):
-                q = "Got it — I’ll assemble your 4-point card now?"
-            if "\n" in q:
-                q = q.split("\n")[0].strip()
-            if not q.endswith("?"):
-                q = q.rstrip(".! ") + "?"
-            st.session_state.setdefault("used_openers", set()).add(q.lower()[:72])
-            st.session_state.history.append({"role": "assistant", "content": q})
-            low = q.lower()
-            if any(phrase in low for phrase in HANDOFF_PHRASES):
-                st.session_state.final_text = agent3_finalize(st.session_state.history, st.session_state.slots)
-    for jid in done_ids:
-        del st.session_state.agent1_jobs[jid]
-    st.session_state.agent1_typing = len(st.session_state.agent1_jobs) > 0
+                piece = None
+            if not piece:
+                try:
+                    piece = chunk.choices[0].message.get("content")
+                except Exception:
+                    piece = None
+            if piece:
+                full.append(piece)
+                yield piece
 
-# ---------- Agent 2
+    with st.chat_message("assistant"):
+        st.write_stream(token_gen())
+
+    text = "".join(full).strip()
+    if text and not text.endswith("?"):
+        text = text.rstrip(".! ") + "?"
+    # opener tracking + ggf. finalize trigger
+    st.session_state.setdefault("used_openers", set()).add(text.lower()[:72])
+    low = text.lower()
+    if any(phrase in low for phrase in HANDOFF_PHRASES):
+        st.session_state.final_text = agent3_finalize(st.session_state.history + [{"role":"assistant","content": text}], st.session_state.slots)
+    return text
+
+# ---------- Agent 2 (Extractor ONLY; keine Tools)
 AGENT2_SYSTEM = """You are Agent 2.
 
 Task:
@@ -410,7 +415,7 @@ def google_image_search(query: str, num: int = 4, dbg: Optional[list] = None) ->
         debug_emit({"ev":"cse_error", "query": query, "error": str(e)}, dbg)
         return []
 
-# ---------- Vision (Person-safe)
+# ---------- Vision: Validate image vs. context (person-safe branch)
 def validate_image_with_context(image_url: str, entity_type: str, entity_name: str, q_text: str, a_text: str, dbg: Optional[list] = None) -> Dict[str, Any]:
     if (entity_type or "").lower().strip() == "person":
         sys = (
@@ -462,7 +467,7 @@ def validate_image_with_context(image_url: str, entity_type: str, entity_name: s
     except Exception:
         return {"ok": False, "reason": "unverifiable"}
 
-# ---------- Agent 3 (Finalizer)
+# ---------- Agent 3 (Finalizer) — etwas ausführlicher
 FINALIZER_SYSTEM = """You are Agent 3 — Finalizer.
 Create an Expert Card with exactly 4 items from:
 - The conversation (assistant questions + user answers).
@@ -533,7 +538,7 @@ class Orchestrator:
         debug_emit({"ev":"job_scheduled", "jid": jid})
 
     def _job(self, last_q: str, reply: str, seen_snapshot: List[str]) -> Dict[str, Any]:
-        dbg = []
+        dbg = []  # lokaler Buffer (Worker) — bleibt ungenutzt, da DEBUG off
         first_key_detected: Optional[str] = None
         try:
             data = agent2_extract_items(last_q, reply, seen_snapshot, dbg=dbg)
@@ -545,8 +550,10 @@ class Orchestrator:
             debug_emit({"ev":"job_items", "count": len(items)}, dbg)
             processed = 0
             results: List[Dict[str, Any]] = []
+
             now = time.time()
 
+            # Merke die erste erkannte Item-Key für Flow/Pivot (auch wenn später kein Bild validiert)
             if items:
                 etype0 = (items[0].get("entity_type") or "").lower().strip()
                 ename0 = (items[0].get("entity_name") or "").strip()
@@ -587,7 +594,8 @@ class Orchestrator:
                     tries += 1
                     v = validate_image_with_context(cand["url"], etype, ename, last_q, reply, dbg=dbg)
                     if v.get("ok"):
-                        ok_url = cand["url"]; note = v.get("reason", "")
+                        ok_url = cand["url"]
+                        note = v.get("reason", "")
                         debug_emit({"ev":"item_validate_ok", "key": key, "tries": tries}, dbg)
                         break
                     else:
@@ -635,10 +643,12 @@ class Orchestrator:
                     debug_emit({"ev":"poll_exception", "error": str(e)})
                     continue
 
+                # 1) Flow-Update anhand der ersten erkannten Item-Key (Pivot-Erkennung)
                 first_key = res.get("first_key_detected")
                 if first_key:
                     update_flow_with_detected(first_key)
 
+                # 2) Slots updaten, Seen markieren
                 if res.get("status") == "batch":
                     for it in res.get("items", []):
                         if it.get("status") == "ok":
@@ -651,24 +661,15 @@ class Orchestrator:
                                 updated.append(sid)
                             else:
                                 debug_emit({"ev":"slots_full"})
+                # skip/err werden still gehandhabt
         for jid in rm:
             del self.jobs[jid]
         return updated
 
-# ---------- Followup-Helper
-def register_followup(item_key):
-    followup_count = st.session_state.get("followup_count", {})
-    followup_count[item_key] = followup_count.get(item_key, 0) + 1
-    st.session_state.followup_count = followup_count
-
-    done_keys = st.session_state.flow.get("done_keys", [])
-    if len(done_keys) == 3 and followup_count.get(item_key, 0) >= 2:
-        st.session_state.stop_signal = True
-        debug_emit({"ev":"stop_signal_auto","item":item_key}, None)
-
 # ---------- Render
 def render_slots_summary():
-    filled = filled_slots_count()
+    slots = st.session_state.slots
+    filled = len([s for s in slots.values() if (s.get("label") or "").strip()])
     st.progress(min(1.0, filled / 4), text=f"Progress: {filled}/4")
 
 def render_history():
@@ -721,55 +722,45 @@ orch = Orchestrator()
 
 # First opener from Agent 1
 if not st.session_state.history:
-    opener = agent1_next_question([])
+    # stream den ersten Opener
+    opener = agent1_stream_question([])
     st.session_state.history.append({"role": "assistant", "content": opener})
     st.rerun()
 
-# Poll Agent 2 + Agent 1
+# Poll Agent 2 async jobs (silent; kein Debug/Toast)
 orch.poll()
-poll_agent1()
-
-# Tippindikator
-if st.session_state.agent1_typing:
-    with st.chat_message("assistant"):
-        st.caption("Agent 1 is typing…")
 
 # UI
 render_slots_summary()
 render_history()
 
-# Final card
+# FINAL CARD (if present)
 if st.session_state.final_text:
     st.subheader("Your Expert Card")
     render_final_card(st.session_state.final_text, st.session_state.slots)
 
-# ---------- Input handling
+# Input handling
 user_text = st.chat_input("Your turn…")
 if user_text:
-    # 1) User Nachricht zeigen
     st.session_state.history.append({"role": "user", "content": user_text})
 
-    # 1a) Follow-up zum aktuellen Item registrieren (falls vorhanden)
-    current_key = st.session_state.flow.get("current_item_key")
-    if current_key:
-        register_followup(current_key)
-
-    # 1b) **Harter Gate:** Wenn 4 Slots bereits gefüllt -> sofort Stop-Signal setzen,
-    #     bevor ein neuer Agent-1-Job geplant wird.
-    if filled_slots_count() >= 4:
-        st.session_state.stop_signal = True
-
-    # 2) Agent 2 anwerfen (asynchron)
+    # Agent 2 beobachten lassen (asynchron)
     last_q = ""
     for m in reversed(st.session_state.history[:-1]):
         if m["role"] == "assistant":
-            last_q = m["content"]; break
+            last_q = m["content"]
+            break
     orch.schedule_watch(last_q, user_text)
 
-    # 3) Agent 1 asynchron starten (nimmt das aktuelle stop_signal als Snapshot mit)
-    schedule_agent1_question(st.session_state.history)
+    # Agent 1 — **Streaming** der nächsten Frage
+    nxt = agent1_stream_question(st.session_state.history)
+    st.session_state.history.append({"role": "assistant", "content": nxt})
 
-    # 4) Sofort rerendern
+    # Finalize ONLY when Agent 1 explizit signalisiert (Handoff-Phrase)
+    low = nxt.lower()
+    if any(phrase in low for phrase in HANDOFF_PHRASES):
+        st.session_state.final_text = agent3_finalize(st.session_state.history, st.session_state.slots)
+
     st.rerun()
 
 # Actions
@@ -788,15 +779,3 @@ with c2:
         for k in list(st.session_state.keys()):
             del st.session_state[k]
         st.rerun()
-
-# ---------- Auto-Refresh, solange Jobs laufen
-def _has_pending_jobs() -> bool:
-    if any(not fut.done() for fut in st.session_state.agent1_jobs.values()):
-        return True
-    if any(not fut.done() for _, fut in st.session_state.jobs.values()):
-        return True
-    return False
-
-if _has_pending_jobs():
-    time.sleep(0.25)
-    st.rerun()
