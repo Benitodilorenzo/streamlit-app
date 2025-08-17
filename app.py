@@ -50,7 +50,7 @@ HANDOFF_PHRASES = [
     "wir haben jetzt 4 aspekte",
     "wir haben vier aspekte",
     "ich stelle jetzt deinen steckbrief zusammen",
-    "ich assemble jetzt deinen 4-punkte-steckbrief",
+    "ich erstelle jetzt deinen 4-punkte-steckbrief",
 ]
 
 # ---------- OpenAI client
@@ -251,7 +251,7 @@ Avoid repeating your own earlier phrasing within this session.
 
 ## Stop Condition (Handoff)
 When you judge 4 strong slots are covered, say a short line like:
-“Got it — I’ll assemble your 4-point card now.” or "we have four aspects we can turn into a profile"
+“Got it — I’ll assemble your 4-point card now.” or "we have four aspects we can turn into a profile" or "Alright - we have 4 aspects we can turn into a profile"
 Give the user a chance to answer on follow-up to your fourth and last item youre asking for.
 The system will route to Agent 3.
 
@@ -262,7 +262,7 @@ Don’t reveal internal agents/tools. Keep it professional. Mirror language swit
 1) Read latest user message + light memory of prior slots.
 2) Decide one move (micro-clarify, deepen, pivot, close-and-move).
 3) Ask one focused question (optionally with a brief synthesis).
-4) Continue until 4 good items → give the handoff line.
+4) Continue until 4 good items → give the handoff line. But wait for a follow-up response, in case you already gave an additional follow-up question to the user.
 """
 
 def agent1_next_question(history_snapshot):
