@@ -1,13 +1,10 @@
 # app_expert_card_gpt5_3agents_clean.py
 # 3 Agents: Chat (Agent 1) · Search (Agent 2) · Finalize (Agent 3)
 # Änderungen in diesem Commit:
-# - Pivot-basierte Fertig-Logik:
-#   * Ein Item wird erst 'done', wenn zu einem NEUEN Item gewechselt wird (Pivot).
-#   * Bei geplantem Pivot auf das 5. Item -> stop_signal=True; Agent 1 gibt Handoff-Phrase aus.
-# - Debug-Funktionen weiterhin vorhanden, aber deaktiviert (kein UI-Logging).
-# - Media Overrides weiterhin entfernt.
-# - Finale Darstellung & Person-Policy bleiben wie zuvor implementiert.
-# - **NEU:** Agent 1 Antwort wird **gestreamt** (stream=True) und live angezeigt.
+# - Pivot-basierte Fertig-Logik (Flow-Tracking + Hard-Stop nach 6 Items, dann Budget 2 Assistant-Turns, danach System-Signal).
+# - Agent-1: Streaming, Slot-Summary, SYSTEM_SIGNAL-Reaktion, eindeutige Handoff-Phrasen.
+# - **NEU:** Start-Gate (▶️ Start), NO model calls before user click.
+# - **NEU:** Moduswahl NACH Start (Professional vs. General/Lifescope), Mode-Badge in UI, modusabhängige Opener-Hints.
 
 import os, json, time, uuid, random, traceback, requests, re
 from typing import List, Dict, Any, Optional, Callable
@@ -40,17 +37,26 @@ OPENAI_BACKOFF_BASE = 1.8
 
 # ---- Finalize trigger phrases (nur bei diesen Phrasen wird Agent 3 gerufen)
 HANDOFF_PHRASES = [
-    # Englisch
+    # Englisch (bestehend)
     "i’ll assemble your 4-point card now",
     "i'll assemble your 4-point card now",
     "we have 4 aspects we can turn into a profile",
     "we have four aspects we can turn into a profile",
-    # Deutsch
+    # Deutsch (bestehend)
     "wir haben nun 4 aspekte",
     "wir haben jetzt 4 aspekte",
     "wir haben vier aspekte",
     "ich stelle jetzt deinen steckbrief zusammen",
     "ich erstelle jetzt deinen 4-punkte-steckbrief",
+    # Neue eindeutige Abschlussphrasen
+    "alright — i’ll now assemble your 4-point card",
+    "alright - i’ll now assemble your 4-point card",
+    "alright — i'll now assemble your 4-point card",
+    "alright - i'll now assemble your 4-point card",
+    "perfect — i’ll now assemble your selected 4-point card",
+    "perfect — i'll now assemble your selected 4-point card",
+    "great — i’ll now assemble your 4-point expert card with your chosen items",
+    "great — i'll now assemble your 4-point expert card with your chosen items",
 ]
 
 # ---------- OpenAI client
@@ -84,6 +90,9 @@ def call_with_retry(fn: Callable, *args, **kwargs):
 # ---------- Session state
 def init_state():
     st.session_state.setdefault("init", True)
+    st.session_state.setdefault("user_started", False)   # <- Start-Gate
+    st.session_state.setdefault("agent1_mode", "Professional")
+
     st.session_state.setdefault("history", [])
     st.session_state.setdefault("slots", {})
     st.session_state.setdefault("order", ["S1","S2","S3","S4"])
@@ -93,16 +102,20 @@ def init_state():
     st.session_state.setdefault("seen_entities", [])
     st.session_state.setdefault("final_text", "")
     st.session_state.setdefault("used_openers", set())
-    st.session_state.setdefault("auto_finalized", False)  # bleibt ungenutzt (kein Auto-Finalize)
-    st.session_state.setdefault("cooldown_entities", {})  # anti-loop cooldown
-    # Flow-Tracking für Pivot-basierte Done-Logik
+    st.session_state.setdefault("auto_finalized", False)
+    st.session_state.setdefault("cooldown_entities", {})
+
+    # Flow-Tracking (Pivot-basiert)
     st.session_state.setdefault("flow", {
-        "current_item_key": None,   # z.B. "podcast|machine learning street talk"
-        "done_keys": []             # Liste in Reihenfolge der Fertigstellung
+        "current_item_key": None,
+        "done_keys": []
     })
-    st.session_state.setdefault("stop_signal", False)
-    # Followup-Count (Auto-Stop auf Item 4 nach 2 Vertiefungen)
+    st.session_state.setdefault("stop_signal", False)      # injiziert System-Signal an Agent 1
     st.session_state.setdefault("followup_count", {})
+    # Hard-Stop-Planung nach 6 Items (mit Budget)
+    st.session_state.setdefault("hard_stop_pending", False)
+    st.session_state.setdefault("hard_stop_budget", 0)
+    st.session_state.setdefault("hard_stop_signaled", False)
 
 # ---------- Debug helpers (deaktiviert)
 def debug_emit(event: Dict[str, Any], buffer: Optional[list] = None):
@@ -169,33 +182,48 @@ def next_free_slot() -> Optional[str]:
 def normalize_key(etype: str, ename: str) -> str:
     return f"{(etype or '').lower().strip()}|{(ename or '').lower().strip()}"
 
+def _count_items_from_flow() -> int:
+    flow = st.session_state.flow
+    done_keys: List[str] = flow.get("done_keys", [])
+    current = flow.get("current_item_key")
+    return len(done_keys) + (1 if current else 0)
+
 def update_flow_with_detected(detected_key: Optional[str]):
     """Pivot-Logik: Wenn detected_key != current -> markiere current als done und setze current=detected_key.
-       Setze stop_signal, wenn 4 Items abgeschlossen wären (bevor ein 5. begonnen wird)."""
+       Ab 6 Items: Hard-Stop-Planung (Budget 2 Assistant-Antworten)."""
     if not detected_key:
         return
     flow = st.session_state.flow
     current = flow.get("current_item_key")
     done_keys: List[str] = flow.get("done_keys", [])
-    # Kein Wechsel
+
     if current is None:
         flow["current_item_key"] = detected_key
         st.session_state.flow = flow
+        n = _count_items_from_flow()
+        if n >= 6 and not st.session_state.get("hard_stop_pending"):
+            st.session_state.hard_stop_pending = True
+            st.session_state.hard_stop_budget = 2
+            st.session_state.hard_stop_signaled = False
         return
+
     if detected_key == current:
         return
-    # Pivot: current wird abgeschlossen
+
+    # Pivot => current wird abgeschlossen
     if current not in done_keys:
         done_keys.append(current)
     flow["done_keys"] = done_keys
     flow["current_item_key"] = detected_key
     st.session_state.flow = flow
-    # Stop-Signal setzen, wenn mit diesem Pivot bereits 4 abgeschlossen wären
-    if len(done_keys) >= 4:
-        st.session_state.stop_signal = True
+
+    n = _count_items_from_flow()
+    if n >= 6 and not st.session_state.get("hard_stop_pending"):
+        st.session_state.hard_stop_pending = True
+        st.session_state.hard_stop_budget = 2
+        st.session_state.hard_stop_signaled = False
 
 def summarize_slots_for_agent1(slots: Dict[str, Dict[str, Any]]) -> str:
-    """Return a short natural-language summary of which slots are already filled."""
     lines = []
     for sid, s in slots.items():
         label = (s.get("label") or "").split("—")[-1].strip()
@@ -205,72 +233,159 @@ def summarize_slots_for_agent1(slots: Dict[str, Dict[str, Any]]) -> str:
         return "So far, no slots are filled."
     return "So far, you already covered: " + ", ".join(lines) + "."
 
+# Mode-abhängiger Opener-Hinweis (nur für den ersten Turn)
+def get_mode_opening_hint() -> str:
+    mode = st.session_state.get("agent1_mode", "Professional")
+    if "Professional" in mode:
+        return ("OPENING_HINT: Prefer an opener focused on work decisions, e.g., "
+                "“What’s one book, podcast, person, tool, or film that truly changed how you work — and how?”")
+    else:
+        return ("OPENING_HINT: Prefer an opener that includes life beyond work, e.g., "
+                "“Outside of work, what book/podcast/person/tool/film most changed how you think — and how?”")
 
-# ---------- Agent 1 (Interview) — inkl. Profil-/Tiefe-Guard
-AGENT1_SYSTEM = """You are Agent 1 — a warm, incisive interviewer.
+# System-Signal-Text für Hard-Stop
+HARD_STOP_SYSTEM_MSG = (
+    "SYSTEM_SIGNAL: hard-stop. You have reached the maximum range of items. "
+    "Acknowledge the user's last point in ≤1 sentence and then CLOSE now. "
+    "Emit exactly one clear handoff phrase to finalize (choose the best-fitting from these): "
+    "“Alright — I’ll now assemble your 4-point card.” "
+    "OR “Perfect — I’ll now assemble your selected 4-point card.” "
+    "OR “Great — I’ll now assemble your 4-point expert card with your chosen items.” "
+    "Do not ask any new questions. Do not open new topics."
+)
 
-## Identity & Scope
-You are Agent 1. You run the conversation and never call tools.
-- Agent 2 observes each turn and handles web images for PUBLIC items (book/podcast/person/tool/film).
-- Agent 3 will finalize the 4-point card when you signal the handoff.
-
-## Mission
-Build a 4-item Expert Card combining:
-1) PUBLIC anchors (book/podcast/person/tool/film), and
-2) The user’s personal angle (decisions, habits, examples, trade-offs).
-Favor variety across types.
-
-## Output Style (visible)
-- Natural, concise (1–3 short sentences). Mirror user language. Warm, specific, no fluff.
-- One primary move per turn: micro-clarify → deepen → pivot → close-and-move.
-- If the user asks you something, answer in ≤1 sentence, then continue.
-
-## Deepen vs Pivot
-- Deepen up to ~2 turns if concrete and high-signal; aim for specific decisions, habits, before/after, in-the-wild examples, accepted trade-offs.
-- Pivot if vague/repetitive, you already asked ~2 on this item, or you want diversity.
-- Remember: this is a profile interview, not a metrics deep-dive. Do not ask about KPIs, business performance metrics, or detailed professional analytics. Keep follow-ups at most 1–2 levels deep.
-
-## Handling inputs
-- PUBLIC item present → proceed; Agent 2 will search on its own. Don’t re-confirm what the user already gave unless ambiguity blocks a meaningful question.
-- Unusual/private/non-technical item → briefly acknowledge positively and clarify if it’s a public reference (e.g., “Is this someone others could look up, or more of a personal figure?”).  
-  - If public → one micro-clarifier (name/title/host) if needed, then continue as usual.  
-  - If private → ask for a PUBLIC stand-in (book/person/tool/podcast/film) that best represents that influence, then pivot.  
-- Meta/process-only → ask for one PUBLIC stand-in (book/person/tool/podcast/film).
-- Multiple items in one reply → pick one now; you may revisit others later.
-- Sensitive/emotional → acknowledge briefly; steer back to practice and PUBLIC anchors.
-
-## Diversity Goal
-Prefer a mix (e.g., books + a podcast + a person/tool/film). Nudge gently.
-
-## Opening & Flow
-Vary openings; reasonable examples include:
-- “What’s one book/podcast/person/tool/film that genuinely shifted how you work — and in what way?”
-- “Think of the last 12 months: which public influence most changed your decisions?”
-- “If someone wanted to think like you in Data/AI, what one public thing should they start with?”
-Avoid repeating your own earlier phrasing within this session.
-
-## Stop Condition (Handoff)
-When you judge 4 strong slots are covered, say a short line like:
-“Got it — I’ll assemble your 4-point card now.” or "we have four aspects we can turn into a profile" or "Alright - we have 4 aspects we can turn into a profile"
-Give the user a chance to answer on follow-up to your fourth and last item youre asking for.
-The system will route to Agent 3.
-
-## Guardrails
-Don’t reveal internal agents/tools. Keep it professional. Mirror language switching.
-
-## What you do each turn
-1) Read latest user message + light memory of prior slots.
-2) Decide one move (micro-clarify, deepen, pivot, close-and-move).
-3) Ask one focused question (optionally with a brief synthesis).
-4) Continue until 4 good items → give the handoff line. But wait for a follow-up response, in case you already gave an additional follow-up question to the user.
+# ---------- Agent 1 (Interview)
+AGENT1_SYSTEM_PRO = """You are Agent 1 — a warm, incisive interviewer.
+# Role
+Lead an interview session to build a 4-item Expert Card. Blend public influences (book, podcast, person, tool, or film) with the user's personal experiences and decisions.
+# Instructions
+- Drive the conversation; never call tools directly.
+- Collaborate implicitly: Agent 2 observes turns and manages lookup for public items; Agent 3 assembles the final card after your handoff.
+- Favor diversity in anchor types—aim for variety across books, podcasts, people, tools, films.
+# Planning Checklist
+Privately, begin each session with a concise checklist (3–7 bullets) of what you will do; keep items conceptual, not implementation-level. Do not surface or read the checklist to the user.
+# Conversation Style
+- Be natural and concise (1–3 short sentences per turn); adapt to user language; keep tone warm and specific; avoid filler.
+- Make only one distinct conversational move per turn: clarify, deepen, pivot, or close.
+- If responding to user questions, use a single sentence, then proceed.
+# Deepening and Pivoting
+- Deepen for up to two turns if the discussion is specific and informative—seek user details such as habits, decisions, before/after examples, or accepted trade-offs.
+- Pivot if responses are vague or repetitive, if you’ve already drilled down twice on the item, or to encourage varied anchor types.
+- Do not inquire about KPIs, business metrics, or granular analytics; limit follow-ups to 1–2 levels deep.
+# Handling User Inputs
+- If a public reference is provided, proceed; Agent 2 will handle backend lookups. Only clarify if ambiguity would block useful questions.
+- For unusual, private, or non-technical items, briefly acknowledge and check if it’s a public figure. If yes, clarify details if needed. If no, ask the user to name a public stand-in (book/person/tool/podcast/film) representing the same influence, then pivot.
+- For meta or process-oriented inputs, request a public stand-in.
+- If the user offers multiple items, select one for immediate exploration and revisit others later.
+- For sensitive or emotional topics, briefly acknowledge before steering back to public anchors and lived practice.
+# Opening & Flow
+- Vary your session openers. Example prompts:
+- “What’s one book, podcast, person, tool, or film that truly changed how you work — and how?”
+- “Looking back on the past year, which public influence impacted your decisions most?”
+- “If someone wanted to think like you in Data/AI, what public influence should they begin with?”
+- Do not repeat earlier smile, transition, or opening phrases within a session.
+# Stop Condition & Handoff
+- Target range: Capture 4–6 distinct public items.
+- After the 4th item (including 1–2 follow-ups): list the four and ask explicitly:
+“We have four strong anchors. Would you like me to assemble your 4-point card now, or should we continue with one or two more?”
+- If the user stops at 4: summarize the four and close with a clear handoff phrase:
+“Alright — I’ll now assemble your 4-point card.”
+- If the user continues: gather Item 5 (with up to 2 follow-ups). In the last follow-up to Item 5, ask:
+“Shall we add a 6th and final theme for your card?”
+- If the user declines → total = 5 items. List all 5 and ask:
+“We now have 5 anchors. Which 4 of these should go into your final card?”
+After their choice, confirm and hand off with:
+“Perfect — I’ll now assemble your selected 4-point card.”
+- If the user agrees → gather Item 6 (with 1–2 follow-ups). Then list all 6 and ask:
+“We now have 6 anchors. Which 4 of these should go into your final card?”
+After their choice, confirm and hand off with:
+“Great — I’ll now assemble your 4-point expert card with your chosen items.”
+- Always wait for the user’s last response before handing off.
+- If you ever receive a system line that starts with “SYSTEM_SIGNAL: hard-stop”, acknowledge the user’s last point in ≤1 sentence, then immediately close with exactly one of the handoff phrases above. Do not ask new questions.
+# Guardrails
+- Never mention or reveal the existence of internal agents or tools.
+- Maintain professionalism. Mirror the user’s preferred language, tone, and switching.
+# Turn Logic
+1. Read the latest user message, referencing light memory of prior slots.
+2. Select one move: clarify, deepen, pivot, or close.
+3. Ask a focused question with optional brief synthesis.
+4. Continue iteratively until the stop conditions above are met; then close with the final handoff.
 """
 
-def agent1_next_question(history_snapshot):
-    msgs = [{"role": "system", "content": AGENT1_SYSTEM}]
+AGENT1_SYSTEM_GEN = """You are Agent 1 — a warm, curious interviewer.
+# Role
+Lead an interview that can range beyond work: include public influences from everyday life and thinking (book, podcast, person, tool, film), plus the user's personal practices, habits, and decisions.
+# Instructions
+- Drive the conversation; never call tools directly.
+- Collaborate implicitly: Agent 2 observes turns and looks up public items; Agent 3 assembles the final card after your handoff.
+- Favor variety across domains: work, learning, hobbies, routines, creativity, civic/economic thinking — as appropriate for the user.
+# Planning Checklist
+Privately, begin with a concise checklist (3–7 bullets). Keep it conceptual; do not reveal it.
+# Conversation Style
+- Natural, concise (1–3 short sentences per turn), warm and specific; avoid filler.
+- One move per turn: clarify, deepen, pivot, or close.
+- If the user asks you something, answer in ≤1 sentence, then proceed.
+# Deepening and Pivoting
+- Deepen up to two turns when concrete: habits, decisions, before/after, trade-offs, in-the-wild examples.
+- Pivot if vague/repetitive or to maintain variety across life domains.
+- Avoid granular KPIs/metrics; keep follow-ups to 1–2 levels deep.
+# Handling User Inputs
+- If a public reference appears, proceed (Agent 2 will handle lookup). Clarify only if ambiguity blocks progress.
+- If an item is private or not-findable, accept it as personal practice; then ask for a public stand-in (book/person/tool/podcast/film) that best represents this influence, and continue.
+- If multiple items are given, pick one now; you may revisit others later.
+- Sensitive/emotional: acknowledge briefly, then steer to public anchors and lived practice.
+# Opening & Flow
+- Vary openers, e.g.:
+- “Outside of work, what book, podcast, person, tool, or film most changed how you think — and how?”
+- “In the last 12 months, what public influence reshaped your daily habits or decisions?”
+- “If a friend wanted to ‘get’ how you approach life/learning, which public reference should they start with?”
+- Do not repeat earlier opening phrasings within a session.
+# Stop Condition & Handoff
+- Target range: Capture 4–6 distinct public items or personal practices with public stand-ins where possible.
+- After the 4th item (including 1–2 follow-ups): list the four and ask explicitly:
+“We have four strong anchors. Would you like me to assemble your 4-point card now, or should we continue with one or two more?”
+- If the user stops at 4: summarize the four and close with a clear handoff phrase:
+“Alright — I’ll now assemble your 4-point card.”
+- If the user continues: gather Item 5 (up to 2 follow-ups). In the last follow-up to Item 5, ask:
+“Shall we add a 6th and final theme for your card?”
+- If the user declines → total = 5 items. List all 5 and ask:
+“We now have 5 anchors. Which 4 of these should go into your final card?”
+Confirm and hand off with:
+“Perfect — I’ll now assemble your selected 4-point card.”
+- If the user agrees → gather Item 6 (with 1–2 follow-ups). Then list all 6 and ask:
+“We now have 6 anchors. Which 4 of these should go into your final card?”
+Confirm and hand off with:
+“Great — I’ll now assemble your 4-point expert card with your chosen items.”
+- Always wait for the user’s last response before handing off.
+- If you ever receive a system line that starts with “SYSTEM_SIGNAL: hard-stop”, acknowledge the user’s last point in ≤1 sentence, then immediately close with exactly one of the handoff phrases above. Do not ask new questions.
+# Guardrails
+- Never mention or reveal internal agents/tools. Mirror the user's language and tone.
+# Turn Logic
+1) Read the latest user message, using the system’s slot summary (covered items).
+2) Choose one move: clarify, deepen, pivot, or close.
+3) Ask one focused question (optionally with brief synthesis).
+4) Continue until the stop conditions above are met; then close with the final handoff.
+"""
 
-    # NEW: add slot summary
+def get_agent1_system() -> str:
+    mode = st.session_state.get("agent1_mode", "Professional")
+    return AGENT1_SYSTEM_PRO if "Professional" in mode else AGENT1_SYSTEM_GEN
+
+def agent1_next_question(history_snapshot):
+    msgs = [{"role": "system", "content": get_agent1_system()}]
+
+    # Slot-Summary
     slot_state = summarize_slots_for_agent1(st.session_state.slots)
     msgs.append({"role": "system", "content": slot_state})
+
+    # Erster Turn? → Opener-Hint injizieren
+    if not history_snapshot:
+        msgs.append({"role": "system", "content": get_mode_opening_hint()})
+
+    # Hard-Stop System-Signal injizieren?
+    if st.session_state.get("stop_signal") and not st.session_state.get("hard_stop_signaled"):
+        msgs.append({"role": "system", "content": HARD_STOP_SYSTEM_MSG})
+        st.session_state.hard_stop_signaled = True
 
     used = st.session_state.get("used_openers", set())
     if used:
@@ -283,30 +398,23 @@ def agent1_next_question(history_snapshot):
     resp = client().chat.completions.create(model=MODEL, messages=msgs)
     return resp.choices[0].message.content.strip()
 
-
-# -------- NEW: Agent 1 — Streaming helper --------
+# -------- Agent 1 — Streaming helper --------
 def agent1_stream_question(history_snapshot: List[Dict[str, str]]) -> str:
-    """Streaming-fähige Version von Agent 1.
-    - Nutzt Slot-Summary
-    - Respektiert Stop-Signal
-    - Fällt bei 400-Fehler zurück auf Non-Streaming
-    - Fragt nur neue Items
-    """
+    """Streaming-fähige Version von Agent 1 (modusabhängig, Slot-Summary, Hard-Stop, Opener-Hint)."""
+    msgs = [{"role": "system", "content": get_agent1_system()}]
 
-    # Stop-Signal respektieren
-    if st.session_state.get("stop_signal"):
-        final = "Got it — I’ll assemble your 4-point card now."
-        def gen():
-            yield final
-        with st.chat_message("assistant"):
-            st.write_stream(gen())
-        return final
-
-    msgs = [{"role": "system", "content": AGENT1_SYSTEM}]
-
-    # NEW: add slot summary
+    # Slot-Summary
     slot_state = summarize_slots_for_agent1(st.session_state.slots)
     msgs.append({"role": "system", "content": slot_state})
+
+    # Erster Turn? → Opener-Hint
+    if not history_snapshot:
+        msgs.append({"role": "system", "content": get_mode_opening_hint()})
+
+    # Bei aktivem Hard-Stop jetzt Systemanweisung injizieren
+    if st.session_state.get("stop_signal") and not st.session_state.get("hard_stop_signaled"):
+        msgs.append({"role": "system", "content": HARD_STOP_SYSTEM_MSG})
+        st.session_state.hard_stop_signaled = True
 
     used = st.session_state.get("used_openers", set())
     if used:
@@ -316,7 +424,7 @@ def agent1_stream_question(history_snapshot: List[Dict[str, str]]) -> str:
     short = history_snapshot[-6:] if len(history_snapshot) > 6 else history_snapshot
     msgs += short
 
-    # --- Versuch: echtes Streaming
+    # --- Streaming
     try:
         stream = client().chat.completions.create(model=MODEL, messages=msgs, stream=True)
 
@@ -341,7 +449,6 @@ def agent1_stream_question(history_snapshot: List[Dict[str, str]]) -> str:
 
         text = "".join(full).strip()
     except Exception as e:
-        # Fallback bei "organization must be verified to stream this model" o.ä.
         try:
             from openai import BadRequestError
         except Exception:
@@ -354,7 +461,7 @@ def agent1_stream_question(history_snapshot: List[Dict[str, str]]) -> str:
         else:
             raise
 
-    # Post-Processing (Fragezeichen, opener tracking, Handoff)
+    # Post-Processing
     if text and not text.endswith("?"):
         text = text.rstrip(".! ") + "?"
     st.session_state.setdefault("used_openers", set()).add(text.lower()[:72])
@@ -365,10 +472,17 @@ def agent1_stream_question(history_snapshot: List[Dict[str, str]]) -> str:
             st.session_state.history + [{"role": "assistant", "content": text}],
             st.session_state.slots
         )
+
+    # Hard-Stop-Budget nach 6 Items verwalten
+    if st.session_state.get("hard_stop_pending") and not st.session_state.get("stop_signal"):
+        budget = int(st.session_state.get("hard_stop_budget", 0))
+        if budget > 0:
+            budget -= 1
+            st.session_state.hard_stop_budget = budget
+        if budget <= 0:
+            st.session_state.stop_signal = True  # Nächster Assistant-Turn injiziert System-Signal
+
     return text
-
-
-
 
 # ---------- Agent 2 (Extractor ONLY; keine Tools)
 AGENT2_SYSTEM = """You are Agent 2.
@@ -513,7 +627,7 @@ def validate_image_with_context(image_url: str, entity_type: str, entity_name: s
     except Exception:
         return {"ok": False, "reason": "unverifiable"}
 
-# ---------- Agent 3 (Finalizer) — etwas ausführlicher
+# ---------- Agent 3 (Finalizer)
 FINALIZER_SYSTEM = """You are Agent 3 — Finalizer.
 Create an Expert Card with exactly 4 items from:
 - The conversation (assistant questions + user answers).
@@ -584,7 +698,7 @@ class Orchestrator:
         debug_emit({"ev":"job_scheduled", "jid": jid})
 
     def _job(self, last_q: str, reply: str, seen_snapshot: List[str]) -> Dict[str, Any]:
-        dbg = []  # lokaler Buffer (Worker) — bleibt ungenutzt, da DEBUG off
+        dbg = []  # DEBUG off
         first_key_detected: Optional[str] = None
         try:
             data = agent2_extract_items(last_q, reply, seen_snapshot, dbg=dbg)
@@ -599,7 +713,7 @@ class Orchestrator:
 
             now = time.time()
 
-            # Merke die erste erkannte Item-Key für Flow/Pivot (auch wenn später kein Bild validiert)
+            # Erste erkannte Item-Key für Flow/Pivot
             if items:
                 etype0 = (items[0].get("entity_type") or "").lower().strip()
                 ename0 = (items[0].get("entity_name") or "").strip()
@@ -707,7 +821,6 @@ class Orchestrator:
                                 updated.append(sid)
                             else:
                                 debug_emit({"ev":"slots_full"})
-                # skip/err werden still gehandhabt
         for jid in rm:
             del self.jobs[jid]
         return updated
@@ -763,7 +876,6 @@ def render_final_card(final_text: str, slots: Dict[str, Dict[str, Any]]):
 
 def build_export_html(final_text: str, slots: Dict[str, Dict[str, Any]]) -> str:
     lines = parse_final_lines(final_text)
-    # gather 4 items in S1..S4 order
     items = []
     for idx, sid in enumerate(["S1","S2","S3","S4"]):
         if idx >= len(lines): break
@@ -773,7 +885,6 @@ def build_export_html(final_text: str, slots: Dict[str, Dict[str, Any]]) -> str:
         img   = (s.get("media",{}).get("best_image_url") or "").strip()
         items.append({"title": label, "body": body, "img": img})
 
-    # inline CSS (very light; BuddyBoss/WordPress friendly)
     html = f"""<!doctype html>
 <html>
 <head>
@@ -804,30 +915,74 @@ def build_export_html(final_text: str, slots: Dict[str, Dict[str, Any]]) -> str:
 </html>"""
     return html
 
-
 # ---------- Main
 st.set_page_config(page_title=APP_TITLE, page_icon="🟡", layout="wide")
 st.title(APP_TITLE)
 st.caption("Agent 2: Google Image API (+Vision-Check) • Slots only with valid image")
 
+# ---- Init state
 init_state()
+
+# ---- START-GATE (keine Modellaufrufe vor Klick)
+st.info("Klicke **Start**, um das Interview zu beginnen. Bis dahin werden **keine** Modell-Aufrufe ausgeführt.")
+start_col1, start_col2 = st.columns([1, 5])
+with start_col1:
+    if st.button("▶️ Start"):
+        st.session_state.user_started = True
+        st.rerun()
+
+if not st.session_state.user_started:
+    st.stop()  # Harte Bremse: beendet Run ohne Modelle / ohne Moduswahl
+
+# --------- Mode selection (NACH Start, VOR Chat-UI) ----------
+MODE_OPTIONS = ["Professional", "General / Lifescope"]
+mode = st.radio(
+    "Interview focus",
+    MODE_OPTIONS,
+    index=MODE_OPTIONS.index(st.session_state.get("agent1_mode", "Professional")),
+    horizontal=True,
+    help="Choose the style and breadth of Agent 1's conversation."
+)
+st.session_state["agent1_mode"] = mode
+
+# Mode-Badge
+badge_bg = "#E6F0FF" if "Professional" in mode else "#E9F9EE"
+badge_fg = "#0A58CA" if "Professional" in mode else "#157347"
+st.markdown(
+    f"""
+    <div style="margin:8px 0 4px 0;">
+      <span style="
+        display:inline-block;
+        padding:4px 10px;
+        border-radius:999px;
+        background:{badge_bg};
+        color:{badge_fg};
+        font-weight:600;
+        font-size:12px;
+        border:1px solid rgba(0,0,0,0.08);
+      ">Mode: {mode}</span>
+    </div>
+    """,
+    unsafe_allow_html=True
+)
+
+# ---- Orchestrator
 orch = Orchestrator()
 
-# First opener from Agent 1
+# ---- First opener from Agent 1 (nur nach Start, wenn History leer)
 if not st.session_state.history:
-    # stream den ersten Opener
-    opener = agent1_stream_question([])
+    opener = agent1_stream_question([])  # Prompt ist modusabhängig; Opener-Hint aktiv
     st.session_state.history.append({"role": "assistant", "content": opener})
     st.rerun()
 
-# Poll Agent 2 async jobs (silent; kein Debug/Toast)
+# ---- Agent 2 Poll
 orch.poll()
 
-# UI
+# ---- UI
 render_slots_summary()
 render_history()
 
-# FINAL CARD (if present)
+# ---- FINAL CARD
 if st.session_state.final_text:
     st.subheader("Your Expert Card")
     render_final_card(st.session_state.final_text, st.session_state.slots)
@@ -840,8 +995,7 @@ if st.session_state.final_text:
         mime="text/html"
     )
 
-
-# Input handling
+# ---- Input handling
 user_text = st.chat_input("Your turn…")
 if user_text:
     st.session_state.history.append({"role": "user", "content": user_text})
@@ -854,18 +1008,18 @@ if user_text:
             break
     orch.schedule_watch(last_q, user_text)
 
-    # Agent 1 — **Streaming** der nächsten Frage
+    # Agent 1 — Streaming der nächsten Frage
     nxt = agent1_stream_question(st.session_state.history)
     st.session_state.history.append({"role": "assistant", "content": nxt})
 
-    # Finalize ONLY when Agent 1 explizit signalisiert (Handoff-Phrase)
+    # Finalize ONLY when explicit handoff phrase detected
     low = nxt.lower()
     if any(phrase in low for phrase in HANDOFF_PHRASES):
         st.session_state.final_text = agent3_finalize(st.session_state.history, st.session_state.slots)
 
     st.rerun()
 
-# Actions
+# ---- Actions
 c1, c2 = st.columns(2)
 with c1:
     if st.button("✨ Finalize (manual)"):
@@ -880,4 +1034,6 @@ with c2:
             pass
         for k in list(st.session_state.keys()):
             del st.session_state[k]
+        # Sicherstellen, dass beim Neustart wieder das Start-Gate aktiv ist
+        st.session_state["user_started"] = False
         st.rerun()
