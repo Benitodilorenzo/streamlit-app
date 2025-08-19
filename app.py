@@ -513,14 +513,14 @@ def main():
             st.markdown(msg["content"])
 
     # Input box
-    # Ensure history has an opener from Agent 1 on first run
-if "history" not in st.session_state:
-    st.session_state.history = []
-if not st.session_state.history:
-    opener = "Was ist ein Buch, Podcast, eine Person, ein Tool oder ein Film, der dich zuletzt stark beeinflusst hat — und wie?"
-    st.session_state.history.append({"role": "assistant", "content": opener})
+        # Ensure history has an opener from Agent 1 on first run
+    if "history" not in st.session_state:
+        st.session_state.history = []
+    if not st.session_state.history:
+        opener = "Was ist ein Buch, Podcast, eine Person, ein Tool oder ein Film, der dich zuletzt stark beeinflusst hat — und wie?"
+        st.session_state.history.append({"role": "assistant", "content": opener})
 
-user_text = st.chat_input("Deine Antwort…")
+    user_text = st.chat_input("Deine Antwort…")
 
     # Finalize button
     colA, colB = st.columns([1,1])
