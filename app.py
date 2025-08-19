@@ -505,7 +505,7 @@ def main():
             for k in ["history", "state_frame", "card"]:
                 if k in st.session_state:
                     del st.session_state[k]
-            st.rerun()
+            st.experimental_rerun()
 
     # Conversation display
     for msg in st.session_state.history:
