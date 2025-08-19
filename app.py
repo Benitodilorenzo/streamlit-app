@@ -410,7 +410,7 @@ def handle_image_search(client: OpenAI, query: str, artifact_type: str, state_sn
 def orchestrator_turn(client: OpenAI, user_text: str, state_frame: Dict[str, Any], reasoning_effort: str = "low", verbosity: str = "low") -> Dict[str, Any]:
     resp = client.responses.create(
         model="gpt-5",
-        reasoning={"effort": reasoning_effort},        text={"format":{"type":"json_schema","json_schema": ORCHESTRATOR_TURN_SCHEMA, "strict": True}},
+        reasoning={"effort": reasoning_effort},        text={"format":{"type":"json_schema","name":"orchestrator_turn","json_schema": ORCHESTRATOR_TURN_SCHEMA["schema"], "strict": True}},
         input=[
             {"role": "system", "content": SYSTEM_AGENT1},
             {"role": "developer", "content": json.dumps({"state": state_frame})},
@@ -429,7 +429,7 @@ def orchestrator_turn(client: OpenAI, user_text: str, state_frame: Dict[str, Any
 def finalize_card(client: OpenAI, history: List[Dict[str, str]], state_frame: Dict[str, Any]) -> Dict[str, Any]:
     resp = client.responses.create(
         model="gpt-5-mini",
-        text={"format":{"type":"json_schema","json_schema": EXPERT_CARD_SCHEMA, "strict": True}},
+        text={"format":{"type":"json_schema","name":"expert_card","json_schema": EXPERT_CARD_SCHEMA["schema"], "strict": True}},
         input=[
             {"role": "system", "content": SYSTEM_FINALIZER},
             {"role": "developer", "content": json.dumps({"state": state_frame, "history": history})},
@@ -491,6 +491,17 @@ def main():
     st.title("🗂️ Expert Card – 3-Agent System (Single File)")
 
     init_state()
+    # Start Gate: require user to click Start before any model calls
+    if "started" not in st.session_state:
+        st.session_state.started = False
+    if not st.session_state.started:
+        st.info("Klicke **Start**, um zu beginnen. Bis dahin werden **keine** Modell‑Aufrufe ausgeführt.")
+        if st.button("▶️ Start"):
+            st.session_state.started = True
+            st.session_state.history = []
+            st.session_state.card = None
+            st.rerun()
+        st.stop()
     client = get_openai_client()
 
     with st.sidebar:
@@ -511,12 +522,13 @@ def main():
             st.markdown(msg["content"])
 
     # Input box
-        # Ensure history has an opener from Agent 1 on first run
-    if "history" not in st.session_state:
-        st.session_state.history = []
-    if not st.session_state.history:
-        opener = "Was ist ein Buch, Podcast, eine Person, ein Tool oder ein Film, der dich zuletzt stark beeinflusst hat — und wie?"
-        st.session_state.history.append({"role": "assistant", "content": opener})
+        # Ensure history has an opener from Agent 1 on first run (after Start)
+    if st.session_state.get("started"):
+        if "history" not in st.session_state:
+            st.session_state.history = []
+        if not st.session_state.history:
+            opener = "Was ist ein Buch, Podcast, eine Person, ein Tool oder ein Film, der dich zuletzt stark beeinflusst hat — und wie?"
+            st.session_state.history.append({"role": "assistant", "content": opener})
 
     user_text = st.chat_input("Deine Antwort…")
 
