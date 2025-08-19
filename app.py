@@ -410,9 +410,7 @@ def handle_image_search(client: OpenAI, query: str, artifact_type: str, state_sn
 def orchestrator_turn(client: OpenAI, user_text: str, state_frame: Dict[str, Any], reasoning_effort: str = "low", verbosity: str = "low") -> Dict[str, Any]:
     resp = client.responses.create(
         model="gpt-5",
-        reasoning={"effort": reasoning_effort},
-        text={"verbosity": verbosity},
-        text={"format":{"type":"json_schema","json_schema": ORCHESTRATOR_TURN_SCHEMA, "strict": true}},
+        reasoning={"effort": reasoning_effort},        text={"format":{"type":"json_schema","json_schema": ORCHESTRATOR_TURN_SCHEMA, "strict": True}},
         input=[
             {"role": "system", "content": SYSTEM_AGENT1},
             {"role": "developer", "content": json.dumps({"state": state_frame})},
@@ -431,7 +429,7 @@ def orchestrator_turn(client: OpenAI, user_text: str, state_frame: Dict[str, Any
 def finalize_card(client: OpenAI, history: List[Dict[str, str]], state_frame: Dict[str, Any]) -> Dict[str, Any]:
     resp = client.responses.create(
         model="gpt-5-mini",
-        text={"format":{"type":"json_schema","json_schema": EXPERT_CARD_SCHEMA, "strict": true}},
+        text={"format":{"type":"json_schema","json_schema": EXPERT_CARD_SCHEMA, "strict": True}},
         input=[
             {"role": "system", "content": SYSTEM_FINALIZER},
             {"role": "developer", "content": json.dumps({"state": state_frame, "history": history})},
