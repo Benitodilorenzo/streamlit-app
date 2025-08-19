@@ -5,6 +5,10 @@
 # - Agent-1: Streaming, Slot-Summary, SYSTEM_SIGNAL-Reaktion, eindeutige Handoff-Phrasen.
 # - **NEU:** Start-Gate (▶️ Start), NO model calls before user click.
 # - **NEU:** Moduswahl NACH Start (Professional vs. General/Lifescope), Mode-Badge in UI, modusabhängige Opener-Hints.
+# - **NEU (dieser Commit):**
+#   * Alle Agenten auf den `responses`-Endpunkt umgestellt.
+#   * Agent 1 Streaming auf `responses.stream()` umgestellt.
+#   * Agent 2 Standardmodell auf `gpt-5-mini` geändert (Extraktion + Vision-Check).
 
 import os, json, time, uuid, random, traceback, requests, re
 from typing import List, Dict, Any, Optional, Callable
@@ -18,7 +22,7 @@ from requests.exceptions import HTTPError
 
 APP_TITLE = "🟡 Expert Card — GPT-5 (3 Agents · Google Image API · Async)"
 MODEL = os.getenv("OPENAI_GPT5_SNAPSHOT", "gpt-5-2025-08-07")
-AGENT2_MODEL = os.getenv("OPENAI_AGENT2_MODEL", "gpt-4o-mini")  # günstig für Extraktion + Vision
+AGENT2_MODEL = os.getenv("OPENAI_AGENT2_MODEL", "gpt-5-mini")  # günstiger Extraktor + Vision-Validator
 MEDIA_DIR = os.path.join(os.getcwd(), "media")
 os.makedirs(MEDIA_DIR, exist_ok=True)
 
@@ -66,6 +70,37 @@ def client() -> OpenAI:
         raise RuntimeError("OPENAI_API_KEY missing")
     return OpenAI(api_key=key)
 
+# ---------- Helpers for Responses API
+def _resp_text(resp) -> str:
+    """Extract plain text from Responses API objects safely."""
+    # SDK helper if present:
+    txt = getattr(resp, "output_text", None)
+    if txt:
+        return txt.strip()
+    # Fallback parse:
+    try:
+        outputs = getattr(resp, "output", None) or []
+        parts = []
+        for item in outputs:
+            if getattr(item, "type", None) == "message":
+                for c in getattr(item, "content", []) or []:
+                    if getattr(c, "type", None) in ("output_text", "text"):
+                        parts.append(getattr(c, "text", "") or "")
+        return "".join(parts).strip()
+    except Exception:
+        # Last resort: try dict access
+        try:
+            outputs = resp.get("output", [])  # type: ignore
+            parts = []
+            for item in outputs:
+                if item.get("type") == "message":
+                    for c in item.get("content", []):
+                        if c.get("type") in ("output_text", "text"):
+                            parts.append(c.get("text",""))
+            return "".join(parts).strip()
+        except Exception:
+            return ""
+
 # ---------- Retry wrapper
 def call_with_retry(fn: Callable, *args, **kwargs):
     for attempt in range(OPENAI_MAX_RETRIES):
@@ -80,7 +115,7 @@ def call_with_retry(fn: Callable, *args, **kwargs):
             raise
         except Exception as e:
             msg = str(e).lower()
-            if "rate limit" in msg or "429" in msg:
+            if "rate limit" in msg or "429" in msg or "temporarily unavailable" in msg:
                 delay = OPENAI_BACKOFF_BASE ** attempt + random.uniform(0, 0.3)
                 time.sleep(delay)
                 continue
@@ -395,12 +430,12 @@ def agent1_next_question(history_snapshot):
     short = history_snapshot[-6:] if len(history_snapshot) > 6 else history_snapshot
     msgs += short
 
-    resp = client().chat.completions.create(model=MODEL, messages=msgs)
-    return resp.choices[0].message.content.strip()
+    resp = call_with_retry(client().responses.create, model=MODEL, input=msgs)
+    return _resp_text(resp)
 
-# -------- Agent 1 — Streaming helper --------
+# -------- Agent 1 — Streaming helper (Responses.stream) --------
 def agent1_stream_question(history_snapshot: List[Dict[str, str]]) -> str:
-    """Streaming-fähige Version von Agent 1 (modusabhängig, Slot-Summary, Hard-Stop, Opener-Hint)."""
+    """Streaming-fähige Version von Agent 1 (modusabhängig, Slot-Summary, Hard-Stop, Opener-Hint) — Responses API."""
     msgs = [{"role": "system", "content": get_agent1_system()}]
 
     # Slot-Summary
@@ -424,42 +459,38 @@ def agent1_stream_question(history_snapshot: List[Dict[str, str]]) -> str:
     short = history_snapshot[-6:] if len(history_snapshot) > 6 else history_snapshot
     msgs += short
 
-    # --- Streaming
-    try:
-        stream = client().chat.completions.create(model=MODEL, messages=msgs, stream=True)
+    full_parts: List[str] = []
 
-        full = []
-        def token_gen():
-            for chunk in stream:
-                try:
-                    piece = chunk.choices[0].delta.get("content") if hasattr(chunk.choices[0], "delta") else None
-                except Exception:
-                    piece = None
-                if not piece:
-                    try:
-                        piece = chunk.choices[0].message.get("content")
-                    except Exception:
-                        piece = None
-                if piece:
-                    full.append(piece)
-                    yield piece
-
-        with st.chat_message("assistant"):
-            st.write_stream(token_gen())
-
-        text = "".join(full).strip()
-    except Exception as e:
+    def token_generator():
         try:
-            from openai import BadRequestError
-        except Exception:
-            BadRequestError = Exception
-        if isinstance(e, BadRequestError) or "must be verified to stream" in str(e).lower() or "unsupported_value" in str(e).lower():
-            resp = call_with_retry(client().chat.completions.create, model=MODEL, messages=msgs)
-            text = (resp.choices[0].message.content or "").strip()
-            with st.chat_message("assistant"):
-                st.markdown(text if text else "...")
-        else:
-            raise
+            with client().responses.stream(model=MODEL, input=msgs) as stream:
+                for event in stream:
+                    # Stream nur Text-Deltas anzeigen
+                    if getattr(event, "type", "") == "response.output_text.delta":
+                        delta = getattr(event, "delta", "")
+                        if delta:
+                            full_parts.append(delta)
+                            yield delta
+                # Stream schließen & finale Antwort verfügbar
+                final = stream.get_final_response()
+                # fallback: falls keine deltas kamen
+                if not full_parts:
+                    txt = _resp_text(final)
+                    if txt:
+                        full_parts.append(txt)
+                        yield txt
+        except Exception as e:
+            # Fallback auf Non-Streaming
+            resp = call_with_retry(client().responses.create, model=MODEL, input=msgs)
+            txt = _resp_text(resp) or ""
+            if txt:
+                full_parts.append(txt)
+                yield txt
+
+    with st.chat_message("assistant"):
+        st.write_stream(token_generator())
+
+    text = "".join(full_parts).strip()
 
     # Post-Processing
     if text and not text.endswith("?"):
@@ -510,16 +541,16 @@ def agent2_extract_items(last_q: str, user_reply: str, seen_entities: List[str],
     try:
         debug_emit({"ev":"extract_start", "q_len": len(last_q), "a_len": len(user_reply)}, dbg)
         resp = call_with_retry(
-            client().chat.completions.create,
+            client().responses.create,
             model=AGENT2_MODEL,
-            messages=[
-                {"role":"system","content": AGENT2_SYSTEM},
-                {"role":"user","content": json.dumps(payload, ensure_ascii=False)}
+            input=[
+                {"role": "system", "content": AGENT2_SYSTEM},
+                {"role": "user", "content": json.dumps(payload, ensure_ascii=False)}
             ]
         )
-        raw = (resp.choices[0].message.content or "").strip()
-        debug_emit({"ev":"extract_raw", "preview": raw[:240]}, dbg)
-        data = parse_json_loose(raw)
+        raw = _resp_text(resp)
+        debug_emit({"ev":"extract_raw", "preview": (raw or "")[:240]}, dbg)
+        data = parse_json_loose(raw or "")
         if isinstance(data, dict):
             debug_emit({"ev":"extract_parsed", "detected": bool(data.get("detected")), "count": len(data.get("items") or [])}, dbg)
             return data
@@ -609,19 +640,20 @@ def validate_image_with_context(image_url: str, entity_type: str, entity_name: s
             "Does this image plausibly match the item?"
         )
     try:
+        # Responses API: multimodal input (text + image)
         resp = call_with_retry(
-            client().chat.completions.create,
+            client().responses.create,
             model=AGENT2_MODEL,
-            messages=[
+            input=[
                 {"role": "system", "content": sys},
                 {"role": "user", "content": [
-                    {"type": "text", "text": user_text},
-                    {"type": "image_url", "image_url": {"url": image_url}}
+                    {"type": "input_text", "text": user_text},
+                    {"type": "input_image", "image_url": image_url}
                 ]}
             ]
         )
-        txt = (resp.choices[0].message.content or "").strip()
-        data = parse_json_loose(txt)
+        txt = _resp_text(resp)
+        data = parse_json_loose(txt or "")
         ok = bool(data.get("ok")) if isinstance(data, dict) else False
         return {"ok": ok, "reason": (data.get("reason") if isinstance(data, dict) else "")[:200]}
     except Exception:
@@ -663,8 +695,8 @@ def agent3_finalize(history: List[Dict[str, str]], slots: Dict[str, Dict[str, An
         {"role": "system", "content": FINALIZER_SYSTEM},
         {"role": "user", "content": f"Transcript:\n{convo_text}\n\nSlots:\n{slots_text}"}
     ]
-    resp = call_with_retry(client().chat.completions.create, model=MODEL, messages=msgs)
-    return (resp.choices[0].message.content or "").strip()
+    resp = call_with_retry(client().responses.create, model=MODEL, input=msgs)
+    return _resp_text(resp)
 
 # ---------- Orchestrator
 COOLDOWN_SECONDS = 600  # 10 Minuten
@@ -915,6 +947,7 @@ def build_export_html(final_text: str, slots: Dict[str, Dict[str, Any]]) -> str:
 </html>"""
     return html
 
+
 # ---------- Main
 st.set_page_config(page_title=APP_TITLE, page_icon="🟡", layout="wide")
 st.title(APP_TITLE)
@@ -1008,7 +1041,7 @@ if user_text:
             break
     orch.schedule_watch(last_q, user_text)
 
-    # Agent 1 — Streaming der nächsten Frage
+    # Agent 1 — Streaming der nächsten Frage (Responses)
     nxt = agent1_stream_question(st.session_state.history)
     st.session_state.history.append({"role": "assistant", "content": nxt})
 
