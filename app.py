@@ -1,203 +1,211 @@
-# app.py — 🟡 Expert Card – 3-Agent System (Single File, Responses API correct)
-# Requirements: streamlit, openai>=1.40, requests
-# ENV: OPENAI_API_KEY, GOOGLE_CSE_KEY, GOOGLE_CSE_CX, GOOGLE_CSE_SAFE (off|active)
-
-import os, json, uuid, requests
-from typing import Any, Dict, List, Optional
-
+# app.py — Expert Card (Assistants · Option A · Single Thread, 3 Assistants, In-Band State)
+import os, time, json, re, requests, uuid
+from typing import Dict, Any, List, Optional, Tuple
 import streamlit as st
 from openai import OpenAI
-from requests.exceptions import HTTPError
 
-# -------------------------
-# Config / ENV
-# -------------------------
-APP_TITLE = "🟡 Expert Card — GPT-5 (3 Agents · Responses API)"
-MODEL = os.getenv("OPENAI_GPT5_SNAPSHOT", "gpt-5")           # API alias per GPT-5 guide :contentReference[oaicite:1]{index=1}
-AGENT2_MODEL = os.getenv("OPENAI_AGENT2_MODEL", "gpt-5-mini") # cost-optimized validator :contentReference[oaicite:2]{index=2}
+# ----------------------------
+# Config & Env
+# ----------------------------
+APP_TITLE = "🟡 Expert Card — GPT-5 (3 Assistants · Single Thread · In-Band State)"
+MODEL_MAIN = os.getenv("OPENAI_GPT5_SNAPSHOT", "gpt-5-2025-08-07")
+MODEL_AGENT2_VALIDATOR = os.getenv("OPENAI_AGENT2_MODEL", "gpt-5-mini")
 
 GOOGLE_CSE_KEY  = os.getenv("GOOGLE_CSE_KEY", "").strip()
 GOOGLE_CSE_CX   = os.getenv("GOOGLE_CSE_CX", "").strip()
 GOOGLE_CSE_SAFE = os.getenv("GOOGLE_CSE_SAFE", "off").strip().lower()  # "off" | "active"
 
-HANDOFF_PHRASES = [
-    "i’ll assemble your 4-point card now",
-    "i'll assemble your 4-point card now",
-    "we have 4 aspects we can turn into a profile",
-    "we have four aspects we can turn into a profile",
-    "wir haben nun 4 aspekte",
-    "wir haben jetzt 4 aspekte",
-    "wir haben vier aspekte",
-    "ich stelle jetzt deinen steckbrief zusammen",
-    "ich erstelle jetzt deinen 4-punkte-steckbrief",
-    "alright — i’ll now assemble your 4-point card",
-    "alright - i’ll now assemble your 4-point card",
-    "alright — i'll now assemble your 4-point card",
-    "alright - i'll now assemble your 4-point card",
-    "perfect — i’ll now assemble your selected 4-point card",
-    "perfect — i'll now assemble your selected 4-point card",
-    "great — i’ll now assemble your 4-point expert card with your chosen items",
-    "great — i'll now assemble your 4-point expert card with your chosen items",
-]
+# Hard limits
+MAX_POLL_SECONDS = 90
+AGENT2_MAX_CANDIDATES = 3
 
-# -------------------------
-# OpenAI client
-# -------------------------
-def client() -> OpenAI:
+# ----------------------------
+# UI Setup
+# ----------------------------
+st.set_page_config(page_title=APP_TITLE, page_icon="🟡", layout="wide")
+st.title(APP_TITLE)
+st.caption("Assistants API · 1 Thread als einziger Speicher · Agent-2 ruft Custom-Tools (Google CSE + Vision-Check) auf und schreibt Ergebnisse als Plaintext in den Thread.")
+
+# ----------------------------
+# OpenAI Client
+# ----------------------------
+def get_client() -> OpenAI:
     key = os.getenv("OPENAI_API_KEY", "").strip()
     if not key:
-        st.error("OPENAI_API_KEY fehlt.")
         st.stop()
     return OpenAI(api_key=key)
 
-# -------------------------
-# Schemas (Structured Outputs via text.format json_schema)
-# -------------------------
-ORCHESTRATOR_TURN_SCHEMA: Dict[str, Any] = {
-    "type": "object",
-    "properties": {
-        "assistant_message": {
-            "type": "string",
-            "description": "Next assistant utterance (1–3 sentences). If not handing off, end with a question."
-        },
-        "planned_searches": {
-            "type": "array",
-            "items": {
-                "type": "object",
-                "properties": {
-                    "entity_type": {"type": "string", "enum": ["person","book","podcast","tool","film"]},
-                    "entity_name": {"type": "string"},
-                    "artifact": {"type": "string", "enum": ["portrait","book_cover","podcast_cover","tool_logo","film_poster"]},
-                    "search_query": {"type": "string"},
-                    "cluster_id": {"type": "string"}
+# ----------------------------
+# Assistant blueprints (Prompts: Platzhalter — du kannst sie später verfeinern)
+# ----------------------------
+SYSTEM_AGENT1 = (
+    "You are Agent 1 — an interviewer. Drive a short, warm conversation to collect exactly 4 strong anchors "
+    "(public items: book, podcast, person, tool, film) grounded in the user's words and practices. "
+    "State awareness is IN-BAND: read prior AGENT2_RESULT blocks in this same thread to avoid duplicates and to see clusters.\n"
+    "Per user turn:\n"
+    "1) Write a concise reply to the user (1–3 short sentences; one move: clarify, deepen, pivot, or close).\n"
+    "2) Plan at most one search for Agent 2 ONLY IF a new, clearly searchable public item was mentioned. "
+    "   Output a JSON object (strict) via Structured Output with:\n"
+    "   - assistant_message: string (what to show to user)\n"
+    "   - search_calls: array of 0..1 items {entity_type, entity_name, artifact, search_query, cluster_id}\n"
+    "   - handoff: boolean (true only when the user asked to finalize)\n"
+    "Artifact mapping: person→portrait, book→book_cover, podcast→podcast_cover, tool→tool_logo, film→film_poster.\n"
+    "Dedupe rule: if AGENT2_RESULT exists with same key (type|normalized_name) and artifact, do not plan another search.\n"
+    "Never mention agents or tools."
+)
+
+SYSTEM_AGENT2 = (
+    "You are Agent 2 — Search & Validation.\n"
+    "You operate ONLY when you see a new 'AGENT2_TASK' message in the thread. That JSON contains: "
+    "{entity_type, entity_name, artifact, search_query, cluster_id}.\n"
+    "Use tools:\n"
+    " - image_search(query, max_results)\n"
+    " - vision_validate(url, item_type, item_name, artifact)\n"
+    "Policy:\n"
+    "- Before searching, scan the thread for prior AGENT2_RESULT JSON blocks; if an identical key (type|normalized name) with same artifact already exists, reply with AGENT2_RESULT {\"status\":\"duplicate_skip\", ...} and STOP.\n"
+    "- Otherwise call image_search exactly once. Take up to 3 unique candidates; run vision_validate on each until one passes (ok=true).\n"
+    "- If none pass, return AGENT2_RESULT {\"status\":\"no_valid_image\", ...}.\n"
+    "Return your final decision as a single plaintext line starting with:\n"
+    "AGENT2_RESULT { ...json... }\n"
+    "The JSON MUST include: status, key, label, artifact, cluster_id, best_image_url, source_url.\n"
+    "Label examples: 'Role Model — <name>' for person; 'Must-Read — <title>' for book; 'Podcast — <title>'; 'Go-to Tool — <name>'; 'Influence — <title>'.\n"
+    "Do not speak to the user. No extra prose beyond the single AGENT2_RESULT line."
+)
+
+SYSTEM_AGENT3 = (
+    "You are Agent 3 — Finalizer. Read the thread (assistant questions + user answers) and the AGENT2_RESULT items. "
+    "Produce exactly 4 bullet lines, grounded in THIS user's language. Each line: '- Label: ...' with 1–3 concise sentences. "
+    "Prefer public anchors; if fewer than 4 exist, fill with user's practices. No tool-talk."
+)
+
+# ----------------------------
+# Assistants: create/reuse (IDs im Session State cachen)
+# ----------------------------
+def ensure_assistants(client: OpenAI):
+    if "assistants" not in st.session_state:
+        st.session_state.assistants = {}
+
+    a = st.session_state.assistants
+    if not a.get("A1"):
+        a["A1"] = client.assistants.create(
+            name="Interview Agent",
+            model=MODEL_MAIN,
+            instructions=SYSTEM_AGENT1,
+        ).id
+    if not a.get("A2"):
+        a["A2"] = client.assistants.create(
+            name="Search & Validator Agent",
+            model=MODEL_MAIN,
+            instructions=SYSTEM_AGENT2,
+            tools=[
+                {
+                    "type": "function",
+                    "function": {
+                        "name": "image_search",
+                        "description": "Google CSE image search for public items.",
+                        "parameters": {
+                            "type": "object",
+                            "properties": {
+                                "query": {"type": "string"},
+                                "max_results": {"type": "integer", "minimum": 1, "maximum": 10, "default": 6}
+                            },
+                            "required": ["query"]
+                        }
+                    }
                 },
-                "required": ["entity_type","entity_name","artifact","search_query","cluster_id"],
-                "additionalProperties": False
-            }
-        }
-    },
-    "required": ["assistant_message","planned_searches"],
-    "additionalProperties": False
-}
+                {
+                    "type": "function",
+                    "function": {
+                        "name": "vision_validate",
+                        "description": "Validate that the image at url plausibly matches the requested item + artifact.",
+                        "parameters": {
+                            "type": "object",
+                            "properties": {
+                                "url": {"type": "string"},
+                                "item_type": {"type": "string", "enum": ["person","book","podcast","tool","film"]},
+                                "item_name": {"type": "string"},
+                                "artifact": {"type": "string", "enum": ["portrait","book_cover","podcast_cover","tool_logo","film_poster"]}
+                            },
+                            "required": ["url","item_type","item_name","artifact"]
+                        }
+                    }
+                }
+            ],
+        ).id
+    if not a.get("A3"):
+        a["A3"] = client.assistants.create(
+            name="Finalizer Agent",
+            model=MODEL_MAIN,
+            instructions=SYSTEM_AGENT3,
+        ).id
+    st.session_state.assistants = a
+    return a["A1"], a["A2"], a["A3"]
 
-VALIDATOR_SCHEMA: Dict[str, Any] = {
-    "type": "object",
-    "properties": {
-        "ok": {"type": "boolean"},
-        "reason": {"type": "string"}
-    },
-    "required": ["ok","reason"],
-    "additionalProperties": False
-}
+# ----------------------------
+# Thread helpers
+# ----------------------------
+def ensure_thread(client: OpenAI) -> str:
+    if "thread_id" not in st.session_state or not st.session_state.thread_id:
+        tid = client.threads.create().id
+        st.session_state.thread_id = tid
+    return st.session_state.thread_id
 
-EXPERT_CARD_SCHEMA: Dict[str, Any] = {
-    "type": "object",
-    "properties": {
-        "lines": {
-            "type": "array",
-            "minItems": 4,
-            "maxItems": 4,
-            "items": {"type": "string"}
-        },
-        "html": {"type": "string", "description": "Exportable HTML snippet for the 4 items with images."}
-    },
-    "required": ["lines","html"],
-    "additionalProperties": False
-}
+def add_user_message(client: OpenAI, thread_id: str, content: str):
+    client.messages.create(thread_id=thread_id, role="user", content=content)
 
-# -------------------------
-# System prompts (compact; du kannst deine großen später einsetzen)
-# -------------------------
-SYSTEM_AGENT1: str = (
-    "You are Agent 1 — interviewer/orchestrator.\n"
-    "Goal: build a 4-item Expert Card. Keep turns short (1–3 sentences). One move per turn: clarify, deepen, pivot, or close.\n"
-    "Detect public items (book/podcast/person/tool/film) and plan precise image searches (artifact-aware; add disambiguation like “<Title> by <Author> book cover”).\n"
-    "Offer to assemble after 4 solid anchors; only hand off after explicit confirmation.\n"
-    "OUTPUT strictly matches the JSON schema: assistant_message + planned_searches.\n"
-    "Do not mention tools."
-)
+def list_messages(client: OpenAI, thread_id: str, limit: int = 100) -> List[Dict[str, Any]]:
+    out = client.messages.list(thread_id=thread_id, limit=limit)
+    # SDK returns .data list; preserve order oldest->newest for readability
+    return list(reversed(out.data))
 
-SYSTEM_AGENT1_CHAT: str = (
-    "You are Agent 1 — the user-facing voice. Speak naturally and briefly. "
-    "Don’t mention tools or planning. If finalizing, use one of the handoff phrases exactly; else ask one focused question."
-)
+# ----------------------------
+# Run + polling
+# ----------------------------
+def poll_run(client: OpenAI, thread_id: str, run_id: str) -> Dict[str, Any]:
+    t0 = time.time()
+    while True:
+        r = client.runs.retrieve(thread_id=thread_id, run_id=run_id)
+        if r.status in ("completed", "failed", "cancelled", "expired"):
+            return r.to_dict()
+        if r.status == "requires_action":
+            return r.to_dict()
+        if time.time() - t0 > MAX_POLL_SECONDS:
+            return r.to_dict()
+        time.sleep(0.7)
 
-SYSTEM_VALIDATOR: str = (
-    "You are Agent 2 — image validator. STRICT JSON. For PERSON+portrait: DO NOT identify the person; only check portrait form (single human, not logo/meme/group). "
-    "For covers/posters/logos: check plausibility for the requested artifact given the context. Return {ok:boolean, reason:string}."
-)
-
-SYSTEM_FINALIZER: str = (
-    "You are Agent 3 — Finalizer. Produce exactly 4 lines (concise, grounded in this user's words). "
-    "Also produce an HTML snippet that lays out the 4 items with optional images (title on left with 1–3 sentences, image on right)."
-)
-
-# -------------------------
-# Helpers
-# -------------------------
-def _resp_text(resp) -> str:
+# ----------------------------
+# JSON helpers
+# ----------------------------
+def find_json_block(text: str) -> Optional[dict]:
+    if not text: return None
+    m = re.search(r"\{[\s\S]*\}\s*$", text.strip())
+    if not m: 
+        # try first {...}
+        m = re.search(r"\{[\s\S]*?\}", text)
+    if not m:
+        return None
     try:
-        t = getattr(resp, "output_text", None)
-        if t:
-            return t
+        return json.loads(m.group(0))
     except Exception:
-        pass
-    try:
-        out = resp.output or []
-        buf = []
-        for item in out:
-            if getattr(item, "type", "") == "message":
-                for c in getattr(item, "content", []) or []:
-                    if getattr(c, "type", "") in ("output_text","text"):
-                        buf.append(getattr(c, "text", "") or "")
-        return "".join(buf)
-    except Exception:
-        return ""
+        return None
 
-def safe_json(txt: str) -> Dict[str, Any]:
-    try:
-        return json.loads(txt)
-    except Exception:
-        a, b = txt.find("{"), txt.rfind("}")
-        if a != -1 and b != -1 and b > a:
-            try:
-                return json.loads(txt[a:b+1])
-            except Exception:
-                return {}
-        return {}
+def normalize_key(entity_type: str, entity_name: str) -> str:
+    et = (entity_type or "").strip().lower()
+    nm = (entity_name or "").strip().lower()
+    nm = re.sub(r"[^\w\s\-:]", " ", nm)
+    nm = re.sub(r"\s+", " ", nm).strip()
+    return f"{et}|{nm}"
 
-def next_free_slot(slots: Dict[str, Any]) -> Optional[str]:
-    for sid in ("S1","S2","S3","S4"):
-        if sid not in slots or not (slots.get(sid,{}).get("label")):
-            return sid
-    return None
-
-def render_slots(slots: Dict[str, Any]):
-    filled = len([s for s in slots.values() if (s.get("label") or "").strip()])
-    st.progress(min(1.0, filled/4), text=f"Progress: {filled}/4")
-    if slots:
-        cols = st.columns(4)
-        order = ["S1","S2","S3","S4"]
-        for idx, sid in enumerate(order):
-            with cols[idx]:
-                s = slots.get(sid)
-                if not s:
-                    st.caption(sid); st.write("—"); continue
-                st.caption(sid + " · " + s.get("label",""))
-                img = (s.get("image_url") or "").strip()
-                if img: st.image(img, use_column_width=True)
-                else:   st.write("(no image)")
-
-# -------------------------
-# Google Image Search (CSE)
-# -------------------------
-def google_image_search(query: str, num: int = 6) -> List[Dict[str, str]]:
+# ----------------------------
+# Google CSE Tool
+# ----------------------------
+def google_image_search(query: str, max_results: int = 6) -> List[Dict[str, str]]:
     if not GOOGLE_CSE_KEY or not GOOGLE_CSE_CX:
         return []
     params = {
         "q": query,
         "searchType": "image",
-        "num": max(1, min(num, 10)),
+        "num": max(1, min(max_results, 10)),
         "safe": GOOGLE_CSE_SAFE,
         "key": GOOGLE_CSE_KEY,
         "cx": GOOGLE_CSE_CX,
@@ -205,303 +213,403 @@ def google_image_search(query: str, num: int = 6) -> List[Dict[str, str]]:
     try:
         r = requests.get("https://www.googleapis.com/customsearch/v1", params=params, timeout=12)
         r.raise_for_status()
-        data = r.json()
-        items = data.get("items", []) or []
-        out = []
-        for it in items:
-            link = (it.get("link") or "").strip()
-            ctx = (it.get("image", {}) or {}).get("contextLink") or ""
-            if link:
-                out.append({"url": link, "page_url": ctx})
-        return out
-    except HTTPError:
-        return []
     except Exception:
         return []
+    data = r.json()
+    items = data.get("items") or []
+    out = []
+    seen = set()
+    for it in items:
+        url = (it.get("link") or "").strip()
+        ctx = ""
+        try:
+            ctx = (it.get("image", {}).get("contextLink") or "").strip()
+        except Exception:
+            ctx = ""
+        if url and url not in seen:
+            seen.add(url)
+            out.append({"url": url, "page_url": ctx})
+        if len(out) >= max_results:
+            break
+    return out
 
-# -------------------------
-# Agent calls
-# -------------------------
-def agent1_plan_searches(last_q: str, user_reply: str, known_labels: List[str]) -> Dict[str, Any]:
-    """Structured output: assistant_message + planned_searches[]"""
-    c = client()
-    payload = {
-        "assistant_question": last_q or "",
-        "user_reply": user_reply or "",
-        "known_slots": known_labels or [],
-    }
-    resp = c.responses.create(
-        model=MODEL,
-        text={
-            "verbosity": "low",                                    # GPT-5 verbosity :contentReference[oaicite:3]{index=3}
-            "format": {
-                "type": "json_schema",
-                "name": "OrchestratorTurn",
-                "schema": ORCHESTRATOR_TURN_SCHEMA,               # ← WICHTIG: schema gesetzt (nicht json_schema)
-                "strict": True
-            }
-        },
-        instructions=SYSTEM_AGENT1,
-        input=[{"role": "user", "content": [{"type":"input_text","text": json.dumps(payload, ensure_ascii=False)}]}],
-    )
-    return safe_json(_resp_text(resp))
-
-def agent1_chat_stream(history: List[Dict[str, str]], mode_hint: str, slot_summary: str) -> str:
-    """User-visible utterance (streamed)."""
-    c = client()
-    # small transcript
-    convo = []
-    for m in history[-10:]:
-        prefix = "Q: " if m["role"]=="assistant" else "A: "
-        convo.append(prefix + m["content"])
-    transcript = "\n".join(convo)
-
-    user_payload = {"transcript": transcript, "mode": mode_hint, "slot_summary": slot_summary}
-    container = st.empty()
-    buf = ""
-
-    try:
-        with c.responses.stream(
-            model=MODEL,
-            text={"verbosity": "low"},
-            instructions=SYSTEM_AGENT1_CHAT,
-            input=[{"role":"user","content":[{"type":"input_text","text": json.dumps(user_payload, ensure_ascii=False)}]}]
-        ) as stream:
-            for event in stream:
-                if event.type == "response.output_text.delta":
-                    delta = getattr(event, "delta", "") or ""
-                    if delta:
-                        buf += delta
-                        container.markdown(buf)
-                elif event.type == "response.error":
-                    container.error(str(getattr(event, "error", "")))
-            final = stream.get_final_response()
-            if not buf:
-                t = _resp_text(final)
-                if t:
-                    buf = t
-                    container.markdown(buf)
-    except Exception as e:
-        container.error(f"Stream error: {e}")
-    return (buf or "").strip()
-
-def agent2_validate_image(image_url: str, entity_type: str, entity_name: str, artifact: str,
-                          q_text: str, a_text: str) -> Dict[str, Any]:
-    c = client()
-    if (entity_type or "").strip().lower() == "person" and (artifact or "").strip().lower() == "portrait":
-        user_text = (
-            "Artifact: portrait\nItem type: person\n"
-            f"Person name (context only; do NOT identify): {entity_name}\n"
-            "Check only portrait form: single human headshot/portrait; not logo/meme/group.\n"
-            "Return STRICT JSON."
+# ----------------------------
+# Vision Validator Tool (Responses API call)
+# ----------------------------
+def tool_vision_validate(client: OpenAI, url: str, item_type: str, item_name: str, artifact: str) -> Dict[str, Any]:
+    if item_type == "person" and artifact == "portrait":
+        sys = (
+            'You are an image verifier. Return STRICT JSON {"ok":true/false,"reason":"..."}.\n'
+            "Do NOT identify the person. Only check portrait criteria:\n"
+            "- Single-human portrait or headshot; not a logo/meme/cartoon/product.\n"
+            "- Not a group photo; 1 clearly visible person.\n"
+            "Return ok=true if criteria hold; else false."
         )
+        user_text = f"Item type: person\nItem name (context only): {item_name}\nOnly check portrait criteria."
     else:
-        user_text = (
-            f"Artifact: {artifact}\nItem type: {entity_type}\nItem name: {entity_name}\n"
-            f"Context Q: {q_text[:300]}\nContext A: {a_text[:500]}\n"
-            "Check plausibility for requested item/artifact. Return STRICT JSON."
+        sys = (
+            'You are an image verifier. Return STRICT JSON {"ok":true/false,"reason":"..."}.\n'
+            "Check plausibility that the image matches the item + artifact given context. "
+            "Be strict against mismatches; allow reasonable cover/poster variants."
         )
-    resp = c.responses.create(
-        model=AGENT2_MODEL,
-        text={
-            "verbosity": "low",
-            "format": {
-                "type": "json_schema",
-                "name": "validator",
-                "schema": VALIDATOR_SCHEMA,
-                "strict": True
-            }
-        },
-        instructions=SYSTEM_VALIDATOR,
-        input=[{"role": "user", "content": [
-            {"type":"input_text","text": user_text},
-            {"type":"input_image","image_url": image_url}
-        ]}],
-    )
-    return safe_json(_resp_text(resp)) or {"ok": False, "reason": "unverifiable"}
+        user_text = f"Item type: {item_type}\nItem name: {item_name}\nArtifact: {artifact}"
+    try:
+        resp = client.responses.create(
+            model=MODEL_AGENT2_VALIDATOR,
+            input=[
+                {"role":"system","content":sys},
+                {"role":"user","content":[
+                    {"type":"input_text","text":user_text},
+                    {"type":"input_image","image_url":url}
+                ]}
+            ],
+        )
+        txt = (resp.output_text or "").strip()
+        data = find_json_block(txt) or {}
+        ok = bool(data.get("ok"))
+        reason = (data.get("reason") or "")[:200]
+        return {"ok": ok, "reason": reason}
+    except Exception:
+        return {"ok": False, "reason": "validator_error"}
 
-def agent3_finalize(history: List[Dict[str, str]], slots: Dict[str, Any]) -> Dict[str, Any]:
-    c = client()
-    convo = []
-    for m in history[-24:]:
-        prefix = "Q: " if m["role"]=="assistant" else "A: "
-        convo.append(prefix + m["content"])
-    transcript = "\n".join(convo)
-    slot_lines = []
-    for sid in ["S1","S2","S3","S4"]:
-        s = slots.get(sid, {})
-        lab = (s.get("label") or "").strip()
-        img = (s.get("image_url") or "").strip()
-        if lab:
-            slot_lines.append(f"{sid}: {lab} | image={img or 'n/a'}")
-    user_payload = {"transcript": transcript, "slots": slot_lines}
-
-    resp = c.responses.create(
-        model=MODEL,
-        text={
-            "verbosity": "low",
-            "format": {
-                "type": "json_schema",
-                "name": "expert_card",
-                "schema": EXPERT_CARD_SCHEMA,
-                "strict": True
-            }
-        },
-        instructions=SYSTEM_FINALIZER,
-        input=[{"role":"user","content":[{"type":"input_text","text": json.dumps(user_payload, ensure_ascii=False)}]}],
-    )
-    return safe_json(_resp_text(resp))
-
-# -------------------------
-# Streamlit UI + Orchestration
-# -------------------------
-st.set_page_config(page_title=APP_TITLE, page_icon="🟡", layout="wide")
-st.title(APP_TITLE)
-st.caption("Agent-1 (streamed), Agent-2 (validator via image+json_schema), Agent-3 (finalizer via json_schema).")
-
-# Session state
-if "started" not in st.session_state:
-    st.session_state.started = False
-if "mode" not in st.session_state:
-    st.session_state.mode = "Professional"
-if "history" not in st.session_state:
-    st.session_state.history: List[Dict[str,str]] = []
-if "slots" not in st.session_state:
-    st.session_state.slots: Dict[str,Dict[str,Any]] = {}
-if "final_data" not in st.session_state:
-    st.session_state.final_data: Dict[str,Any] = {}
-
-# Start gate
-st.info("Klicke **Start**, um das Interview zu beginnen. Bis dahin werden **keine** Modell-Aufrufe ausgeführt.")
-c1, c2 = st.columns([1,5])
-with c1:
-    if st.button("▶️ Start", disabled=st.session_state.started):
-        st.session_state.started = True
-        st.rerun()
-
-if not st.session_state.started:
-    st.stop()
-
-# Mode selection
-st.session_state.mode = st.radio(
-    "Interview focus",
-    ["Professional", "General / Lifescope"],
-    index=0,
-    horizontal=True
-)
-
-# Render slots + history
-render_slots(st.session_state.slots)
-for m in st.session_state.history:
-    with st.chat_message(m["role"]):
-        st.write(m["content"])
-
-# First opener (once, after Start)
-if not st.session_state.history:
-    with st.chat_message("assistant"):
-        opener = agent1_chat_stream([], st.session_state.mode, "No items yet.")
-    st.session_state.history.append({"role":"assistant", "content": opener if opener else "What’s one book, podcast, person, tool, or film that truly changed how you work — and how?"})
-    st.rerun()
-
-# Input
-user_text = st.chat_input("Your turn…")
-if user_text:
-    st.session_state.history.append({"role":"user","content": user_text})
-
-    # PLAN searches (structured)
-    last_q = ""
-    for m in reversed(st.session_state.history[:-1]):
-        if m["role"] == "assistant":
-            last_q = m["content"]; break
-    known_labels = [v.get("label","") for v in st.session_state.slots.values() if v.get("label")]
-    plan = agent1_plan_searches(last_q, user_text, known_labels)
-
-    planned = plan.get("planned_searches") or []
-    # take at most one planned search per turn
-    if planned:
-        s0 = planned[0]
-        query = s0.get("search_query","").strip()
-        entity_type = s0.get("entity_type","")
-        entity_name = s0.get("entity_name","")
-        artifact = s0.get("artifact","")
-        imgs = google_image_search(query, num=6)
-        # validate up to 3 unique
-        uniq = []
-        seen = set()
-        for it in imgs:
-            u = (it.get("url") or "").strip()
-            if u and u not in seen:
-                seen.add(u); uniq.append(it)
-            if len(uniq) >= 3: break
-        ok_url = ""; reason = ""
-        for it in uniq:
-            v = agent2_validate_image(
-                image_url=it["url"],
-                entity_type=entity_type,
-                entity_name=entity_name,
-                artifact=artifact,
-                q_text=last_q,
-                a_text=user_text
-            )
-            if v.get("ok"):
-                ok_url = it["url"]; reason = v.get("reason",""); break
-        if ok_url:
-            sid = next_free_slot(st.session_state.slots)
-            if sid:
-                label_hint = {
-                    "book":"Must-Read", "podcast":"Podcast", "person":"Role Model",
-                    "tool":"Go-to Tool", "film":"Influence"
-                }.get(entity_type, "Item")
-                st.session_state.slots[sid] = {
-                    "label": f"{label_hint} — {entity_name}",
-                    "image_url": ok_url,
-                    "meta": {"type": entity_type, "artifact": artifact, "cluster_id": s0.get("cluster_id","")}
+# ----------------------------
+# Agent 1 — Run with Structured Outputs
+# ----------------------------
+AGENT1_SCHEMA = {
+    "name": "Agent1Turn",
+    "schema": {
+        "type": "object",
+        "properties": {
+            "assistant_message": {"type": "string"},
+            "search_calls": {
+                "type": "array",
+                "items": {
+                    "type": "object",
+                    "properties": {
+                        "entity_type": {"type":"string", "enum":["person","book","podcast","tool","film"]},
+                        "entity_name": {"type":"string"},
+                        "artifact": {"type":"string", "enum":["portrait","book_cover","podcast_cover","tool_logo","film_poster"]},
+                        "search_query": {"type":"string"},
+                        "cluster_id": {"type":"string"}
+                    },
+                    "required": ["entity_type","entity_name","artifact","search_query","cluster_id"],
+                    "additionalProperties": False
                 }
+            },
+            "handoff": {"type":"boolean", "default": False}
+        },
+        "required": ["assistant_message"],
+        "additionalProperties": False
+    },
+    "strict": True
+}
 
-    # Next assistant message (stream)
-    slot_summary = ", ".join([s.get("label","") for s in st.session_state.slots.values() if s.get("label")]) or "none yet"
-    with st.chat_message("assistant"):
-        nxt = agent1_chat_stream(st.session_state.history, st.session_state.mode, slot_summary)
-    if not nxt:
-        nxt = (plan.get("assistant_message","") or "").strip()
-    if nxt:
-        st.session_state.history.append({"role":"assistant","content": nxt})
-        # Finalize on explicit handoff
-        low = nxt.lower()
-        if any(p in low for p in HANDOFF_PHRASES):
-            data = agent3_finalize(st.session_state.history, st.session_state.slots)
-            st.session_state.final_data = data or {}
+def run_agent1_plan(client: OpenAI, thread_id: str, a1_id: str) -> Dict[str, Any]:
+    run = client.runs.create(
+        thread_id=thread_id,
+        assistant_id=a1_id,
+        response_format={"type":"json_schema","json_schema": AGENT1_SCHEMA},
+        tool_choice="none"
+    )
+    res = poll_run(client, thread_id, run.id)
+    # Fetch latest message from A1; content will be the structured JSON (as text)
+    msgs = list_messages(client, thread_id, limit=10)
+    plan = {"assistant_message":"", "search_calls": [], "handoff": False}
+    for m in msgs:
+        if m.role == "assistant" and getattr(m, "assistant_id", None) == a1_id:
+            text_parts = [p.text.value for p in m.content if getattr(p, "type", None) == "text"]
+            if not text_parts: 
+                continue
+            data = find_json_block("\n".join(text_parts))
+            if isinstance(data, dict) and "assistant_message" in data:
+                plan = data
+                break
+    return plan
 
-    st.rerun()
+# ----------------------------
+# Agent 2 — Run with tools + submit_tool_outputs
+# ----------------------------
+def run_agent2_task(
+    client: OpenAI,
+    thread_id: str,
+    a2_id: str,
+    task: Dict[str, Any]
+) -> Optional[Dict[str, Any]]:
+    # Post a task message to the thread (in-band)
+    add_user_message(client, thread_id, "AGENT2_TASK " + json.dumps(task, ensure_ascii=False))
 
-# Final card render + export
-if st.session_state.final_data:
-    st.subheader("Your Expert Card")
-    lines = st.session_state.final_data.get("lines") or []
-    html = st.session_state.final_data.get("html") or ""
-    order = ["S1","S2","S3","S4"]
-    for i, sid in enumerate(order):
-        s = st.session_state.slots.get(sid, {})
-        title = (s.get("label") or sid).split("—")[-1].strip()
-        text = lines[i] if i < len(lines) else ""
-        img = (s.get("image_url") or "").strip()
-        col_text, col_img = st.columns([3,2], vertical_alignment="center")
-        with col_text:
-            st.markdown(f"**{title}**")
-            st.write(text)
-        with col_img:
+    run = client.runs.create(thread_id=thread_id, assistant_id=a2_id, tool_choice="auto")
+    # Tool loop
+    t0 = time.time()
+    while True:
+        r = client.runs.retrieve(thread_id=thread_id, run_id=run.id)
+        status = r.status
+        if status == "requires_action":
+            calls = r.required_action.submit_tool_outputs.tool_calls
+            tool_outputs = []
+            for c in calls:
+                name = c.function.name
+                args = json.loads(c.function.arguments or "{}")
+                if name == "image_search":
+                    query = args.get("query","")
+                    k = int(args.get("max_results", 6))
+                    items = google_image_search(query, max_results=k)
+                    output = json.dumps(items, ensure_ascii=False)
+                    tool_outputs.append({"tool_call_id": c.id, "output": output})
+                elif name == "vision_validate":
+                    url = args.get("url","")
+                    it = args.get("item_type","")
+                    nm = args.get("item_name","")
+                    art = args.get("artifact","")
+                    verdict = tool_vision_validate(client, url, it, nm, art)
+                    output = json.dumps(verdict, ensure_ascii=False)
+                    tool_outputs.append({"tool_call_id": c.id, "output": output})
+                else:
+                    tool_outputs.append({"tool_call_id": c.id, "output": json.dumps({"error":"unknown_tool"}, ensure_ascii=False)})
+            client.runs.submit_tool_outputs(thread_id=thread_id, run_id=run.id, tool_outputs=tool_outputs)
+        elif status in ("queued", "in_progress"):
+            if time.time() - t0 > MAX_POLL_SECONDS:
+                break
+            time.sleep(0.7)
+        else:
+            break
+
+    # Parse Agent2 result (latest assistant message from A2 starting with AGENT2_RESULT)
+    msgs = list_messages(client, thread_id, limit=20)
+    for m in msgs:
+        if m.role == "assistant" and getattr(m, "assistant_id", None) == a2_id:
+            parts = [p.text.value for p in m.content if getattr(p, "type", None) == "text"]
+            joined = "\n".join(parts)
+            for line in joined.splitlines():
+                line = line.strip()
+                if line.startswith("AGENT2_RESULT"):
+                    data = find_json_block(line)
+                    if isinstance(data, dict) and data.get("status"):
+                        return data
+    return None
+
+# ----------------------------
+# Agent 3 — Finalize (returns 4 bullet lines as text)
+# ----------------------------
+def run_agent3_finalize(client: OpenAI, thread_id: str, a3_id: str) -> str:
+    run = client.runs.create(thread_id=thread_id, assistant_id=a3_id, tool_choice="none")
+    _ = poll_run(client, thread_id, run.id)
+    # Read last A3 message
+    msgs = list_messages(client, thread_id, limit=10)
+    for m in msgs:
+        if m.role == "assistant" and getattr(m, "assistant_id", None) == a3_id:
+            parts = [p.text.value for p in m.content if getattr(p, "type", None) == "text"]
+            return "\n".join(parts).strip()
+    return ""
+
+# ----------------------------
+# UI helpers (Slots)
+# ----------------------------
+def get_seen_items_from_thread(client: OpenAI, thread_id: str) -> Dict[str, Dict[str, Any]]:
+    """Scan all AGENT2_RESULT lines in thread to reconstruct items dict by key+artifact."""
+    seen: Dict[str, Dict[str, Any]] = {}
+    msgs = list_messages(client, thread_id, limit=100)
+    for m in msgs:
+        parts = []
+        for c in m.content:
+            if getattr(c, "type", None) == "text":
+                parts.append(c.text.value)
+        joined = "\n".join(parts)
+        for line in joined.splitlines():
+            if not line.startswith("AGENT2_RESULT"):
+                continue
+            data = find_json_block(line)
+            if not isinstance(data, dict): 
+                continue
+            key = data.get("key","")
+            artifact = data.get("artifact","")
+            if data.get("status") == "ok" and key and artifact:
+                seen_key = f"{key}||{artifact}"
+                seen[seen_key] = data
+    return seen
+
+def render_progress(slots_count: int):
+    st.progress(min(1.0, slots_count / 4), text=f"Progress: {slots_count}/4")
+
+def render_slots(seen: Dict[str, Dict[str, Any]]):
+    # Stable order by first appearance key
+    keys = list(seen.keys())[:4]
+    cols = st.columns(4)
+    for idx, k in enumerate(keys):
+        with cols[idx]:
+            item = seen[k]
+            st.markdown(f"**S{idx+1} · {item.get('label','')}**")
+            img = item.get("best_image_url","")
             if img:
-                st.image(img, use_column_width=True)
+                st.image(img, caption=item.get("source_url",""), use_container_width=True)
             else:
-                st.caption("(no image)")
-    st.download_button("⬇️ Export HTML", data=html.encode("utf-8"), file_name="expert-card.html", mime="text/html")
+                st.caption("—")
 
-# Footer actions
-cA, cB = st.columns(2)
-with cA:
-    if st.button("🔄 Restart"):
-        for k in list(st.session_state.keys()):
-            del st.session_state[k]
+def extract_four_lines(text: str) -> List[str]:
+    lines = []
+    for ln in text.splitlines():
+        s = ln.strip()
+        if not s: continue
+        if s.startswith("- "):
+            lines.append(s[2:].strip())
+        elif s.lower().startswith("- label:"):
+            lines.append(s.split(":",1)[-1].strip())
+    return lines[:4]
+
+def build_export_html(lines: List[str], seen: Dict[str, Dict[str, Any]]) -> str:
+    html_items = []
+    # Pair first four seen items with lines
+    keys = list(seen.keys())[:4]
+    for idx in range(min(4, len(lines))):
+        title = seen.get(keys[idx], {}).get("label","Item")
+        img = seen.get(keys[idx], {}).get("best_image_url","")
+        body = lines[idx]
+        html_items.append((title, body, img))
+
+    sections = []
+    for title, body, img in html_items:
+        img_tag = f'<img src="{img}" alt="{title}" style="max-width:100%;height:auto;border-radius:12px;border:1px solid rgba(0,0,0,0.06);object-fit:contain;" />' if img else '<div style="color:#999;font-size:13px;">(no image)</div>'
+        sections.append(f"""
+        <section style="display:flex;gap:20px;align-items:flex-start;justify-content:space-between;margin:0 0 28px 0;flex-wrap:wrap;">
+            <div style="flex: 1 1 56%;min-width:260px;">
+                <h2 style="margin:0 0 8px 0;font-size:20px;">{title}</h2>
+                <p style="margin:0;font-size:16px;">{body}</p>
+            </div>
+            <div style="flex: 1 1 38%;min-width:220px;display:flex;justify-content:center;">{img_tag}</div>
+        </section>
+        """)
+    return f"""<!doctype html>
+<html><head><meta charset="utf-8"/><title>Expert Card</title></head>
+<body style="margin:0;padding:24px;background:#fff;color:#111;font-family:-apple-system,BlinkMacSystemFont,Segoe UI,Roboto,Helvetica,Arial,sans-serif;line-height:1.5;">
+  <div style="max-width:900px;margin:0 auto;">
+    <h1 style="margin:0 0 16px 0;font-size:28px;">Expert Card</h1>
+    <div style="font-size:14px;color:#555;margin:0 0 24px 0;">Generated from interview notes.</div>
+    {''.join(sections)}
+  </div>
+</body></html>"""
+
+# ----------------------------
+# App Main
+# ----------------------------
+def main():
+    # Start-Gate
+    st.info("Klicke **Start**, um das Interview zu beginnen. Bis dahin werden **keine** Modell-Aufrufe ausgeführt.")
+    started = st.session_state.get("started", False)
+    c1, c2 = st.columns([1,5])
+    with c1:
+        if st.button("▶️ Start"):
+            st.session_state.started = True
+            started = True
+    if not started:
+        st.stop()
+
+    # Mode (nur UI-Hinweis für A1; Anpassung kannst du später in den Prompts verankern)
+    mode = st.radio("Interview focus", ["Professional", "General / Lifescope"], horizontal=True)
+    st.session_state["mode"] = mode
+
+    client = get_client()
+    a1_id, a2_id, a3_id = ensure_assistants(client)
+    thread_id = ensure_thread(client)
+
+    # On first start → seed with an empty user cue to trigger opener
+    if not st.session_state.get("seeded"):
+        add_user_message(client, thread_id, "[[START]]")
+        st.session_state.seeded = True
+        # Immediately ask A1 for the first turn
+        plan = run_agent1_plan(client, thread_id, a1_id)
+        st.session_state.last_plan = plan
+
+        # If A1 already planned a search, run A2 now
+        calls = plan.get("search_calls") or []
+        if calls:
+            task = calls[0]
+            _ = run_agent2_task(client, thread_id, a2_id, task)
+
+    # Read state from thread and render
+    seen = get_seen_items_from_thread(client, thread_id)
+    render_progress(len(seen))
+    render_slots(seen)
+
+    # Render visible chat: show last 12 messages from A1 and user
+    msgs = list_messages(client, thread_id, limit=50)
+    for m in msgs:
+        parts = [p.text.value for p in m.content if getattr(p, "type", None) == "text"]
+        if not parts: continue
+        text = "\n".join(parts).strip()
+        if m.role == "user":
+            # Skip internal signals to keep UI clean
+            if text.startswith("AGENT2_TASK") or text.startswith("[[START]]"):
+                continue
+            with st.chat_message("user"):
+                st.markdown(text)
+        elif m.role == "assistant" and getattr(m, "assistant_id", None) == a1_id:
+            # A1 messages are structured JSON; show assistant_message
+            data = find_json_block(text)
+            visible = ""
+            if isinstance(data, dict) and "assistant_message" in data:
+                visible = data["assistant_message"]
+            else:
+                visible = text
+            with st.chat_message("assistant"):
+                st.markdown(visible)
+
+    # Final card (if already produced)
+    if st.session_state.get("final_text"):
+        st.subheader("Your Expert Card")
+        lines = extract_four_lines(st.session_state["final_text"])
+        # Simple render: pair first 4 seen items with lines
+        cols = st.columns(2)
+        for idx in range(min(4, len(lines))):
+            with cols[idx % 2]:
+                st.markdown(f"**{list(seen.values())[idx].get('label','Item')}**")
+                st.write(lines[idx])
+                img = list(seen.values())[idx].get("best_image_url","")
+                if img:
+                    st.image(img, use_container_width=True)
+
+        export_html = build_export_html(lines, seen)
+        st.download_button("⬇️ Export HTML", data=export_html.encode("utf-8"),
+                           file_name="expert-card.html", mime="text/html")
+
+    # Chat input
+    user_text = st.chat_input("Your turn…")
+    if user_text:
+        add_user_message(client, thread_id, user_text)
+
+        # Agent 1 turn → plan (assistant message + optional search)
+        plan = run_agent1_plan(client, thread_id, a1_id)
+        st.session_state.last_plan = plan
+
+        # Optional search (max 1 per turn)
+        calls = plan.get("search_calls") or []
+        if calls:
+            task = calls[0]
+            # Dedupe in-band: if AGENT2_RESULT already has same key+artifact, skip
+            k = normalize_key(task["entity_type"], task["entity_name"])
+            art = task["artifact"]
+            seen_now = get_seen_items_from_thread(client, thread_id)
+            if f"{k}||{art}" not in seen_now:
+                _ = run_agent2_task(client, thread_id, a2_id, task)
+
+        # Finalize?
+        if plan.get("handoff"):
+            final_text = run_agent3_finalize(client, thread_id, a3_id)
+            st.session_state["final_text"] = final_text
+
         st.rerun()
-with cB:
-    st.caption("Built with OpenAI Responses API (Structured Outputs, streaming).")
+
+    # Manual actions
+    cA, cB = st.columns(2)
+    with cA:
+        if st.button("✨ Finalize (manual)"):
+            final_text = run_agent3_finalize(client, thread_id, a3_id)
+            st.session_state["final_text"] = final_text
+            st.rerun()
+    with cB:
+        if st.button("🔄 Restart"):
+            for k in list(st.session_state.keys()):
+                del st.session_state[k]
+            st.rerun()
+
+if __name__ == "__main__":
+    main()
