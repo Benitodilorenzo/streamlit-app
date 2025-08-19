@@ -412,7 +412,7 @@ def orchestrator_turn(client: OpenAI, user_text: str, state_frame: Dict[str, Any
         model="gpt-5",
         reasoning={"effort": reasoning_effort},
         text={"verbosity": verbosity},
-        response_format={"type": "json_schema", "json_schema": ORCHESTRATOR_TURN_SCHEMA},
+        text={"format":{"type":"json_schema","json_schema": ORCHESTRATOR_TURN_SCHEMA, "strict": true}},
         input=[
             {"role": "system", "content": SYSTEM_AGENT1},
             {"role": "developer", "content": json.dumps({"state": state_frame})},
@@ -431,7 +431,7 @@ def orchestrator_turn(client: OpenAI, user_text: str, state_frame: Dict[str, Any
 def finalize_card(client: OpenAI, history: List[Dict[str, str]], state_frame: Dict[str, Any]) -> Dict[str, Any]:
     resp = client.responses.create(
         model="gpt-5-mini",
-        response_format={"type": "json_schema", "json_schema": EXPERT_CARD_SCHEMA},
+        text={"format":{"type":"json_schema","json_schema": EXPERT_CARD_SCHEMA, "strict": true}},
         input=[
             {"role": "system", "content": SYSTEM_FINALIZER},
             {"role": "developer", "content": json.dumps({"state": state_frame, "history": history})},
@@ -505,7 +505,7 @@ def main():
             for k in ["history", "state_frame", "card"]:
                 if k in st.session_state:
                     del st.session_state[k]
-            st.experimental_rerun()
+            st.rerun()
 
     # Conversation display
     for msg in st.session_state.history:
@@ -513,7 +513,14 @@ def main():
             st.markdown(msg["content"])
 
     # Input box
-    user_text = st.chat_input("Deine Antwort…")
+    # Ensure history has an opener from Agent 1 on first run
+if "history" not in st.session_state:
+    st.session_state.history = []
+if not st.session_state.history:
+    opener = "Was ist ein Buch, Podcast, eine Person, ein Tool oder ein Film, der dich zuletzt stark beeinflusst hat — und wie?"
+    st.session_state.history.append({"role": "assistant", "content": opener})
+
+user_text = st.chat_input("Deine Antwort…")
 
     # Finalize button
     colA, colB = st.columns([1,1])
