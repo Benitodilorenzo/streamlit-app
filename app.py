@@ -5,6 +5,11 @@
 # - Agent-1: Streaming, Slot-Summary, SYSTEM_SIGNAL-Reaktion, eindeutige Handoff-Phrasen.
 # - **NEU:** Start-Gate (▶️ Start), NO model calls before user click.
 # - **NEU:** Moduswahl NACH Start (Professional vs. General/Lifescope), Mode-Badge in UI, modusabhängige Opener-Hints.
+# - **NEU (dieser Commit):**
+#   * Alle Agenten auf den `responses`-Endpunkt umgestellt.
+#   * Agent 1 Streaming auf `responses.stream()` umgestellt.
+#   * Agent 2 Standardmodell auf `gpt-5-mini` geändert (Extraktion + Vision-Check).
+#   * Follow-up-Tracking (2er-Schranke) reaktiviert inkl. Enforcer-Systemsignal vor dem nächsten Agent-1-Turn.
 
 import os, json, time, uuid, random, traceback, requests, re
 from typing import List, Dict, Any, Optional, Callable
@@ -18,7 +23,7 @@ from requests.exceptions import HTTPError
 
 APP_TITLE = "🟡 Expert Card — GPT-5 (3 Agents · Google Image API · Async)"
 MODEL = os.getenv("OPENAI_GPT5_SNAPSHOT", "gpt-5-2025-08-07")
-AGENT2_MODEL = os.getenv("OPENAI_AGENT2_MODEL", "gpt-5-mini")  # günstig für Extraktion + Vision
+AGENT2_MODEL = os.getenv("OPENAI_AGENT2_MODEL", "gpt-5-mini")  # günstiger Extraktor + Vision-Validator
 MEDIA_DIR = os.path.join(os.getcwd(), "media")
 os.makedirs(MEDIA_DIR, exist_ok=True)
 
@@ -66,6 +71,34 @@ def client() -> OpenAI:
         raise RuntimeError("OPENAI_API_KEY missing")
     return OpenAI(api_key=key)
 
+# ---------- Helpers for Responses API
+def _resp_text(resp) -> str:
+    """Extract plain text from Responses API objects safely."""
+    txt = getattr(resp, "output_text", None)
+    if txt:
+        return txt.strip()
+    try:
+        outputs = getattr(resp, "output", None) or []
+        parts = []
+        for item in outputs:
+            if getattr(item, "type", None) == "message":
+                for c in getattr(item, "content", []) or []:
+                    if getattr(c, "type", None) in ("output_text", "text"):
+                        parts.append(getattr(c, "text", "") or "")
+        return "".join(parts).strip()
+    except Exception:
+        try:
+            outputs = resp.get("output", [])  # type: ignore
+            parts = []
+            for item in outputs:
+                if item.get("type") == "message":
+                    for c in item.get("content", []):
+                        if c.get("type") in ("output_text", "text"):
+                            parts.append(c.get("text",""))
+            return "".join(parts).strip()
+        except Exception:
+            return ""
+
 # ---------- Retry wrapper
 def call_with_retry(fn: Callable, *args, **kwargs):
     for attempt in range(OPENAI_MAX_RETRIES):
@@ -80,7 +113,7 @@ def call_with_retry(fn: Callable, *args, **kwargs):
             raise
         except Exception as e:
             msg = str(e).lower()
-            if "rate limit" in msg or "429" in msg:
+            if "rate limit" in msg or "429" in msg or "temporarily unavailable" in msg:
                 delay = OPENAI_BACKOFF_BASE ** attempt + random.uniform(0, 0.3)
                 time.sleep(delay)
                 continue
@@ -110,8 +143,10 @@ def init_state():
         "current_item_key": None,
         "done_keys": []
     })
-    st.session_state.setdefault("stop_signal", False)      # injiziert System-Signal an Agent 1
-    st.session_state.setdefault("followup_count", {})
+    st.session_state.setdefault("stop_signal", False)      # injiziert System-Signal an Agent 1 (Hard-Stop nach 6 Items)
+    st.session_state.setdefault("followup_count", {})      # pro Item-Key Anzahl Deepening-Follow-ups
+    st.session_state.setdefault("enforce_stop_deepening", False)  # Enforcer-Flag für 2er-Schranke
+
     # Hard-Stop-Planung nach 6 Items (mit Budget)
     st.session_state.setdefault("hard_stop_pending", False)
     st.session_state.setdefault("hard_stop_budget", 0)
@@ -217,6 +252,9 @@ def update_flow_with_detected(detected_key: Optional[str]):
     flow["current_item_key"] = detected_key
     st.session_state.flow = flow
 
+    # Reset Follow-up-Zähler für neues Item
+    st.session_state.followup_count[detected_key] = 0
+
     n = _count_items_from_flow()
     if n >= 6 and not st.session_state.get("hard_stop_pending"):
         st.session_state.hard_stop_pending = True
@@ -252,6 +290,14 @@ HARD_STOP_SYSTEM_MSG = (
     "OR “Perfect — I’ll now assemble your selected 4-point card.” "
     "OR “Great — I’ll now assemble your 4-point expert card with your chosen items.” "
     "Do not ask any new questions. Do not open new topics."
+)
+
+# System-Signal-Text für Deepening-Stop (2er-Schranke)
+STOP_DEEPENING_SYSTEM_MSG = (
+    "SYSTEM_SIGNAL: stop-deepening. You have reached the 2-follow-up limit for the current item. "
+    "Do NOT ask another deepening question about this same item. "
+    "Either pivot to a different public anchor (book/podcast/person/tool/film) "
+    "or briefly acknowledge/summarize in ≤1 sentence and move on."
 )
 
 # ---------- Agent 1 (Interview)
@@ -325,19 +371,10 @@ Privately, begin with a concise checklist (3–7 bullets). Keep it conceptual; d
 - Natural, concise (1–3 short sentences per turn), warm and specific; avoid filler.
 - One move per turn: clarify, deepen, pivot, or close.
 - If the user asks you something, answer in ≤1 sentence, then proceed.
-- Add a tone of genuine curiosity: use phrasing like *“That’s intriguing — can you tell me how it shaped your day-to-day?”* rather than abstract follow-ups.
-- Avoid sounding scripted: vary your rhythm between inviting curiosity, showing surprise, and gently steering.
 # Deepening and Pivoting
 - Deepen up to two turns when concrete: habits, decisions, before/after, trade-offs, in-the-wild examples.
 - Pivot if vague/repetitive or to maintain variety across life domains.
 - Avoid granular KPIs/metrics; keep follow-ups to 1–2 levels deep.
-- Example deepening moves:
-  - “What was the hardest part about adopting that habit — and what kept you going?”
-  - “If you hadn’t come across that book, how do you think your approach would be different today?”
-  - “You said this film stuck with you — what scene comes back to mind when you think of it?”
-- Example pivot moves:
-  - “That’s great — let’s switch gears: outside of work, who’s someone you keep learning from?”
-  - “You mentioned routines; can we jump to something more creative — a podcast, a film, or even a quirky ritual?”
 # Handling User Inputs
 - If a public reference appears, proceed (Agent 2 will handle lookup). Clarify only if ambiguity blocks progress.
 - If an item is private or not-findable, accept it as personal practice; then ask for a public stand-in (book/person/tool/podcast/film) that best represents this influence, and continue.
@@ -345,14 +382,9 @@ Privately, begin with a concise checklist (3–7 bullets). Keep it conceptual; d
 - Sensitive/emotional: acknowledge briefly, then steer to public anchors and lived practice.
 # Opening & Flow
 - Vary openers, e.g.:
-  - “Outside of work, what book, podcast, person, tool, or film most changed how you think — and how?”
-  - “In the last 12 months, what public influence reshaped your daily habits or decisions?”
-  - “If a friend wanted to ‘get’ how you approach life/learning, which public reference should they start with?”
-- Supplementary opener examples for more intimacy:
-  - “When you think of a real role model — who do you quietly try to emulate, and why?”
-  - “What’s the last small routine you borrowed from someone else that really stuck with you?”
-  - “Is there a podcast, article, or film that challenged a belief you once held — and shifted your view?”
-  - “Who’s someone you’ve never met, but who feels like a steady voice in the background of your life?”
+- “Outside of work, what book, podcast, person, tool, or film most changed how you think — and how?”
+- “In the last 12 months, what public influence reshaped your daily habits or decisions?”
+- “If a friend wanted to ‘get’ how you approach life/learning, which public reference should they start with?”
 - Do not repeat earlier opening phrasings within a session.
 # Stop Condition & Handoff
 - Target range: Capture 4–6 distinct public items or personal practices with public stand-ins where possible.
@@ -379,7 +411,6 @@ Confirm and hand off with:
 2) Choose one move: clarify, deepen, pivot, or close.
 3) Ask one focused question (optionally with brief synthesis).
 4) Continue until the stop conditions above are met; then close with the final handoff.
-
 """
 
 def get_agent1_system() -> str:
@@ -397,6 +428,11 @@ def agent1_next_question(history_snapshot):
     if not history_snapshot:
         msgs.append({"role": "system", "content": get_mode_opening_hint()})
 
+    # Enforcer: Stop-Deepening (2er-Schranke)
+    if st.session_state.get("enforce_stop_deepening"):
+        msgs.append({"role": "system", "content": STOP_DEEPENING_SYSTEM_MSG})
+        st.session_state.enforce_stop_deepening = False  # verbrauchen
+
     # Hard-Stop System-Signal injizieren?
     if st.session_state.get("stop_signal") and not st.session_state.get("hard_stop_signaled"):
         msgs.append({"role": "system", "content": HARD_STOP_SYSTEM_MSG})
@@ -410,17 +446,12 @@ def agent1_next_question(history_snapshot):
     short = history_snapshot[-6:] if len(history_snapshot) > 6 else history_snapshot
     msgs += short
 
-    # ---- Responses (non-streaming)
-    resp = call_with_retry(
-        client().responses.create,
-        model=MODEL,
-        input=msgs
-    )
-    return (resp.output_text or "").strip()
+    resp = call_with_retry(client().responses.create, model=MODEL, input=msgs)
+    return _resp_text(resp)
 
-# -------- Agent 1 — Streaming helper --------
+# -------- Agent 1 — Streaming helper (Responses.stream) --------
 def agent1_stream_question(history_snapshot: List[Dict[str, str]]) -> str:
-    """Streaming-fähige Version von Agent 1 (modusabhängig, Slot-Summary, Hard-Stop, Opener-Hint)."""
+    """Streaming-fähige Version von Agent 1 (modusabhängig, Slot-Summary, Hard-Stop, Opener-Hint) — Responses API."""
     msgs = [{"role": "system", "content": get_agent1_system()}]
 
     # Slot-Summary
@@ -430,6 +461,11 @@ def agent1_stream_question(history_snapshot: List[Dict[str, str]]) -> str:
     # Erster Turn? → Opener-Hint
     if not history_snapshot:
         msgs.append({"role": "system", "content": get_mode_opening_hint()})
+
+    # Enforcer: Stop-Deepening (2er-Schranke)
+    if st.session_state.get("enforce_stop_deepening"):
+        msgs.append({"role": "system", "content": STOP_DEEPENING_SYSTEM_MSG})
+        st.session_state.enforce_stop_deepening = False  # verbrauchen
 
     # Bei aktivem Hard-Stop jetzt Systemanweisung injizieren
     if st.session_state.get("stop_signal") and not st.session_state.get("hard_stop_signaled"):
@@ -444,48 +480,34 @@ def agent1_stream_question(history_snapshot: List[Dict[str, str]]) -> str:
     short = history_snapshot[-6:] if len(history_snapshot) > 6 else history_snapshot
     msgs += short
 
-    # --- Streaming über Responses
-    try:
-        stream = client().responses.stream(model=MODEL, input=msgs)
+    full_parts: List[str] = []
 
-        full_parts: List[str] = []
-
-        def token_gen():
-            for event in stream:
-                # text deltas
-                if event.type == "response.output_text.delta":
-                    delta = getattr(event, "delta", None)
-                    if delta:
-                        full_parts.append(delta)
-                        yield delta
-                # Fallback auf komplette Textstücke
-                elif event.type == "response.output_text.done":
-                    text_done = getattr(event, "text", "")
-                    if text_done:
-                        # (Optional) nichts yielden – schon per deltas gestreamt
-                        pass
-                elif event.type == "error":
-                    # Bei Stream-Error Ausgabe abbrechen
-                    break
-
-        with st.chat_message("assistant"):
-            st.write_stream(token_gen())
-
-        # Finales Response-Objekt (inkl. safety)
-        final = stream.get_final_response()
-        text = (final.output_text or "".join(full_parts)).strip()
-    except Exception as e:
+    def token_generator():
         try:
-            from openai import BadRequestError
+            with client().responses.stream(model=MODEL, input=msgs) as stream:
+                for event in stream:
+                    if getattr(event, "type", "") == "response.output_text.delta":
+                        delta = getattr(event, "delta", "")
+                        if delta:
+                            full_parts.append(delta)
+                            yield delta
+                final = stream.get_final_response()
+                if not full_parts:
+                    txt = _resp_text(final)
+                    if txt:
+                        full_parts.append(txt)
+                        yield txt
         except Exception:
-            BadRequestError = Exception
-        if isinstance(e, BadRequestError) or "must be verified to stream" in str(e).lower() or "unsupported_value" in str(e).lower():
             resp = call_with_retry(client().responses.create, model=MODEL, input=msgs)
-            text = (resp.output_text or "").strip()
-            with st.chat_message("assistant"):
-                st.markdown(text if text else "...")
-        else:
-            raise
+            txt = _resp_text(resp) or ""
+            if txt:
+                full_parts.append(txt)
+                yield txt
+
+    with st.chat_message("assistant"):
+        st.write_stream(token_generator())
+
+    text = "".join(full_parts).strip()
 
     # Post-Processing
     if text and not text.endswith("?"):
@@ -539,13 +561,13 @@ def agent2_extract_items(last_q: str, user_reply: str, seen_entities: List[str],
             client().responses.create,
             model=AGENT2_MODEL,
             input=[
-                {"role":"system","content": AGENT2_SYSTEM},
-                {"role":"user","content": json.dumps(payload, ensure_ascii=False)}
+                {"role": "system", "content": AGENT2_SYSTEM},
+                {"role": "user", "content": json.dumps(payload, ensure_ascii=False)}
             ]
         )
-        raw = (resp.output_text or "").strip()
-        debug_emit({"ev":"extract_raw", "preview": raw[:240]}, dbg)
-        data = parse_json_loose(raw)
+        raw = _resp_text(resp)
+        debug_emit({"ev":"extract_raw", "preview": (raw or "")[:240]}, dbg)
+        data = parse_json_loose(raw or "")
         if isinstance(data, dict):
             debug_emit({"ev":"extract_parsed", "detected": bool(data.get("detected")), "count": len(data.get("items") or [])}, dbg)
             return data
@@ -619,10 +641,6 @@ def validate_image_with_context(image_url: str, entity_type: str, entity_name: s
             f"Item name (context only, DO NOT IDENTIFY): {entity_name}\n"
             "Only check portrait criteria."
         )
-        user_content = [
-            {"type": "input_text", "text": user_text},
-            {"type": "input_image", "image_url": image_url}
-        ]
     else:
         sys = (
             "You are an image verifier. Respond with STRICT JSON like "
@@ -638,22 +656,21 @@ def validate_image_with_context(image_url: str, entity_type: str, entity_name: s
             f"Context A: {a_text[:500]}\n"
             "Does this image plausibly match the item?"
         )
-        user_content = [
-            {"type": "input_text", "text": user_text},
-            {"type": "input_image", "image_url": image_url}
-        ]
-
     try:
+        # Responses API: multimodal input (text + image)
         resp = call_with_retry(
             client().responses.create,
             model=AGENT2_MODEL,
             input=[
                 {"role": "system", "content": sys},
-                {"role": "user", "content": user_content}
+                {"role": "user", "content": [
+                    {"type": "input_text", "text": user_text},
+                    {"type": "input_image", "image_url": image_url}
+                ]}
             ]
         )
-        txt = (resp.output_text or "").strip()
-        data = parse_json_loose(txt)
+        txt = _resp_text(resp)
+        data = parse_json_loose(txt or "")
         ok = bool(data.get("ok")) if isinstance(data, dict) else False
         return {"ok": ok, "reason": (data.get("reason") if isinstance(data, dict) else "")[:200]}
     except Exception:
@@ -696,7 +713,7 @@ def agent3_finalize(history: List[Dict[str, str]], slots: Dict[str, Dict[str, An
         {"role": "user", "content": f"Transcript:\n{convo_text}\n\nSlots:\n{slots_text}"}
     ]
     resp = call_with_retry(client().responses.create, model=MODEL, input=msgs)
-    return (resp.output_text or "").strip()
+    return _resp_text(resp)
 
 # ---------- Orchestrator
 COOLDOWN_SECONDS = 600  # 10 Minuten
@@ -791,4 +808,300 @@ class Orchestrator:
                         debug_emit({"ev":"item_validate_ok", "key": key, "tries": tries}, dbg)
                         break
                     else:
-                        debug_emit({"_
+                        debug_emit({"ev":"item_validate_ko", "key": key, "tries": tries, "reason": v.get("reason","")[:160]}, dbg)
+
+                if not ok_url:
+                    self.cooldown[key] = now + COOLDOWN_SECONDS
+                    debug_emit({"ev":"item_no_valid_image", "key": key}, dbg)
+                    debug_emit({"ev":"item_set_cooldown", "key": key, "cooldown_s": COOLDOWN_SECONDS}, dbg)
+                    continue
+
+                label_hint = {
+                    "book": "Must-Read",
+                    "podcast": "Podcast",
+                    "person": "Role Model",
+                    "tool": "Go-to Tool",
+                    "film": "Influence",
+                }.get(etype, "Item")
+                label = f"{label_hint} — {ename}"
+
+                media = {
+                    "status": "found",
+                    "best_image_url": ok_url,
+                    "candidates": [{"url": ok_url, "page_url": imgs[0].get("page_url",""), "source": "google-cse", "confidence": 0.9, "reason": note}],
+                    "notes": note or "validated"
+                }
+
+                results.append({"status": "ok", "key": key, "label": label, "media": media})
+                debug_emit({"ev":"item_ready_for_slot", "key": key}, dbg)
+                processed += 1
+
+            return {"status": "batch", "items": results, "debug": dbg, "first_key_detected": first_key_detected}
+        except Exception as e:
+            debug_emit({"ev":"job_error", "error": str(e)}, dbg)
+            return {"status": "error", "error": str(e), "trace": traceback.format_exc()[:1200], "debug": dbg, "first_key_detected": first_key_detected}
+
+    def poll(self) -> List[str]:
+        updated, rm = [], []
+        for jid, (sid, fut) in list(self.jobs.items()):
+            if fut.done():
+                rm.append(jid)
+                try:
+                    res = fut.result()
+                except Exception as e:
+                    debug_emit({"ev":"poll_exception", "error": str(e)})
+                    continue
+
+                # 1) Follow-up-Zähler / Flow-Update anhand der ersten erkannten Item-Key (Pivot-Erkennung)
+                first_key = res.get("first_key_detected")
+                current_before = st.session_state.flow.get("current_item_key")
+
+                if first_key:
+                    # Flow ggf. piven
+                    update_flow_with_detected(first_key)
+
+                    # Follow-up zählen, wenn gleiches Item weiter vertieft
+                    if current_before and first_key == current_before:
+                        cnt = st.session_state.followup_count.get(first_key, 0) + 1
+                        st.session_state.followup_count[first_key] = cnt
+                        # Enforcer nach 2 Deepening-Follow-ups
+                        if cnt >= 2:
+                            st.session_state.enforce_stop_deepening = True
+                    else:
+                        # neues Item → Zähler resetten
+                        st.session_state.followup_count[first_key] = 0
+
+                # 2) Slots updaten, Seen markieren
+                if res.get("status") == "batch":
+                    for it in res.get("items", []):
+                        if it.get("status") == "ok":
+                            sid = next_free_slot()
+                            if sid:
+                                self.upsert(sid, it["label"], it["media"])
+                                key = it.get("key")
+                                if key and key not in self.seen:
+                                    self.seen.append(key)
+                                updated.append(sid)
+                            else:
+                                debug_emit({"ev":"slots_full"})
+        for jid in rm:
+            del self.jobs[jid]
+        return updated
+
+# ---------- Render
+def render_slots_summary():
+    slots = st.session_state.slots
+    filled = len([s for s in slots.values() if (s.get("label") or "").strip()])
+    st.progress(min(1.0, filled / 4), text=f"Progress: {filled}/4")
+
+def render_history():
+    for m in st.session_state.history:
+        with st.chat_message(m["role"]):
+            st.markdown(m["content"])
+
+def parse_final_lines(text: str) -> List[str]:
+    lines = []
+    for ln in text.splitlines():
+        ln = ln.strip()
+        if ln.startswith("- "):
+            lines.append(ln[2:].strip())
+        elif ln.lower().startswith("- label:"):
+            lines.append(ln.split(":", 1)[-1].strip())
+    return lines[:4]
+
+def render_final_card(final_text: str, slots: Dict[str, Dict[str, Any]]):
+    lines = parse_final_lines(final_text)
+    for idx, sid in enumerate(["S1", "S2", "S3", "S4"]):
+        if idx >= len(lines):
+            break
+        s = slots.get(sid)
+        txt = lines[idx]
+        img = (s.get("media", {}).get("best_image_url") or "") if s else ""
+        col_text, col_img = st.columns([3, 2], vertical_alignment="center")
+        with col_text:
+            st.markdown(f"**{s.get('label','').split('—')[-1].strip() if s else 'Item'}**")
+            st.write(txt)
+        with col_img:
+            if img:
+                st.markdown(
+                    f'''
+                    <div style="display:flex;justify-content:center;">
+                      <img src="{img}" alt="Expert Card item image"
+                           style="width:100%;max-width:320px;height:auto;
+                                  border-radius:12px;border:1px solid rgba(0,0,0,0.06);
+                                  object-fit:contain;" />
+                    </div>
+                    ''',
+                    unsafe_allow_html=True
+                )
+            else:
+                st.caption("(no image)")
+
+def build_export_html(final_text: str, slots: Dict[str, Dict[str, Any]]) -> str:
+    lines = parse_final_lines(final_text)
+    items = []
+    for idx, sid in enumerate(["S1","S2","S3","S4"]):
+        if idx >= len(lines): break
+        s = slots.get(sid, {})
+        label = (s.get("label","") or "").split("—")[-1].strip() or f"Item {idx+1}"
+        body  = lines[idx]
+        img   = (s.get("media",{}).get("best_image_url") or "").strip()
+        items.append({"title": label, "body": body, "img": img})
+
+    html = f"""<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8"/>
+  <title>Expert Card</title>
+</head>
+<body style="margin:0;padding:24px;background:#ffffff;color:#111111;font-family:-apple-system,BlinkMacSystemFont,Segoe UI,Roboto,Helvetica,Arial,sans-serif;line-height:1.5;">
+  <div style="max-width:900px;margin:0 auto;">
+    <h1 style="margin:0 0 16px 0;font-size:28px;">Expert Card</h1>
+    <div style="font-size:14px;color:#555;margin:0 0 24px 0;">Generated from interview notes.</div>
+
+    {"".join([
+      f'''
+      <section style="display:flex;gap:20px;align-items:flex-start;justify-content:space-between;margin:0 0 28px 0;flex-wrap:wrap;">
+        <div style="flex: 1 1 56%;min-width:260px;">
+          <h2 style="margin:0 0 8px 0;font-size:20px;">{item["title"]}</h2>
+          <p style="margin:0;font-size:16px;">{item["body"]}</p>
+        </div>
+        <div style="flex: 1 1 38%;min-width:220px;display:flex;justify-content:center;">
+          { (f'<img src="{item["img"]}" alt="{item["title"]}" style="max-width:100%;height:auto;border-radius:12px;border:1px solid rgba(0,0,0,0.06);object-fit:contain;" />') if item["img"] else '<div style="color:#999;font-size:13px;">(no image)</div>' }
+        </div>
+      </section>
+      '''
+      for item in items
+    ])}
+  </div>
+</body>
+</html>"""
+    return html
+
+
+# ---------- Main
+st.set_page_config(page_title=APP_TITLE, page_icon="🟡", layout="wide")
+st.title(APP_TITLE)
+st.caption("Agent 2: Google Image API (+Vision-Check) • Slots only with valid image")
+
+# ---- Init state
+init_state()
+
+# ---- START-GATE (keine Modellaufrufe vor Klick)
+st.info("Klicke **Start**, um das Interview zu beginnen. Bis dahin werden **keine** Modell-Aufrufe ausgeführt.")
+start_col1, start_col2 = st.columns([1, 5])
+with start_col1:
+    if st.button("▶️ Start"):
+        st.session_state.user_started = True
+        st.rerun()
+
+if not st.session_state.user_started:
+    st.stop()  # Harte Bremse: beendet Run ohne Modelle / ohne Moduswahl
+
+# --------- Mode selection (NACH Start, VOR Chat-UI) ----------
+MODE_OPTIONS = ["Professional", "General / Lifescope"]
+mode = st.radio(
+    "Interview focus",
+    MODE_OPTIONS,
+    index=MODE_OPTIONS.index(st.session_state.get("agent1_mode", "Professional")),
+    horizontal=True,
+    help="Choose the style and breadth of Agent 1's conversation."
+)
+st.session_state["agent1_mode"] = mode
+
+# Mode-Badge
+badge_bg = "#E6F0FF" if "Professional" in mode else "#E9F9EE"
+badge_fg = "#0A58CA" if "Professional" in mode else "#157347"
+st.markdown(
+    f"""
+    <div style="margin:8px 0 4px 0;">
+      <span style="
+        display:inline-block;
+        padding:4px 10px;
+        border-radius:999px;
+        background:{badge_bg};
+        color:{badge_fg};
+        font-weight:600;
+        font-size:12px;
+        border:1px solid rgba(0,0,0,0.08);
+      ">Mode: {mode}</span>
+    </div>
+    """,
+    unsafe_allow_html=True
+)
+
+# ---- Orchestrator
+orch = Orchestrator()
+
+# ---- First opener from Agent 1 (nur nach Start, wenn History leer)
+if not st.session_state.history:
+    opener = agent1_stream_question([])  # Prompt ist modusabhängig; Opener-Hint aktiv
+    st.session_state.history.append({"role": "assistant", "content": opener})
+    st.rerun()
+
+# ---- Agent 2 Poll (laufend)
+orch.poll()
+
+# ---- UI
+render_slots_summary()
+render_history()
+
+# ---- FINAL CARD
+if st.session_state.final_text:
+    st.subheader("Your Expert Card")
+    render_final_card(st.session_state.final_text, st.session_state.slots)
+
+    export_html = build_export_html(st.session_state.final_text, st.session_state.slots)
+    st.download_button(
+        "⬇️ Export HTML",
+        data=export_html.encode("utf-8"),
+        file_name="expert-card.html",
+        mime="text/html"
+    )
+
+# ---- Input handling
+user_text = st.chat_input("Your turn…")
+if user_text:
+    st.session_state.history.append({"role": "user", "content": user_text})
+
+    # Agent 2 beobachten lassen (asynchron)
+    last_q = ""
+    for m in reversed(st.session_state.history[:-1]):
+        if m["role"] == "assistant":
+            last_q = m["content"]
+            break
+    orch.schedule_watch(last_q, user_text)
+
+    # *** WICHTIG: Sofortiges Polling vor dem nächsten Agent-1-Call,
+    # damit Enforcer/Follow-up-Zähler rechtzeitig injiziert werden. ***
+    orch.poll()
+
+    # Agent 1 — Streaming der nächsten Frage (Responses)
+    nxt = agent1_stream_question(st.session_state.history)
+    st.session_state.history.append({"role": "assistant", "content": nxt})
+
+    # Finalize ONLY when explicit handoff phrase detected
+    low = nxt.lower()
+    if any(phrase in low for phrase in HANDOFF_PHRASES):
+        st.session_state.final_text = agent3_finalize(st.session_state.history, st.session_state.slots)
+
+    st.rerun()
+
+# ---- Actions
+c1, c2 = st.columns(2)
+with c1:
+    if st.button("✨ Finalize (manual)"):
+        st.session_state.final_text = agent3_finalize(st.session_state.history, st.session_state.slots)
+        st.success("Finalized.")
+        st.rerun()
+with c2:
+    if st.button("🔄 Restart"):
+        try:
+            st.session_state.executor.shutdown(cancel_futures=True)
+        except Exception:
+            pass
+        for k in list(st.session_state.keys()):
+            del st.session_state[k]
+        # Sicherstellen, dass beim Neustart wieder das Start-Gate aktiv ist
+        st.session_state["user_started"] = False
+        st.rerun()
