@@ -10,6 +10,9 @@
 #   * Agent 1 Streaming auf `responses.stream()` umgestellt.
 #   * Agent 2 Standardmodell auf `gpt-5-mini` geändert (Extraktion + Vision-Check).
 #   * Follow-up-Tracking (2er-Schranke) reaktiviert inkl. Enforcer-Systemsignal vor dem nächsten Agent-1-Turn.
+#   * **NEU:** Diakritikfeste Normalisierung, Agent-1-Suchplanung (artifact-aware), Korrektur-Parsing,
+#             Orchestrator verarbeitet `pending_searches` bevorzugt, Agent 2 nur Validator (artefakt-sensitiv),
+#             Slot-Dedupe (key+artifact) + Cluster-Index.
 
 import os, json, time, uuid, random, traceback, requests, re
 from typing import List, Dict, Any, Optional, Callable
@@ -20,6 +23,8 @@ from PIL import Image, ImageDraw, ImageFont
 from openai import OpenAI
 from openai import APIStatusError
 from requests.exceptions import HTTPError
+
+import unicodedata, re as _re  # ← NEU: für diakritikfeste Normalisierung
 
 APP_TITLE = "🟡 Expert Card — GPT-5 (3 Agents · Google Image API · Async)"
 MODEL = os.getenv("OPENAI_GPT5_SNAPSHOT", "gpt-5-2025-08-07")
@@ -152,6 +157,10 @@ def init_state():
     st.session_state.setdefault("hard_stop_budget", 0)
     st.session_state.setdefault("hard_stop_signaled", False)
 
+    # ---- NEU: Agent-1-Suchplanung und Cluster-Index
+    st.session_state.setdefault("pending_searches", [])  # Agent 1 plant hier Suchaufträge (artefakt-spezifisch)
+    st.session_state.setdefault("clusters", {})          # cluster_id -> {"title": "...", "items": [slot_ids]}
+
 # ---------- Debug helpers (deaktiviert)
 def debug_emit(event: Dict[str, Any], buffer: Optional[list] = None):
     if not DEBUG_ENABLED:
@@ -171,22 +180,19 @@ def debug_emit(event: Dict[str, Any], buffer: Optional[list] = None):
 def debug_log_agent2(event: Dict[str, Any]):
     debug_emit(event, buffer=None)
 
-# ---------- Utils
-def parse_json_loose(text: str) -> Optional[dict]:
-    if not text:
-        return None
-    try:
-        return json.loads(text)
-    except Exception:
-        pass
-    a, b = text.find("{"), text.rfind("}")
-    if a != -1 and b != -1 and b > a:
-        frag = text[a:b+1]
-        try:
-            return json.loads(frag)
-        except Exception:
-            return None
-    return None
+# ---------- Utils (diakritikfeste Normalisierung)
+def _strip_accents(s: str) -> str:
+    if not s: return ""
+    nf = unicodedata.normalize("NFD", s)
+    return "".join(ch for ch in nf if unicodedata.category(ch) != "Mn")
+
+def normalize_key(etype: str, ename: str) -> str:
+    et = (etype or "").lower().strip()
+    nm = (ename or "").lower().strip()
+    nm = _strip_accents(nm)  # Akzente/Diakritika entfernen
+    nm = _re.sub(r"[^a-z0-9\s\+\-&_/\.]", " ", nm)
+    nm = _re.sub(r"\s+", " ", nm).strip()
+    return f"{et}|{nm}"
 
 def placeholder_image(text: str, name: str) -> str:
     img = Image.new("RGB", (640, 640), (24, 31, 55))
@@ -214,93 +220,343 @@ def next_free_slot() -> Optional[str]:
             return sid
     return None
 
-def normalize_key(etype: str, ename: str) -> str:
-    return f"{(etype or '').lower().strip()}|{(ename or '').lower().strip()}"
+def parse_json_loose(text: str) -> Optional[dict]:
+    if not text:
+        return None
+    try:
+        return json.loads(text)
+    except Exception:
+        pass
+    a, b = text.find("{"), text.rfind("}")
+    if a != -1 and b != -1 and b > a:
+        frag = text[a:b+1]
+        try:
+            return json.loads(frag)
+        except Exception:
+            return None
+    return None
 
-def _count_items_from_flow() -> int:
-    flow = st.session_state.flow
-    done_keys: List[str] = flow.get("done_keys", [])
-    current = flow.get("current_item_key")
-    return len(done_keys) + (1 if current else 0)
+# ---------- Agent 1 – Suchplanung & Korrektur-Parsing (NEU)
+def agent1_plan_searches(last_q: str, user_reply: str, slots: Dict[str, Any]) -> List[Dict[str, Any]]:
+    """
+    Lässt Agent 1 auf Basis von Frage+Antwort und vorhandenen Slots 0..N konkrete Suchaufträge planen:
+    - entity_type: person|book|podcast|tool|film
+    - entity_name: "Gabor Maté" / "In the Realm of Hungry Ghosts"
+    - artifact: "portrait"|"book_cover"|"podcast_cover"|"tool_logo"|"film_poster"
+    - search_query: z. B. 'In the Realm of Hungry Ghosts by Gabor Maté book cover'
+    - cluster_id: stabile ID zur Gruppierung (z. B. 'gabor-mate')
+    """
+    sys = (
+        "You are Agent 1. Given assistant_question + user_reply and current slots, "
+        "plan specific searches for public items. For each item, pick the correct artifact type "
+        "(portrait, book_cover, podcast_cover, tool_logo, film_poster) and produce a precise search_query "
+        "that disambiguates by author/host/creator when known. Group related items with a stable cluster_id "
+        "(e.g., 'gabor-mate' for the person and authored books). Output ONLY strict JSON:\n"
+        "{ \"searches\": [ {\"entity_type\":\"...\",\"entity_name\":\"...\",\"artifact\":\"...\",\"search_query\":\"...\",\"cluster_id\":\"...\"}, ... ] }"
+    )
+    payload = {
+        "assistant_question": last_q or "",
+        "user_reply": user_reply or "",
+        "known_slots": [s.get("label","") for s in slots.values()]
+    }
+    try:
+        resp = call_with_retry(client().responses.create, model=MODEL, input=[
+            {"role":"system","content":sys},
+            {"role":"user","content":json.dumps(payload, ensure_ascii=False)}
+        ])
+        data = parse_json_loose(_resp_text(resp) or "")
+        searches = data.get("searches", []) if isinstance(data, dict) else []
+        out = []
+        for s in searches:
+            et = (s.get("entity_type") or "").lower().strip()
+            nm = (s.get("entity_name") or "").strip()
+            ar = (s.get("artifact") or "").lower().strip()
+            q  = (s.get("search_query") or "").strip()
+            cl = (s.get("cluster_id") or "").strip() or _strip_accents(nm.lower()).replace(" ", "-")
+            if et and nm and ar and q:
+                out.append({
+                    "entity_type": et,
+                    "entity_name": nm,
+                    "artifact": ar,
+                    "search_query": q,
+                    "cluster_id": cl
+                })
+        return out
+    except Exception:
+        return []
 
-def update_flow_with_detected(detected_key: Optional[str]):
-    """Pivot-Logik: Wenn detected_key != current -> markiere current als done und setze current=detected_key.
-       Ab 6 Items: Hard-Stop-Planung (Budget 2 Assistant-Antworten)."""
-    if not detected_key:
-        return
-    flow = st.session_state.flow
-    current = flow.get("current_item_key")
-    done_keys: List[str] = flow.get("done_keys", [])
+def agent1_parse_corrections(user_reply: str, slots: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    Erkenne einfache Korrekturen/Wünsche:
+    - replace_item: {"from_name":"...", "to_name":"...", "entity_type":"book|person|..."}
+    - prefer_variant: {"slot_key":"...", "rule":"no_text_on_cover|face_only|..."}
+    - drop_item: {"slot_key":"..."}  (oder entity_type+entity_name)
+    - reassign_cluster: {"slot_key":"...", "cluster_id":"..."}
+    Output ONLY JSON: {"actions":[...]}
+    """
+    if not user_reply or len(user_reply) < 4:
+        return {"actions":[]}
+    sys = (
+        "You are Agent 1. Extract user intent for corrections to the current items. "
+        "Return ONLY JSON with an 'actions' array. Supported actions: replace_item, prefer_variant, drop_item, reassign_cluster. "
+        "Use slot_key if you can infer it from the label in slots; otherwise include 'entity_type' & 'entity_name'. "
+        "Example actions: "
+        "{\"action\":\"drop_item\",\"slot_key\":\"person|gabor mate\"}, "
+        "{\"action\":\"reassign_cluster\",\"slot_key\":\"book|in the realm of hungry ghosts\",\"cluster_id\":\"gabor-mate\"}, "
+        "{\"action\":\"replace_item\",\"entity_type\":\"book\",\"from_name\":\"hungry ghosts\",\"to_name\":\"scattered minds\"}, "
+        "{\"action\":\"prefer_variant\",\"slot_key\":\"book|in the realm of hungry ghosts\",\"rule\":\"no_text_on_cover\"}"
+    )
+    payload = {
+        "user_reply": user_reply,
+        "slot_labels": {sid: s.get("label","") for sid,s in slots.items()}
+    }
+    try:
+        resp = call_with_retry(client().responses.create, model=MODEL, input=[
+            {"role":"system","content":sys},
+            {"role":"user","content":json.dumps(payload, ensure_ascii=False)}
+        ])
+        data = parse_json_loose(_resp_text(resp) or "")
+        if isinstance(data, dict) and isinstance(data.get("actions"), list):
+            return {"actions": data["actions"]}
+        return {"actions":[]}
+    except Exception:
+        return {"actions":[]}
 
-    if current is None:
-        flow["current_item_key"] = detected_key
-        st.session_state.flow = flow
-        n = _count_items_from_flow()
-        if n >= 6 and not st.session_state.get("hard_stop_pending"):
-            st.session_state.hard_stop_pending = True
-            st.session_state.hard_stop_budget = 2
-            st.session_state.hard_stop_signaled = False
-        return
+# ---------- Google CSE: Image Search
+def google_image_search(query: str, num: int = 4, dbg: Optional[list] = None) -> List[Dict[str, str]]:
+    if not GOOGLE_CSE_KEY or not GOOGLE_CSE_CX:
+        debug_emit({"ev":"cse_keys_missing", "query": query}, dbg)
+        return []
+    try:
+        params = {
+            "q": query,
+            "searchType": "image",
+            "num": max(1, min(num, 10)),
+            "safe": GOOGLE_CSE_SAFE,
+            "key": GOOGLE_CSE_KEY,
+            "cx": GOOGLE_CSE_CX,
+        }
+        debug_emit({"ev":"cse_start", "query": query, "params": {"num": params["num"], "safe": GOOGLE_CSE_SAFE}}, dbg)
+        r = requests.get("https://www.googleapis.com/customsearch/v1", params=params, timeout=12)
+        try:
+            r.raise_for_status()
+        except HTTPError as he:
+            try:
+                err_json = r.json()
+            except Exception:
+                err_json = {"text": r.text[:400]}
+            debug_emit({"ev":"cse_http_error", "status": r.status_code, "error": str(he), "body": err_json}, dbg)
+            return []
+        data = r.json()
+        if "error" in data:
+            debug_emit({"ev":"cse_api_error", "query": query, "api_error": data.get("error")}, dbg)
+            return []
+        items = data.get("items", []) or []
+        out = []
+        for it in items:
+            link = (it.get("link") or "").strip()
+            ctx = ""
+            try:
+                ctx = (it.get("image", {}).get("contextLink") or "").strip()
+            except Exception:
+                ctx = ""
+            if link:
+                out.append({"url": link, "page_url": ctx})
+        debug_emit({"ev":"cse_done", "query": query, "returned": len(out)}, dbg)
+        return out
+    except Exception as e:
+        debug_emit({"ev":"cse_error", "query": query, "error": str(e)}, dbg)
+        return []
 
-    if detected_key == current:
-        return
-
-    # Pivot => current wird abgeschlossen
-    if current not in done_keys:
-        done_keys.append(current)
-    flow["done_keys"] = done_keys
-    flow["current_item_key"] = detected_key
-    st.session_state.flow = flow
-
-    # Reset Follow-up-Zähler für neues Item
-    st.session_state.followup_count[detected_key] = 0
-
-    n = _count_items_from_flow()
-    if n >= 6 and not st.session_state.get("hard_stop_pending"):
-        st.session_state.hard_stop_pending = True
-        st.session_state.hard_stop_budget = 2
-        st.session_state.hard_stop_signaled = False
-
-def summarize_slots_for_agent1(slots: Dict[str, Dict[str, Any]]) -> str:
-    lines = []
-    for sid, s in slots.items():
-        label = (s.get("label") or "").split("—")[-1].strip()
-        if label:
-            lines.append(label)
-    if not lines:
-        return "So far, no slots are filled."
-    return "So far, you already covered: " + ", ".join(lines) + "."
-
-# Mode-abhängiger Opener-Hinweis (nur für den ersten Turn)
-def get_mode_opening_hint() -> str:
-    mode = st.session_state.get("agent1_mode", "Professional")
-    if "Professional" in mode:
-        return ("OPENING_HINT: Prefer an opener focused on work decisions, e.g., "
-                "“What’s one book, podcast, person, tool, or film that truly changed how you work — and how?”")
+# ---------- Vision: Validate image vs. context (person-safe branch) – bestehend
+def validate_image_with_context(image_url: str, entity_type: str, entity_name: str, q_text: str, a_text: str, dbg: Optional[list] = None) -> Dict[str, Any]:
+    if (entity_type or "").lower().strip() == "person":
+        sys = (
+            "You are an image verifier. Respond with STRICT JSON like "
+            '{"ok":true/false,"reason":"..."}. '
+            "Policy: Do NOT attempt to identify or confirm a specific person’s identity. "
+            "For PERSON items, only verify:\n"
+            " - The image is a single-human portrait or headshot (not a logo, meme, cartoon, or product shot).\n"
+            " - Not a group photo (ideally 1 clearly visible person).\n"
+            " - Reasonable to use as a generic portrait representation.\n"
+            "Return ok=true if those conditions hold; otherwise false."
+        )
+        user_text = (
+            "Item type: person\n"
+            f"Item name (context only, DO NOT IDENTIFY): {entity_name}\n"
+            "Only check portrait criteria."
+        )
     else:
-        return ("OPENING_HINT: Prefer an opener that includes life beyond work, e.g., "
-                "“Outside of work, what book/podcast/person/tool/film most changed how you think — and how?”")
+        sys = (
+            "You are an image verifier. Respond with STRICT JSON like "
+            '{"ok":true/false,"reason":"..."}. '
+            "Check if the image plausibly depicts the requested public item "
+            "(book/podcast/person/tool/film) given the context. "
+            "Be strict about wrong items/logos/memes; flexible with cover art variants."
+        )
+        user_text = (
+            f"Item type: {entity_type}\n"
+            f"Item name: {entity_name}\n"
+            f"Context Q: {q_text[:300]}\n"
+            f"Context A: {a_text[:500]}\n"
+            "Does this image plausibly match the item?"
+        )
+    try:
+        resp = call_with_retry(
+            client().responses.create,
+            model=AGENT2_MODEL,
+            input=[
+                {"role": "system", "content": sys},
+                {"role": "user", "content": [
+                    {"type": "input_text", "text": user_text},
+                    {"type": "input_image", "image_url": image_url}
+                ]}
+            ]
+        )
+        txt = _resp_text(resp)
+        data = parse_json_loose(txt or "")
+        ok = bool(data.get("ok")) if isinstance(data, dict) else False
+        return {"ok": ok, "reason": (data.get("reason") if isinstance(data, dict) else "")[:200]}
+    except Exception:
+        return {"ok": False, "reason": "unverifiable"}
 
-# System-Signal-Text für Hard-Stop
-HARD_STOP_SYSTEM_MSG = (
-    "SYSTEM_SIGNAL: hard-stop. You have reached the maximum range of items. "
-    "Acknowledge the user's last point in ≤1 sentence and then CLOSE now. "
-    "Emit exactly one clear handoff phrase to finalize (choose the best-fitting from these): "
-    "“Alright — I’ll now assemble your 4-point card.” "
-    "OR “Perfect — I’ll now assemble your selected 4-point card.” "
-    "OR “Great — I’ll now assemble your 4-point expert card with your chosen items.” "
-    "Do not ask any new questions. Do not open new topics."
-)
+# ---------- Vision: Artefakt-spezifischer Validator (NEU, Agent 2 bleibt Validator)
+def validate_image_with_context_for_artifact(image_url: str, entity_type: str, entity_name: str, artifact: str, q_text: str, a_text: str, dbg: Optional[list] = None) -> Dict[str, Any]:
+    """
+    Artefakt-spezifische Policy:
+    - portrait: identisch zur PERSON-Policy oben (keine Identifikation, nur Porträtkriterien)
+    - book_cover: plausibles Buchcover (Titel/Autor-Typografie ok; keine reinen Portraits/Logos/Memes)
+    - podcast_cover: quadratisches Artwork/Branding ok; keine generischen Stockfotos ohne Bezug
+    - tool_logo: offizielles Logo/Produktmarke ok; keine fremden Marken
+    - film_poster: posterartige Komposition mit Titel/Typo bevorzugt; reine Stills ohne Titel eher ablehnen
+    """
+    art = (artifact or "").lower().strip()
+    if entity_type.lower().strip() == "person" and art == "portrait":
+        return validate_image_with_context(image_url, entity_type, entity_name, q_text, a_text, dbg=dbg)
 
-# System-Signal-Text für Deepening-Stop (2er-Schranke)
-STOP_DEEPENING_SYSTEM_MSG = (
-    "SYSTEM_SIGNAL: stop-deepening. You have reached the 2-follow-up limit for the current item. "
-    "Do NOT ask another deepening question about this same item. "
-    "Either pivot to a different public anchor (book/podcast/person/tool/film) "
-    "or briefly acknowledge/summarize in ≤1 sentence and move on."
-)
+    sys = (
+        "You are an image verifier. Respond with STRICT JSON like {\"ok\":true/false,\"reason\":\"...\"}. "
+        "Check if the image plausibly depicts the requested public item/artifact given the context. "
+        "Reject logos/memes when not appropriate; accept reasonable cover/poster variants."
+    )
+    hints = {
+        "book_cover": "Prefer book cover framing; allow title/author typography; avoid plain portraits or unrelated imagery.",
+        "podcast_cover": "Prefer square/cover-style artwork with show/host branding; avoid unrelated stock photos.",
+        "tool_logo": "Prefer the official product/service logo; avoid unrelated brands or generic icons.",
+        "film_poster": "Prefer poster-like composition with title/credits; avoid random stills without poster treatment."
+    }.get(art, "Be strict but reasonable.")
 
-# ---------- Agent 1 (Interview)
+    user_text = (
+        f"Item type: {entity_type}\n"
+        f"Item name: {entity_name}\n"
+        f"Artifact: {artifact}\n"
+        f"Hints: {hints}\n"
+        f"Context Q: {q_text[:300]}\n"
+        f"Context A: {a_text[:500]}\n"
+    )
+    try:
+        resp = call_with_retry(
+            client().responses.create,
+            model=AGENT2_MODEL,
+            input=[
+                {"role":"system","content":sys},
+                {"role":"user","content":[
+                    {"type":"input_text","text":user_text},
+                    {"type":"input_image","image_url":image_url}
+                ]}
+            ]
+        )
+        data = parse_json_loose(_resp_text(resp) or "")
+        ok = bool(data.get("ok")) if isinstance(data, dict) else False
+        return {"ok": ok, "reason": (data.get("reason","") if isinstance(data, dict) else "")[:200]}
+    except Exception:
+        return {"ok": False, "reason": "unverifiable"}
+
+# ---------- Agent 2 (Extractor ONLY; keine Tools) – belassen (Fallback, aktuell ungenutzt)
+AGENT2_SYSTEM = """You are Agent 2.
+
+Task:
+- From assistant_question + user_reply extract 0..N PUBLIC items (book|podcast|person|tool|film).
+- For each item, return {entity_type, entity_name}. Do NOT search the web. Do NOT invent.
+- Dedupe by normalized lowercase name per type.
+
+Output ONLY strict JSON:
+{
+  "detected": true|false,
+  "items": [
+    {"entity_type":"book|podcast|person|tool|film","entity_name":"..."}
+  ]
+}
+
+Rules:
+- If no item present → {"detected": false}
+- Return ONLY JSON.
+"""
+
+def agent2_extract_items(last_q: str, user_reply: str, seen_entities: List[str], dbg: Optional[list] = None) -> Dict[str, Any]:
+    payload = {"assistant_question": last_q or "", "user_reply": user_reply or "", "seen_entities": list(seen_entities or [])}
+    try:
+        debug_emit({"ev":"extract_start", "q_len": len(last_q), "a_len": len(user_reply)}, dbg)
+        resp = call_with_retry(
+            client().responses.create,
+            model=AGENT2_MODEL,
+            input=[
+                {"role": "system", "content": AGENT2_SYSTEM},
+                {"role": "user", "content": json.dumps(payload, ensure_ascii=False)}
+            ]
+        )
+        raw = _resp_text(resp)
+        debug_emit({"ev":"extract_raw", "preview": (raw or "")[:240]}, dbg)
+        data = parse_json_loose(raw or "")
+        if isinstance(data, dict):
+            debug_emit({"ev":"extract_parsed", "detected": bool(data.get("detected")), "count": len(data.get("items") or [])}, dbg)
+            return data
+        debug_emit({"ev":"extract_noparse"}, dbg)
+        return {"detected": False, "reason": "no-parse"}
+    except Exception as e:
+        debug_emit({"ev":"extract_error", "error": str(e)}, dbg)
+        return {"detected": False, "reason": f"error: {e}", "trace": traceback.format_exc()[:600]}
+
+# ---------- Agent 3 (Finalizer)
+FINALIZER_SYSTEM = """You are Agent 3 — Finalizer.
+Create an Expert Card with exactly 4 items from:
+- The conversation (assistant questions + user answers).
+- The current slots (labels + image URLs if any).
+Rules:
+- Each line begins with '- Label:' followed by 1–3 concise sentences grounded in THIS user's words.
+- Prefer PUBLIC items; if fewer than 4, fill with the user's stated practices/principles.
+- No fluff, no generic encyclopedia facts, no references to these instructions.
+- If the user provided richer detail for an item, lean toward 2–3 sentences; otherwise keep it tight.
+"""
+
+def agent3_finalize(history: List[Dict[str, str]], slots: Dict[str, Dict[str, Any]]) -> str:
+    convo = []
+    for m in history[-24:]:
+        if m["role"] == "assistant":
+            convo.append("Q: " + m["content"])
+        else:
+            convo.append("A: " + m["content"])
+    convo_text = "\n".join(convo)
+
+    slot_lines = []
+    for sid in ["S1", "S2", "S3", "S4"]:
+        s = slots.get(sid)
+        if not s:
+            continue
+        lab = s.get("label", "").strip()
+        img = (s.get("media", {}).get("best_image_url") or "").strip()
+        if lab:
+            slot_lines.append(f"{sid}: {lab} | image={img or 'n/a'}")
+    slots_text = "\n".join(slot_lines) if slot_lines else "none"
+
+    msgs = [
+        {"role": "system", "content": FINALIZER_SYSTEM},
+        {"role": "user", "content": f"Transcript:\n{convo_text}\n\nSlots:\n{slots_text}"}
+    ]
+    resp = call_with_retry(client().responses.create, model=MODEL, input=msgs)
+    return _resp_text(resp)
+
+# ---------- Agent 1 (Interview) – Prompts minimal erweitert (Artefakte & Korrekturen)
 AGENT1_SYSTEM_PRO = """You are Agent 1 — a warm, incisive interviewer.
 # Role
 Lead an interview session to build a 4-item Expert Card. Blend public influences (book, podcast, person, tool, or film) with the user's personal experiences and decisions.
@@ -308,6 +564,9 @@ Lead an interview session to build a 4-item Expert Card. Blend public influences
 - Drive the conversation; never call tools directly.
 - Collaborate implicitly: Agent 2 observes turns and manages lookup for public items; Agent 3 assembles the final card after your handoff.
 - Favor diversity in anchor types—aim for variety across books, podcasts, people, tools, films.
+- When a public item appears, consider its natural artifacts (for a person → portrait; if a book title emerges → book_cover with a disambiguating query like “<Title> by <Author> book cover”).
+- Accept natural-language corrections (replace item, prefer variant without text, drop item, reassign cluster) and reflect them in your next move.
+
 # Planning Checklist
 Privately, begin each session with a concise checklist (3–7 bullets) of what you will do; keep items conceptual, not implementation-level. Do not surface or read the checklist to the user.
 # Conversation Style
@@ -365,6 +624,9 @@ Lead an interview that can range beyond work: include public influences from eve
 - Drive the conversation; never call tools directly.
 - Collaborate implicitly: Agent 2 observes turns and looks up public items; Agent 3 assembles the final card after your handoff.
 - Favor variety across domains: work, learning, hobbies, routines, creativity, civic/economic thinking — as appropriate for the user.
+- When a public item appears, consider its natural artifacts (for a person → portrait; if a book title emerges → book_cover with a disambiguating query like “<Title> by <Author> book cover”).
+- Accept natural-language corrections (replace item, prefer variant without text, drop item, reassign cluster) and reflect them in your next move.
+
 # Planning Checklist
 Privately, begin with a concise checklist (3–7 bullets). Keep it conceptual; do not reveal it.
 # Conversation Style
@@ -431,6 +693,44 @@ def get_agent1_system() -> str:
     mode = st.session_state.get("agent1_mode", "Professional")
     return AGENT1_SYSTEM_PRO if "Professional" in mode else AGENT1_SYSTEM_GEN
 
+def summarize_slots_for_agent1(slots: Dict[str, Dict[str, Any]]) -> str:
+    lines = []
+    for sid, s in slots.items():
+        label = (s.get("label") or "").split("—")[-1].strip()
+        if label:
+            lines.append(label)
+    if not lines:
+        return "So far, no slots are filled."
+    return "So far, you already covered: " + ", ".join(lines) + "."
+
+def get_mode_opening_hint() -> str:
+    mode = st.session_state.get("agent1_mode", "Professional")
+    if "Professional" in mode:
+        return ("OPENING_HINT: Prefer an opener focused on work decisions, e.g., "
+                "“What’s one book, podcast, person, tool, or film that truly changed how you work — and how?”")
+    else:
+        return ("OPENING_HINT: Prefer an opener that includes life beyond work, e.g., "
+                "“Outside of work, what book/podcast/person/tool/film most changed how you think — and how?”")
+
+# System-Signal-Text für Hard-Stop
+HARD_STOP_SYSTEM_MSG = (
+    "SYSTEM_SIGNAL: hard-stop. You have reached the maximum range of items. "
+    "Acknowledge the user's last point in ≤1 sentence and then CLOSE now. "
+    "Emit exactly one clear handoff phrase to finalize (choose the best-fitting from these): "
+    "“Alright — I’ll now assemble your 4-point card.” "
+    "OR “Perfect — I’ll now assemble your selected 4-point card.” "
+    "OR “Great — I’ll now assemble your 4-point expert card with your chosen items.” "
+    "Do not ask any new questions. Do not open new topics."
+)
+
+# System-Signal-Text für Deepening-Stop (2er-Schranke)
+STOP_DEEPENING_SYSTEM_MSG = (
+    "SYSTEM_SIGNAL: stop-deepening. You have reached the 2-follow-up limit for the current item. "
+    "Do NOT ask another deepening question about this same item. "
+    "Either pivot to a different public anchor (book/podcast/person/tool/film) "
+    "or briefly acknowledge/summarize in ≤1 sentence and move on."
+)
+
 def agent1_next_question(history_snapshot):
     msgs = [{"role": "system", "content": get_agent1_system()}]
 
@@ -463,7 +763,7 @@ def agent1_next_question(history_snapshot):
     resp = call_with_retry(client().responses.create, model=MODEL, input=msgs)
     return _resp_text(resp)
 
-# -------- Agent 1 — Streaming helper (Responses.stream) --------
+# -------- Agent 1 — Streaming helper (Responses.stream)
 def agent1_stream_question(history_snapshot: List[Dict[str, str]]) -> str:
     """Streaming-fähige Version von Agent 1 (modusabhängig, Slot-Summary, Hard-Stop, Opener-Hint) — Responses API."""
     msgs = [{"role": "system", "content": get_agent1_system()}]
@@ -546,189 +846,6 @@ def agent1_stream_question(history_snapshot: List[Dict[str, str]]) -> str:
 
     return text
 
-# ---------- Agent 2 (Extractor ONLY; keine Tools)
-AGENT2_SYSTEM = """You are Agent 2.
-
-Task:
-- From assistant_question + user_reply extract 0..N PUBLIC items (book|podcast|person|tool|film).
-- For each item, return {entity_type, entity_name}. Do NOT search the web. Do NOT invent.
-- Dedupe by normalized lowercase name per type.
-
-Output ONLY strict JSON:
-{
-  "detected": true|false,
-  "items": [
-    {"entity_type":"book|podcast|person|tool|film","entity_name":"..."}
-  ]
-}
-
-Rules:
-- If no item present → {"detected": false}
-- Return ONLY JSON.
-"""
-
-def agent2_extract_items(last_q: str, user_reply: str, seen_entities: List[str], dbg: Optional[list] = None) -> Dict[str, Any]:
-    payload = {"assistant_question": last_q or "", "user_reply": user_reply or "", "seen_entities": list(seen_entities or [])}
-    try:
-        debug_emit({"ev":"extract_start", "q_len": len(last_q), "a_len": len(user_reply)}, dbg)
-        resp = call_with_retry(
-            client().responses.create,
-            model=AGENT2_MODEL,
-            input=[
-                {"role": "system", "content": AGENT2_SYSTEM},
-                {"role": "user", "content": json.dumps(payload, ensure_ascii=False)}
-            ]
-        )
-        raw = _resp_text(resp)
-        debug_emit({"ev":"extract_raw", "preview": (raw or "")[:240]}, dbg)
-        data = parse_json_loose(raw or "")
-        if isinstance(data, dict):
-            debug_emit({"ev":"extract_parsed", "detected": bool(data.get("detected")), "count": len(data.get("items") or [])}, dbg)
-            return data
-        debug_emit({"ev":"extract_noparse"}, dbg)
-        return {"detected": False, "reason": "no-parse"}
-    except Exception as e:
-        debug_emit({"ev":"extract_error", "error": str(e)}, dbg)
-        return {"detected": False, "reason": f"error: {e}", "trace": traceback.format_exc()[:600]}
-
-# ---------- Google CSE: Image Search
-def google_image_search(query: str, num: int = 4, dbg: Optional[list] = None) -> List[Dict[str, str]]:
-    if not GOOGLE_CSE_KEY or not GOOGLE_CSE_CX:
-        debug_emit({"ev":"cse_keys_missing", "query": query}, dbg)
-        return []
-    try:
-        params = {
-            "q": query,
-            "searchType": "image",
-            "num": max(1, min(num, 10)),
-            "safe": GOOGLE_CSE_SAFE,
-            "key": GOOGLE_CSE_KEY,
-            "cx": GOOGLE_CSE_CX,
-        }
-        debug_emit({"ev":"cse_start", "query": query, "params": {"num": params["num"], "safe": GOOGLE_CSE_SAFE}}, dbg)
-        r = requests.get("https://www.googleapis.com/customsearch/v1", params=params, timeout=12)
-        try:
-            r.raise_for_status()
-        except HTTPError as he:
-            try:
-                err_json = r.json()
-            except Exception:
-                err_json = {"text": r.text[:400]}
-            debug_emit({"ev":"cse_http_error", "status": r.status_code, "error": str(he), "body": err_json}, dbg)
-            return []
-        data = r.json()
-        if "error" in data:
-            debug_emit({"ev":"cse_api_error", "query": query, "api_error": data.get("error")}, dbg)
-            return []
-        items = data.get("items", []) or []
-        out = []
-        for it in items:
-            link = (it.get("link") or "").strip()
-            ctx = ""
-            try:
-                ctx = (it.get("image", {}).get("contextLink") or "").strip()
-            except Exception:
-                ctx = ""
-            if link:
-                out.append({"url": link, "page_url": ctx})
-        debug_emit({"ev":"cse_done", "query": query, "returned": len(out)}, dbg)
-        return out
-    except Exception as e:
-        debug_emit({"ev":"cse_error", "query": query, "error": str(e)}, dbg)
-        return []
-
-# ---------- Vision: Validate image vs. context (person-safe branch)
-def validate_image_with_context(image_url: str, entity_type: str, entity_name: str, q_text: str, a_text: str, dbg: Optional[list] = None) -> Dict[str, Any]:
-    if (entity_type or "").lower().strip() == "person":
-        sys = (
-            "You are an image verifier. Respond with STRICT JSON like "
-            '{"ok":true/false,"reason":"..."}. '
-            "Policy: Do NOT attempt to identify or confirm a specific person’s identity. "
-            "For PERSON items, only verify:\n"
-            " - The image is a single-human portrait or headshot (not a logo, meme, cartoon, or product shot).\n"
-            " - Not a group photo (ideally 1 clearly visible person).\n"
-            " - Reasonable to use as a generic portrait representation.\n"
-            "Return ok=true if those conditions hold; otherwise false."
-        )
-        user_text = (
-            "Item type: person\n"
-            f"Item name (context only, DO NOT IDENTIFY): {entity_name}\n"
-            "Only check portrait criteria."
-        )
-    else:
-        sys = (
-            "You are an image verifier. Respond with STRICT JSON like "
-            '{"ok":true/false,"reason":"..."}. '
-            "Check if the image plausibly depicts the requested public item "
-            "(book/podcast/person/tool/film) given the context. "
-            "Be strict about wrong items/logos/memes; flexible with cover art variants."
-        )
-        user_text = (
-            f"Item type: {entity_type}\n"
-            f"Item name: {entity_name}\n"
-            f"Context Q: {q_text[:300]}\n"
-            f"Context A: {a_text[:500]}\n"
-            "Does this image plausibly match the item?"
-        )
-    try:
-        # Responses API: multimodal input (text + image)
-        resp = call_with_retry(
-            client().responses.create,
-            model=AGENT2_MODEL,
-            input=[
-                {"role": "system", "content": sys},
-                {"role": "user", "content": [
-                    {"type": "input_text", "text": user_text},
-                    {"type": "input_image", "image_url": image_url}
-                ]}
-            ]
-        )
-        txt = _resp_text(resp)
-        data = parse_json_loose(txt or "")
-        ok = bool(data.get("ok")) if isinstance(data, dict) else False
-        return {"ok": ok, "reason": (data.get("reason") if isinstance(data, dict) else "")[:200]}
-    except Exception:
-        return {"ok": False, "reason": "unverifiable"}
-
-# ---------- Agent 3 (Finalizer)
-FINALIZER_SYSTEM = """You are Agent 3 — Finalizer.
-Create an Expert Card with exactly 4 items from:
-- The conversation (assistant questions + user answers).
-- The current slots (labels + image URLs if any).
-Rules:
-- Each line begins with '- Label:' followed by 1–3 concise sentences grounded in THIS user's words.
-- Prefer PUBLIC items; if fewer than 4, fill with the user's stated practices/principles.
-- No fluff, no generic encyclopedia facts, no references to these instructions.
-- If the user provided richer detail for an item, lean toward 2–3 sentences; otherwise keep it tight.
-"""
-
-def agent3_finalize(history: List[Dict[str, str]], slots: Dict[str, Dict[str, Any]]) -> str:
-    convo = []
-    for m in history[-24:]:
-        if m["role"] == "assistant":
-            convo.append("Q: " + m["content"])
-        else:
-            convo.append("A: " + m["content"])
-    convo_text = "\n".join(convo)
-
-    slot_lines = []
-    for sid in ["S1", "S2", "S3", "S4"]:
-        s = slots.get(sid)
-        if not s:
-            continue
-        lab = s.get("label", "").strip()
-        img = (s.get("media", {}).get("best_image_url") or "").strip()
-        if lab:
-            slot_lines.append(f"{sid}: {lab} | image={img or 'n/a'}")
-    slots_text = "\n".join(slot_lines) if slot_lines else "none"
-
-    msgs = [
-        {"role": "system", "content": FINALIZER_SYSTEM},
-        {"role": "user", "content": f"Transcript:\n{convo_text}\n\nSlots:\n{slots_text}"}
-    ]
-    resp = call_with_retry(client().responses.create, model=MODEL, input=msgs)
-    return _resp_text(resp)
-
 # ---------- Orchestrator
 COOLDOWN_SECONDS = 600  # 10 Minuten
 
@@ -741,6 +858,7 @@ class Orchestrator:
         self.exec = st.session_state.executor
         self.seen = st.session_state.seen_entities
         self.cooldown = st.session_state.cooldown_entities
+        self.clusters = st.session_state.clusters  # ← NEU
 
     def upsert(self, sid: str, label: str, media: Dict[str, Any]):
         s = self.slots.get(sid, {"slot_id": sid, "label": "", "media": {"status": "pending", "best_image_url": "", "candidates": [], "notes": ""}})
@@ -752,6 +870,7 @@ class Orchestrator:
         m.setdefault("notes", "")
         m.update(media or {})
         s["media"] = m
+        # Meta-Felder (key/item_type/artifact/cluster) werden außerhalb gesetzt; hier nichts überschreiben.
         self.slots[sid] = s
 
     def schedule_watch(self, last_q: str, reply: str):
@@ -763,59 +882,65 @@ class Orchestrator:
     def _job(self, last_q: str, reply: str, seen_snapshot: List[str]) -> Dict[str, Any]:
         dbg = []  # DEBUG off
         first_key_detected: Optional[str] = None
+
+        # ---- NEU: geplante Suchen (von Agent 1) bevorzugt verarbeiten
+        planned = []
         try:
-            data = agent2_extract_items(last_q, reply, seen_snapshot, dbg=dbg)
-            if not data.get("detected"):
-                debug_emit({"ev":"job_skip_no_items"}, dbg)
-                return {"status": "skip", "debug": dbg, "first_key_detected": None}
+            planned = list(st.session_state.pending_searches or [])
+            st.session_state.pending_searches = []
+        except Exception:
+            planned = []
 
-            items = data.get("items") or []
-            debug_emit({"ev":"job_items", "count": len(items)}, dbg)
-            processed = 0
+        try:
             results: List[Dict[str, Any]] = []
-
+            processed = 0
             now = time.time()
 
-            # Erste erkannte Item-Key für Flow/Pivot
-            if items:
-                etype0 = (items[0].get("entity_type") or "").lower().strip()
-                ename0 = (items[0].get("entity_name") or "").strip()
-                if etype0 and ename0:
-                    first_key_detected = normalize_key(etype0, ename0)
-
-            for item in items:
-                if processed >= MAX_SEARCHES_PER_RUN:
-                    debug_emit({"ev":"job_cap_reached", "max": MAX_SEARCHES_PER_RUN}, dbg)
-                    break
-                etype = (item.get("entity_type") or "").lower().strip()
-                ename = (item.get("entity_name") or "").strip()
-                if not etype or not ename:
-                    continue
+            def _validate_and_collect(etype, ename, artifact, query, cluster_id):
                 key = normalize_key(etype, ename)
+
+                # Follow-up/Pivot-Flow: first_key_detected setzen (für Enforcer/Flow)
+                nonlocal first_key_detected
+                if first_key_detected is None:
+                    first_key_detected = key
 
                 retry_after = self.cooldown.get(key, 0)
                 if retry_after and now < retry_after:
                     debug_emit({"ev":"item_cooldown_skip", "key": key, "retry_after": int(retry_after - now)}, dbg)
-                    continue
+                    return
 
                 if key in self.seen:
                     debug_emit({"ev":"item_dedupe_skip", "key": key}, dbg)
-                    continue
+                    return
 
-                debug_emit({"ev":"item_consider", "key": key}, dbg)
-                imgs = google_image_search(ename, num=4, dbg=dbg)
+                debug_emit({"ev":"item_consider", "key": key, "artifact": artifact, "query": query}, dbg)
+                imgs = google_image_search(query, num=6, dbg=dbg)
                 debug_emit({"ev":"item_search_results", "key": key, "n": len(imgs)}, dbg)
 
-                if not imgs:
+                # URL-Unique sammeln, max. 3 prüfen
+                url_seen = set()
+                uniq = []
+                for it in imgs:
+                    u = (it.get("url") or "").strip()
+                    if not u or u in url_seen:
+                        continue
+                    url_seen.add(u)
+                    uniq.append(it)
+                    if len(uniq) >= 3:
+                        break
+
+                if not uniq:
                     self.cooldown[key] = now + COOLDOWN_SECONDS
                     debug_emit({"ev":"item_set_cooldown", "key": key, "cooldown_s": COOLDOWN_SECONDS}, dbg)
-                    continue
+                    return
 
                 ok_url, note = "", ""
                 tries = 0
-                for cand in imgs[:2]:
+                for cand in uniq:
                     tries += 1
-                    v = validate_image_with_context(cand["url"], etype, ename, last_q, reply, dbg=dbg)
+                    v = validate_image_with_context_for_artifact(
+                        cand["url"], etype, ename, artifact, last_q, reply, dbg=dbg
+                    )
                     if v.get("ok"):
                         ok_url = cand["url"]
                         note = v.get("reason", "")
@@ -828,7 +953,10 @@ class Orchestrator:
                     self.cooldown[key] = now + COOLDOWN_SECONDS
                     debug_emit({"ev":"item_no_valid_image", "key": key}, dbg)
                     debug_emit({"ev":"item_set_cooldown", "key": key, "cooldown_s": COOLDOWN_SECONDS}, dbg)
-                    continue
+                    return
+
+                # Erfolg → optional cooldown setzen, um sofortige Re-Checks zu vermeiden
+                self.cooldown[key] = now + COOLDOWN_SECONDS
 
                 label_hint = {
                     "book": "Must-Read",
@@ -842,13 +970,48 @@ class Orchestrator:
                 media = {
                     "status": "found",
                     "best_image_url": ok_url,
-                    "candidates": [{"url": ok_url, "page_url": imgs[0].get("page_url",""), "source": "google-cse", "confidence": 0.9, "reason": note}],
+                    "candidates": [{"url": ok_url, "page_url": uniq[0].get("page_url",""), "source": "google-cse", "confidence": 0.9, "reason": note}],
                     "notes": note or "validated"
                 }
 
-                results.append({"status": "ok", "key": key, "label": label, "media": media})
-                debug_emit({"ev":"item_ready_for_slot", "key": key}, dbg)
+                results.append({
+                    "status": "ok",
+                    "key": key,
+                    "label": label,
+                    "media": media,
+                    "meta": {
+                        "item_type": etype,
+                        "artifact": artifact,
+                        "cluster": cluster_id
+                    }
+                })
+
+            # 1) Geplante Suchen (Agent 1) konsumieren
+            for s in planned:
+                if processed >= MAX_SEARCHES_PER_RUN:
+                    debug_emit({"ev":"job_cap_reached", "max": MAX_SEARCHES_PER_RUN}, dbg)
+                    break
+                etype = (s.get("entity_type") or "").strip().lower()
+                ename = (s.get("entity_name") or "").strip()
+                artifact = (s.get("artifact") or "").strip().lower()
+                query = (s.get("search_query") or "").strip() or ename
+                cluster_id = (s.get("cluster_id") or "").strip() or _strip_accents(ename.lower()).replace(" ", "-")
+                if not (etype and ename and artifact and query):
+                    continue
+                _validate_and_collect(etype, ename, artifact, query, cluster_id)
                 processed += 1
+
+            # 2) Optionaler Fallback: klassische Extraktion (derzeit nicht genutzt)
+            # if not results:
+            #     data = agent2_extract_items(last_q, reply, seen_snapshot, dbg=dbg)
+            #     if data.get("detected"):
+            #         items = data.get("items") or []
+            #         if items:
+            #             etype0 = (items[0].get("entity_type") or "").lower().strip()
+            #             ename0 = (items[0].get("entity_name") or "").strip()
+            #             if etype0 and ename0:
+            #                 first_key_detected = normalize_key(etype0, ename0)
+            #         # hier könnte man generische Artefakte raten; übersprungen, da Agent 1 nun plant.
 
             return {"status": "batch", "items": results, "debug": dbg, "first_key_detected": first_key_detected}
         except Exception as e:
@@ -885,17 +1048,48 @@ class Orchestrator:
                         # neues Item → Zähler resetten
                         st.session_state.followup_count[first_key] = 0
 
-                # 2) Slots updaten, Seen markieren
+                # 2) Slots updaten, Seen markieren + Cluster-Index pflegen
                 if res.get("status") == "batch":
                     for it in res.get("items", []):
                         if it.get("status") == "ok":
-                            sid = next_free_slot()
-                            if sid:
-                                self.upsert(sid, it["label"], it["media"])
-                                key = it.get("key")
+                            key = it.get("key","")
+                            meta = it.get("meta", {}) or {}
+                            artifact = meta.get("artifact","")
+
+                            # Slot-Dedupe: kein zweiter Slot für denselben key+artifact
+                            exists = None
+                            for sid2, s in self.slots.items():
+                                if s.get("key") == key and s.get("artifact") == artifact:
+                                    exists = sid2
+                                    break
+                            if exists:
+                                s = self.slots[exists]
+                                s["media"] = it["media"] or s.get("media", {})
+                                self.slots[exists] = s
                                 if key and key not in self.seen:
                                     self.seen.append(key)
-                                updated.append(sid)
+                                updated.append(exists)
+                                continue
+
+                            sid2 = next_free_slot()
+                            if sid2:
+                                self.upsert(sid2, it["label"], it["media"])
+                                # Meta-Felder setzen
+                                self.slots[sid2]["key"] = key
+                                self.slots[sid2]["item_type"] = meta.get("item_type","")
+                                self.slots[sid2]["artifact"] = artifact
+                                self.slots[sid2]["cluster"] = meta.get("cluster","")
+
+                                # Cluster-Index aktualisieren
+                                cl = self.slots[sid2]["cluster"]
+                                if cl:
+                                    self.clusters.setdefault(cl, {"title": cl, "items": []})
+                                    if sid2 not in self.clusters[cl]["items"]:
+                                        self.clusters[cl]["items"].append(sid2)
+
+                                if key and key not in self.seen:
+                                    self.seen.append(key)
+                                updated.append(sid2)
                             else:
                                 debug_emit({"ev":"slots_full"})
         for jid in rm:
@@ -992,11 +1186,55 @@ def build_export_html(final_text: str, slots: Dict[str, Dict[str, Any]]) -> str:
 </html>"""
     return html
 
+# ---------- Flow helpers (bestehend)
+def _count_items_from_flow() -> int:
+    flow = st.session_state.flow
+    done_keys: List[str] = flow.get("done_keys", [])
+    current = flow.get("current_item_key")
+    return len(done_keys) + (1 if current else 0)
+
+def update_flow_with_detected(detected_key: Optional[str]):
+    """Pivot-Logik: Wenn detected_key != current -> markiere current als done und setze current=detected_key.
+       Ab 6 Items: Hard-Stop-Planung (Budget 2 Assistant-Antworten)."""
+    if not detected_key:
+        return
+    flow = st.session_state.flow
+    current = flow.get("current_item_key")
+    done_keys: List[str] = flow.get("done_keys", [])
+
+    if current is None:
+        flow["current_item_key"] = detected_key
+        st.session_state.flow = flow
+        n = _count_items_from_flow()
+        if n >= 6 and not st.session_state.get("hard_stop_pending"):
+            st.session_state.hard_stop_pending = True
+            st.session_state.hard_stop_budget = 2
+            st.session_state.hard_stop_signaled = False
+        return
+
+    if detected_key == current:
+        return
+
+    # Pivot => current wird abgeschlossen
+    if current not in done_keys:
+        done_keys.append(current)
+    flow["done_keys"] = done_keys
+    flow["current_item_key"] = detected_key
+    st.session_state.flow = flow
+
+    # Reset Follow-up-Zähler für neues Item
+    st.session_state.followup_count[detected_key] = 0
+
+    n = _count_items_from_flow()
+    if n >= 6 and not st.session_state.get("hard_stop_pending"):
+        st.session_state.hard_stop_pending = True
+        st.session_state.hard_stop_budget = 2
+        st.session_state.hard_stop_signaled = False
 
 # ---------- Main
 st.set_page_config(page_title=APP_TITLE, page_icon="🟡", layout="wide")
 st.title(APP_TITLE)
-st.caption("Agent 2: Google Image API (+Vision-Check) • Slots only with valid image")
+st.caption("Agent 2: Validator (artifact-aware) • Slots only with valid image")
 
 # ---- Init state
 init_state()
@@ -1076,17 +1314,136 @@ if st.session_state.final_text:
 # ---- Input handling
 user_text = st.chat_input("Your turn…")
 if user_text:
+    # Log the user message
     st.session_state.history.append({"role": "user", "content": user_text})
 
-    # Agent 2 beobachten lassen (asynchron)
+    # (a) Korrekturen interpretieren und anwenden (Agent 1 Parser)
+    corr = agent1_parse_corrections(user_text, st.session_state.slots)
+    for act in corr.get("actions", []):
+        action = (act.get("action") or act.get("type") or "").strip().lower()
+
+        # Helper zum Finden eines Slots via slot_key oder (entity_type,entity_name)
+        def _find_slot_by_action_key(a: Dict[str, Any]) -> Optional[str]:
+            sk = (a.get("slot_key") or "").strip().lower()
+            if sk:
+                # sk kann 'person|gabor mate' sein oder eine Slot-ID
+                if sk in st.session_state.slots:
+                    return sk
+                for sid0, s0 in st.session_state.slots.items():
+                    if s0.get("key","") == sk:
+                        return sid0
+            et = (a.get("entity_type") or "").strip().lower()
+            nm = (a.get("entity_name") or a.get("from_name") or "").strip()
+            if et and nm:
+                key0 = normalize_key(et, nm)
+                for sid0, s0 in st.session_state.slots.items():
+                    if s0.get("key","") == key0:
+                        return sid0
+            return None
+
+        if action == "drop_item":
+            sid_drop = _find_slot_by_action_key(act)
+            if sid_drop and sid_drop in st.session_state.slots:
+                cl = st.session_state.slots[sid_drop].get("cluster","")
+                del st.session_state.slots[sid_drop]
+                # Cluster-Index bereinigen
+                if cl and cl in st.session_state.clusters:
+                    st.session_state.clusters[cl]["items"] = [x for x in st.session_state.clusters[cl]["items"] if x != sid_drop]
+
+        elif action == "reassign_cluster":
+            sid_rc = _find_slot_by_action_key(act)
+            new_cl = (act.get("cluster_id") or "").strip()
+            if sid_rc and sid_rc in st.session_state.slots and new_cl:
+                old = st.session_state.slots[sid_rc].get("cluster","")
+                st.session_state.slots[sid_rc]["cluster"] = new_cl
+                # Cluster-Index aktualisieren
+                if old and old in st.session_state.clusters:
+                    st.session_state.clusters[old]["items"] = [x for x in st.session_state.clusters[old]["items"] if x != sid_rc]
+                st.session_state.clusters.setdefault(new_cl, {"title": new_cl, "items": []})
+                if sid_rc not in st.session_state.clusters[new_cl]["items"]:
+                    st.session_state.clusters[new_cl]["items"].append(sid_rc)
+
+        elif action == "replace_item":
+            # Beispiel: {"action":"replace_item","entity_type":"book","from_name":"hungry ghosts","to_name":"scattered minds"}
+            et = (act.get("entity_type") or "").strip().lower()
+            from_nm = (act.get("from_name") or "").strip()
+            to_nm = (act.get("to_name") or "").strip()
+            if et and to_nm:
+                # Optional: bestehenden Slot finden, Cluster übernehmen
+                sid_rep = _find_slot_by_action_key({"entity_type": et, "entity_name": from_nm})
+                cluster_id = ""
+                if sid_rep and sid_rep in st.session_state.slots:
+                    cluster_id = st.session_state.slots[sid_rep].get("cluster","")
+                    # alten Slot entfernen
+                    old_cl = cluster_id
+                    del st.session_state.slots[sid_rep]
+                    if old_cl and old_cl in st.session_state.clusters:
+                        st.session_state.clusters[old_cl]["items"] = [x for x in st.session_state.clusters[old_cl]["items"] if x != sid_rep]
+
+                # Neue gezielte Suche planen (Artefakt nach Typ raten)
+                artifact_guess = {
+                    "person": "portrait",
+                    "book": "book_cover",
+                    "podcast": "podcast_cover",
+                    "tool": "tool_logo",
+                    "film": "film_poster",
+                }.get(et, "portrait")
+                # Query disambig (wenn Person vorhanden ist, anhängen)
+                query = to_nm
+                if et == "book":
+                    # falls Cluster bekannt (z. B. 'gabor-mate'), setze "book cover"
+                    if cluster_id:
+                        query = f"{to_nm} book cover"
+                    else:
+                        query = f"{to_nm} book cover"
+                st.session_state.pending_searches.append({
+                    "entity_type": et,
+                    "entity_name": to_nm,
+                    "artifact": artifact_guess,
+                    "search_query": query,
+                    "cluster_id": cluster_id or _strip_accents(to_nm.lower()).replace(" ", "-")
+                })
+
+        elif action == "prefer_variant":
+            # Beispiel: {"action":"prefer_variant","slot_key":"book|in the realm of hungry ghosts","rule":"no_text_on_cover"}
+            sid_pref = _find_slot_by_action_key(act)
+            rule = (act.get("rule") or "").strip().lower()
+            if sid_pref and sid_pref in st.session_state.slots:
+                s = st.session_state.slots[sid_pref]
+                et = s.get("item_type","")
+                nm = (s.get("label","").split("—")[-1] or "").strip()
+                artifact = s.get("artifact","")
+                if et and nm and artifact:
+                    # Variantensuche (einfacher Query-Zusatz)
+                    suffix = ""
+                    if rule == "no_text_on_cover":
+                        suffix = " no text minimal"
+                    elif rule == "face_only":
+                        suffix = " face only portrait"
+                    query = f"{nm} {artifact.replace('_', ' ')}{suffix}".strip()
+                    st.session_state.pending_searches.append({
+                        "entity_type": et,
+                        "entity_name": nm,
+                        "artifact": artifact,
+                        "search_query": query,
+                        "cluster_id": s.get("cluster","") or _strip_accents(nm.lower()).replace(" ", "-")
+                    })
+
+    # (b) Gezielte Suchen planen (Agent 1 erzeugt artifact-aware Queries)
     last_q = ""
     for m in reversed(st.session_state.history[:-1]):
         if m["role"] == "assistant":
             last_q = m["content"]
             break
+
+    planned = agent1_plan_searches(last_q, user_text, st.session_state.slots)
+    if planned:
+        st.session_state.pending_searches.extend(planned)
+
+    # Agent 2 beobachten lassen (asynchron) – verarbeitet pending_searches + Validierung
     orch.schedule_watch(last_q, user_text)
 
-    # *** WICHTIG: Sofortiges Polling vor dem nächsten Agent-1-Call,
+    # *** Wichtig: Sofortiges Polling vor dem nächsten Agent-1-Call,
     # damit Enforcer/Follow-up-Zähler rechtzeitig injiziert werden. ***
     orch.poll()
 
