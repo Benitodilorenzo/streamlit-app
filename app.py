@@ -523,7 +523,7 @@ if not st.session_state.history:
 user_text = st.chat_input("Deine Antwort…")
 
     # Finalize button
-colA, colB = st.columns([1,1])
+    colA, colB = st.columns([1,1])
     with colA:
         finalize_now = st.button("Finalize now (build card)")
     with colB:
