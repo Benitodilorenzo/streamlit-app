@@ -11,7 +11,8 @@ from openai import OpenAI
 # Config & Env
 # ----------------------------
 APP_TITLE = "🟡 Expert Card — GPT-5 (3 Assistants · Single Thread · In-Band State)"
-MODEL_MAIN = os.getenv("OPENAI_GPT5_SNAPSHOT", "gpt-5-2025-08-07")
+MODEL_MAIN = os.getenv("OPENAI_GPT5_SNAPSHOT", "gpt-4o-mini")
+
 MODEL_AGENT2_VALIDATOR = os.getenv("OPENAI_AGENT2_MODEL", "gpt-5-mini")
 
 GOOGLE_CSE_KEY  = os.getenv("GOOGLE_CSE_KEY", "").strip()
