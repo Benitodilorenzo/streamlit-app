@@ -1,9 +1,6 @@
 # app.py — Expert Card (Assistants · Option A · Single Thread, 3 Assistants, In-Band State)
-# Requirements: streamlit, openai>=1.40.0, requests
-# ENV: OPENAI_API_KEY, GOOGLE_CSE_KEY, GOOGLE_CSE_CX, GOOGLE_CSE_SAFE (off|active)
-
 import os, time, json, re, requests, uuid
-from typing import Dict, Any, List, Optional
+from typing import Dict, Any, List, Optional, Tuple
 import streamlit as st
 from openai import OpenAI
 
@@ -30,42 +27,13 @@ st.title(APP_TITLE)
 st.caption("Assistants API · 1 Thread als einziger Speicher · Agent-2 ruft Custom-Tools (Google CSE + Vision-Check) auf und schreibt Ergebnisse als Plaintext in den Thread.")
 
 # ----------------------------
-# OpenAI Client + Assistants v2 compatibility adapter
+# OpenAI Client
 # ----------------------------
 def get_client() -> OpenAI:
     key = os.getenv("OPENAI_API_KEY", "").strip()
     if not key:
-        st.error("OPENAI_API_KEY fehlt.")
         st.stop()
     return OpenAI(api_key=key)
-
-ASSISTANTS_BETA_HDR = {"OpenAI-Beta": "assistants=v2"}
-
-def _assistants_api(client: OpenAI):
-    if hasattr(client, "assistants"):
-        return client.assistants
-    if hasattr(client, "beta") and hasattr(client.beta, "assistants"):
-        return client.beta.assistants
-    raise AttributeError("Assistants API not available in this SDK build.")
-
-def _threads_api(client: OpenAI):
-    if hasattr(client, "threads"):
-        return client.threads
-    if hasattr(client, "beta") and hasattr(client.beta, "threads"):
-        return client.beta.threads
-    raise AttributeError("Threads API not available in this SDK build.")
-
-def _messages_api(client: OpenAI):
-    th = _threads_api(client)
-    if hasattr(th, "messages"):
-        return th.messages
-    raise AttributeError("Threads.messages API not available in this SDK build.")
-
-def _runs_api(client: OpenAI):
-    th = _threads_api(client)
-    if hasattr(th, "runs"):
-        return th.runs
-    raise AttributeError("Threads.runs API not available in this SDK build.")
 
 # ----------------------------
 # Assistant blueprints (Prompts: Platzhalter — du kannst sie später verfeinern)
@@ -111,7 +79,7 @@ SYSTEM_AGENT3 = (
 )
 
 # ----------------------------
-# Assistants: create/reuse (IDs im Session State cachen) — with beta header
+# Assistants: create/reuse (IDs im Session State cachen)
 # ----------------------------
 def ensure_assistants(client: OpenAI):
     if "assistants" not in st.session_state:
@@ -119,14 +87,13 @@ def ensure_assistants(client: OpenAI):
 
     a = st.session_state.assistants
     if not a.get("A1"):
-        a["A1"] = _assistants_api(client).create(
+        a["A1"] = client.assistants.create(
             name="Interview Agent",
             model=MODEL_MAIN,
             instructions=SYSTEM_AGENT1,
-            extra_headers=ASSISTANTS_BETA_HDR,
         ).id
     if not a.get("A2"):
-        a["A2"] = _assistants_api(client).create(
+        a["A2"] = client.assistants.create(
             name="Search & Validator Agent",
             model=MODEL_MAIN,
             instructions=SYSTEM_AGENT2,
@@ -164,47 +131,40 @@ def ensure_assistants(client: OpenAI):
                     }
                 }
             ],
-            extra_headers=ASSISTANTS_BETA_HDR,
         ).id
     if not a.get("A3"):
-        a["A3"] = _assistants_api(client).create(
+        a["A3"] = client.assistants.create(
             name="Finalizer Agent",
             model=MODEL_MAIN,
             instructions=SYSTEM_AGENT3,
-            extra_headers=ASSISTANTS_BETA_HDR,
         ).id
     st.session_state.assistants = a
     return a["A1"], a["A2"], a["A3"]
 
 # ----------------------------
-# Thread helpers — with beta header
+# Thread helpers
 # ----------------------------
 def ensure_thread(client: OpenAI) -> str:
     if "thread_id" not in st.session_state or not st.session_state.thread_id:
-        tid = _threads_api(client).create(extra_headers=ASSISTANTS_BETA_HDR).id
+        tid = client.threads.create().id
         st.session_state.thread_id = tid
     return st.session_state.thread_id
 
 def add_user_message(client: OpenAI, thread_id: str, content: str):
-    _messages_api(client).create(
-        thread_id=thread_id,
-        role="user",
-        content=content,
-        extra_headers=ASSISTANTS_BETA_HDR,
-    )
+    client.messages.create(thread_id=thread_id, role="user", content=content)
 
-def list_messages(client: OpenAI, thread_id: str, limit: int = 100) -> List[Any]:
-    out = _messages_api(client).list(thread_id=thread_id, limit=limit, extra_headers=ASSISTANTS_BETA_HDR)
-    # SDK returns newest-first; we want oldest-first for display
+def list_messages(client: OpenAI, thread_id: str, limit: int = 100) -> List[Dict[str, Any]]:
+    out = client.messages.list(thread_id=thread_id, limit=limit)
+    # SDK returns .data list; preserve order oldest->newest for readability
     return list(reversed(out.data))
 
 # ----------------------------
-# Run + polling — with beta header
+# Run + polling
 # ----------------------------
 def poll_run(client: OpenAI, thread_id: str, run_id: str) -> Dict[str, Any]:
     t0 = time.time()
     while True:
-        r = _runs_api(client).retrieve(thread_id=thread_id, run_id=run_id, extra_headers=ASSISTANTS_BETA_HDR)
+        r = client.runs.retrieve(thread_id=thread_id, run_id=run_id)
         if r.status in ("completed", "failed", "cancelled", "expired"):
             return r.to_dict()
         if r.status == "requires_action":
@@ -219,7 +179,8 @@ def poll_run(client: OpenAI, thread_id: str, run_id: str) -> Dict[str, Any]:
 def find_json_block(text: str) -> Optional[dict]:
     if not text: return None
     m = re.search(r"\{[\s\S]*\}\s*$", text.strip())
-    if not m:
+    if not m: 
+        # try first {...}
         m = re.search(r"\{[\s\S]*?\}", text)
     if not m:
         return None
@@ -344,23 +305,22 @@ AGENT1_SCHEMA = {
 }
 
 def run_agent1_plan(client: OpenAI, thread_id: str, a1_id: str) -> Dict[str, Any]:
-    run = _runs_api(client).create(
+    run = client.runs.create(
         thread_id=thread_id,
         assistant_id=a1_id,
         response_format={"type":"json_schema","json_schema": AGENT1_SCHEMA},
-        tool_choice="none",
-        extra_headers=ASSISTANTS_BETA_HDR,
+        tool_choice="none"
     )
-    _ = poll_run(client, thread_id, run.id)
-    # Fetch latest message from A1; content should contain structured JSON
-    msgs = list_messages(client, thread_id, limit=20)
+    res = poll_run(client, thread_id, run.id)
+    # Fetch latest message from A1; content will be the structured JSON (as text)
+    msgs = list_messages(client, thread_id, limit=10)
     plan = {"assistant_message":"", "search_calls": [], "handoff": False}
     for m in msgs:
         if m.role == "assistant" and getattr(m, "assistant_id", None) == a1_id:
-            parts = [p.text.value for p in m.content if getattr(p, "type", None) == "text"]
-            if not parts:
+            text_parts = [p.text.value for p in m.content if getattr(p, "type", None) == "text"]
+            if not text_parts: 
                 continue
-            data = find_json_block("\n".join(parts))
+            data = find_json_block("\n".join(text_parts))
             if isinstance(data, dict) and "assistant_message" in data:
                 plan = data
                 break
@@ -378,10 +338,11 @@ def run_agent2_task(
     # Post a task message to the thread (in-band)
     add_user_message(client, thread_id, "AGENT2_TASK " + json.dumps(task, ensure_ascii=False))
 
-    run = _runs_api(client).create(thread_id=thread_id, assistant_id=a2_id, tool_choice="auto", extra_headers=ASSISTANTS_BETA_HDR)
+    run = client.runs.create(thread_id=thread_id, assistant_id=a2_id, tool_choice="auto")
+    # Tool loop
     t0 = time.time()
     while True:
-        r = _runs_api(client).retrieve(thread_id=thread_id, run_id=run.id, extra_headers=ASSISTANTS_BETA_HDR)
+        r = client.runs.retrieve(thread_id=thread_id, run_id=run.id)
         status = r.status
         if status == "requires_action":
             calls = r.required_action.submit_tool_outputs.tool_calls
@@ -405,13 +366,7 @@ def run_agent2_task(
                     tool_outputs.append({"tool_call_id": c.id, "output": output})
                 else:
                     tool_outputs.append({"tool_call_id": c.id, "output": json.dumps({"error":"unknown_tool"}, ensure_ascii=False)})
-
-            _runs_api(client).submit_tool_outputs(
-                thread_id=thread_id,
-                run_id=run.id,
-                tool_outputs=tool_outputs,
-                extra_headers=ASSISTANTS_BETA_HDR,
-            )
+            client.runs.submit_tool_outputs(thread_id=thread_id, run_id=run.id, tool_outputs=tool_outputs)
         elif status in ("queued", "in_progress"):
             if time.time() - t0 > MAX_POLL_SECONDS:
                 break
@@ -420,7 +375,7 @@ def run_agent2_task(
             break
 
     # Parse Agent2 result (latest assistant message from A2 starting with AGENT2_RESULT)
-    msgs = list_messages(client, thread_id, limit=30)
+    msgs = list_messages(client, thread_id, limit=20)
     for m in msgs:
         if m.role == "assistant" and getattr(m, "assistant_id", None) == a2_id:
             parts = [p.text.value for p in m.content if getattr(p, "type", None) == "text"]
@@ -437,10 +392,10 @@ def run_agent2_task(
 # Agent 3 — Finalize (returns 4 bullet lines as text)
 # ----------------------------
 def run_agent3_finalize(client: OpenAI, thread_id: str, a3_id: str) -> str:
-    run = _runs_api(client).create(thread_id=thread_id, assistant_id=a3_id, tool_choice="none", extra_headers=ASSISTANTS_BETA_HDR)
+    run = client.runs.create(thread_id=thread_id, assistant_id=a3_id, tool_choice="none")
     _ = poll_run(client, thread_id, run.id)
     # Read last A3 message
-    msgs = list_messages(client, thread_id, limit=20)
+    msgs = list_messages(client, thread_id, limit=10)
     for m in msgs:
         if m.role == "assistant" and getattr(m, "assistant_id", None) == a3_id:
             parts = [p.text.value for p in m.content if getattr(p, "type", None) == "text"]
@@ -464,7 +419,7 @@ def get_seen_items_from_thread(client: OpenAI, thread_id: str) -> Dict[str, Dict
             if not line.startswith("AGENT2_RESULT"):
                 continue
             data = find_json_block(line)
-            if not isinstance(data, dict):
+            if not isinstance(data, dict): 
                 continue
             key = data.get("key","")
             artifact = data.get("artifact","")
@@ -477,6 +432,7 @@ def render_progress(slots_count: int):
     st.progress(min(1.0, slots_count / 4), text=f"Progress: {slots_count}/4")
 
 def render_slots(seen: Dict[str, Dict[str, Any]]):
+    # Stable order by first appearance key
     keys = list(seen.keys())[:4]
     cols = st.columns(4)
     for idx, k in enumerate(keys):
@@ -502,6 +458,7 @@ def extract_four_lines(text: str) -> List[str]:
 
 def build_export_html(lines: List[str], seen: Dict[str, Dict[str, Any]]) -> str:
     html_items = []
+    # Pair first four seen items with lines
     keys = list(seen.keys())[:4]
     for idx in range(min(4, len(lines))):
         title = seen.get(keys[idx], {}).get("label","Item")
@@ -546,7 +503,7 @@ def main():
     if not started:
         st.stop()
 
-    # Mode (UI-Hinweis)
+    # Mode (nur UI-Hinweis für A1; Anpassung kannst du später in den Prompts verankern)
     mode = st.radio("Interview focus", ["Professional", "General / Lifescope"], horizontal=True)
     st.session_state["mode"] = mode
 
@@ -580,11 +537,13 @@ def main():
         if not parts: continue
         text = "\n".join(parts).strip()
         if m.role == "user":
+            # Skip internal signals to keep UI clean
             if text.startswith("AGENT2_TASK") or text.startswith("[[START]]"):
                 continue
             with st.chat_message("user"):
                 st.markdown(text)
         elif m.role == "assistant" and getattr(m, "assistant_id", None) == a1_id:
+            # A1 messages are structured JSON; show assistant_message
             data = find_json_block(text)
             visible = ""
             if isinstance(data, dict) and "assistant_message" in data:
@@ -598,13 +557,13 @@ def main():
     if st.session_state.get("final_text"):
         st.subheader("Your Expert Card")
         lines = extract_four_lines(st.session_state["final_text"])
+        # Simple render: pair first 4 seen items with lines
         cols = st.columns(2)
-        vals = list(seen.values())
-        for idx in range(min(4, len(lines), len(vals))):
+        for idx in range(min(4, len(lines))):
             with cols[idx % 2]:
-                st.markdown(f"**{vals[idx].get('label','Item')}**")
+                st.markdown(f"**{list(seen.values())[idx].get('label','Item')}**")
                 st.write(lines[idx])
-                img = vals[idx].get("best_image_url","")
+                img = list(seen.values())[idx].get("best_image_url","")
                 if img:
                     st.image(img, use_container_width=True)
 
@@ -621,10 +580,11 @@ def main():
         plan = run_agent1_plan(client, thread_id, a1_id)
         st.session_state.last_plan = plan
 
-        # Optional search (max 1 per turn) with in-band dedupe against existing AGENT2_RESULTs
+        # Optional search (max 1 per turn)
         calls = plan.get("search_calls") or []
         if calls:
             task = calls[0]
+            # Dedupe in-band: if AGENT2_RESULT already has same key+artifact, skip
             k = normalize_key(task["entity_type"], task["entity_name"])
             art = task["artifact"]
             seen_now = get_seen_items_from_thread(client, thread_id)
