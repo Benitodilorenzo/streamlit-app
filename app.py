@@ -39,6 +39,22 @@ def get_client() -> OpenAI:
         st.stop()
     return OpenAI(api_key=key)
 
+# --- Kompatibilitäts-Adapter (direkt nach get_client() eingefügt) ---
+def _assistants_api(client):
+    # bevorzugt top-level, fallback auf beta.*
+    return getattr(client, "assistants", getattr(client, "beta").assistants)
+
+def _threads_api(client):
+    return getattr(client, "threads", getattr(client, "beta").threads)
+
+def _thread_messages_api(client):
+    th = _threads_api(client)
+    return getattr(th, "messages", getattr(getattr(client, "beta"), "threads").messages)
+
+def _thread_runs_api(client):
+    th = _threads_api(client)
+    return getattr(th, "runs", getattr(getattr(client, "beta"), "threads").runs)
+
 # ----------------------------
 # Prompts (Platzhalter – später feinjustieren)
 # ----------------------------
@@ -91,7 +107,7 @@ def ensure_assistants(client: OpenAI):
 
     a = st.session_state.assistants
     if not a.get("A1"):
-        a["A1"] = client.assistants.create(
+        a["A1"] = _assistants_api(client).create(
             name="Interview Agent",
             model=MODEL_MAIN,
             instructions=SYSTEM_AGENT1,
@@ -99,7 +115,7 @@ def ensure_assistants(client: OpenAI):
         ).id
 
     if not a.get("A2"):
-        a["A2"] = client.assistants.create(
+        a["A2"] = _assistants_api(client).create(
             name="Search & Validator Agent",
             model=MODEL_MAIN,
             instructions=SYSTEM_AGENT2,
@@ -141,7 +157,7 @@ def ensure_assistants(client: OpenAI):
         ).id
 
     if not a.get("A3"):
-        a["A3"] = client.assistants.create(
+        a["A3"] = _assistants_api(client).create(
             name="Finalizer Agent",
             model=MODEL_MAIN,
             instructions=SYSTEM_AGENT3,
@@ -156,12 +172,12 @@ def ensure_assistants(client: OpenAI):
 # ----------------------------
 def ensure_thread(client: OpenAI) -> str:
     if "thread_id" not in st.session_state or not st.session_state.thread_id:
-        tid = client.threads.create(extra_headers=ASSISTANTS_BETA_HDR).id
+        tid = _threads_api(client).create(extra_headers=ASSISTANTS_BETA_HDR).id
         st.session_state.thread_id = tid
     return st.session_state.thread_id
 
 def add_user_message(client: OpenAI, thread_id: str, content: str):
-    client.threads.messages.create(
+    _thread_messages_api(client).create(
         thread_id=thread_id,
         role="user",
         content=content,
@@ -169,7 +185,7 @@ def add_user_message(client: OpenAI, thread_id: str, content: str):
     )
 
 def list_messages(client: OpenAI, thread_id: str, limit: int = 100) -> List[Any]:
-    out = client.threads.messages.list(thread_id=thread_id, limit=limit, extra_headers=ASSISTANTS_BETA_HDR)
+    out = _thread_messages_api(client).list(thread_id=thread_id, limit=limit, extra_headers=ASSISTANTS_BETA_HDR)
     return list(reversed(out.data))
 
 # ----------------------------
@@ -178,7 +194,7 @@ def list_messages(client: OpenAI, thread_id: str, limit: int = 100) -> List[Any]
 def poll_run(client: OpenAI, thread_id: str, run_id: str) -> Dict[str, Any]:
     t0 = time.time()
     while True:
-        r = client.threads.runs.retrieve(thread_id=thread_id, run_id=run_id, extra_headers=ASSISTANTS_BETA_HDR)
+        r = _thread_runs_api(client).retrieve(thread_id=thread_id, run_id=run_id, extra_headers=ASSISTANTS_BETA_HDR)
         if r.status in ("completed", "failed", "cancelled", "expired"):
             return r.to_dict()
         if r.status == "requires_action":
@@ -318,7 +334,7 @@ AGENT1_SCHEMA = {
 }
 
 def run_agent1_plan(client: OpenAI, thread_id: str, a1_id: str) -> Dict[str, Any]:
-    run = client.threads.runs.create(
+    run = _thread_runs_api(client).create(
         thread_id=thread_id,
         assistant_id=a1_id,
         response_format={"type":"json_schema","json_schema": AGENT1_SCHEMA},
@@ -347,10 +363,10 @@ def run_agent2_task(client: OpenAI, thread_id: str, a2_id: str, task: Dict[str, 
     # Post task message (in-band)
     add_user_message(client, thread_id, "AGENT2_TASK " + json.dumps(task, ensure_ascii=False))
 
-    run = client.threads.runs.create(thread_id=thread_id, assistant_id=a2_id, tool_choice="auto", extra_headers=ASSISTANTS_BETA_HDR)
+    run = _thread_runs_api(client).create(thread_id=thread_id, assistant_id=a2_id, tool_choice="auto", extra_headers=ASSISTANTS_BETA_HDR)
     t0 = time.time()
     while True:
-        r = client.threads.runs.retrieve(thread_id=thread_id, run_id=run.id, extra_headers=ASSISTANTS_BETA_HDR)
+        r = _thread_runs_api(client).retrieve(thread_id=thread_id, run_id=run.id, extra_headers=ASSISTANTS_BETA_HDR)
         status = r.status
         if status == "requires_action":
             calls = r.required_action.submit_tool_outputs.tool_calls
@@ -373,7 +389,7 @@ def run_agent2_task(client: OpenAI, thread_id: str, a2_id: str, task: Dict[str, 
                 else:
                     tool_outputs.append({"tool_call_id": c.id, "output": json.dumps({"error":"unknown_tool"}, ensure_ascii=False)})
 
-            client.threads.runs.submit_tool_outputs(
+            _thread_runs_api(client).submit_tool_outputs(
                 thread_id=thread_id,
                 run_id=run.id,
                 tool_outputs=tool_outputs,
@@ -404,7 +420,7 @@ def run_agent2_task(client: OpenAI, thread_id: str, a2_id: str, task: Dict[str, 
 # Agent 3 — Finalizer (returns 4 bullet lines)
 # ----------------------------
 def run_agent3_finalize(client: OpenAI, thread_id: str, a3_id: str) -> str:
-    run = client.threads.runs.create(thread_id=thread_id, assistant_id=a3_id, tool_choice="none", extra_headers=ASSISTANTS_BETA_HDR)
+    run = _thread_runs_api(client).create(thread_id=thread_id, assistant_id=a3_id, tool_choice="none", extra_headers=ASSISTANTS_BETA_HDR)
     _ = poll_run(client, thread_id, run.id)
     # Read last A3 message
     msgs = list_messages(client, thread_id, limit=20)
