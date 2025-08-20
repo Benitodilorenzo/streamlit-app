@@ -309,30 +309,33 @@ AGENT1_SCHEMA = {
     "name": "Agent1Turn",
     "schema": {
         "type": "object",
+        "additionalProperties": False,
         "properties": {
             "assistant_message": {"type": "string"},
             "search_calls": {
                 "type": "array",
+                "default": [],
                 "items": {
                     "type": "object",
+                    "additionalProperties": False,
                     "properties": {
-                        "entity_type": {"type":"string", "enum":["person","book","podcast","tool","film"]},
-                        "entity_name": {"type":"string"},
-                        "artifact": {"type":"string", "enum":["portrait","book_cover","podcast_cover","tool_logo","film_poster"]},
-                        "search_query": {"type":"string"},
-                        "cluster_id": {"type":"string"}
+                        "entity_type": {"type": "string", "enum": ["person","book","podcast","tool","film"]},
+                        "entity_name": {"type": "string"},
+                        "artifact": {"type": "string", "enum": ["portrait","book_cover","podcast_cover","tool_logo","film_poster"]},
+                        "search_query": {"type": "string"},
+                        "cluster_id": {"type": "string"}
                     },
-                    "required": ["entity_type","entity_name","artifact","search_query","cluster_id"],
-                    "additionalProperties": False
+                    "required": ["entity_type","entity_name","artifact","search_query","cluster_id"]
                 }
             },
-            "handoff": {"type":"boolean", "default": False}
+            "handoff": {"type": "boolean", "default": False}
         },
-        "required": ["assistant_message"],
-        "additionalProperties": False
+        # STRICT-Modus verlangt, dass alle Properties hier gelistet sind:
+        "required": ["assistant_message", "search_calls", "handoff"]
     },
     "strict": True
 }
+
 
 def run_agent1_plan(client: OpenAI, thread_id: str, a1_id: str) -> Dict[str, Any]:
     run = _thread_runs_api(client).create(
